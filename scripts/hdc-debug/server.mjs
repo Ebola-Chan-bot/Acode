@@ -99,10 +99,41 @@ const httpServer = createServer((req, res) => {
 	const url = new URL(req.url, `http://localhost:${PORT}`);
 	let pathname = decodeURIComponent(url.pathname);
 
+	// Debug: log all non-static HTTP requests (helps diagnose 404 on /__log)
+	if (pathname.startsWith("/__") || req.method !== "GET") {
+		console.log(`${C.dim}[HTTP]${C.reset} ${req.method} ${pathname} (raw: ${req.url}) from ${req.socket.remoteAddress}`);
+	}
+
 	// Debug client script (injected into app)
 	if (pathname === "/__debug_client.js") {
 		res.writeHead(200, { "Content-Type": "application/javascript", "Access-Control-Allow-Origin": "*" });
 		res.end(generateDebugClientJS());
+		return;
+	}
+
+	// Native log endpoint (Java-side HTTP POST, survives background)
+	if (pathname === "/__log" && req.method === "POST") {
+		let body = "";
+		req.on("data", (chunk) => { body += chunk; });
+		req.on("end", () => {
+			res.writeHead(200, { "Access-Control-Allow-Origin": "*" });
+			res.end("ok");
+			try {
+				const msg = JSON.parse(body);
+				const ts = new Date().toLocaleTimeString("zh-CN");
+				const lvl = (msg.level || "log").toUpperCase();
+				const color = LEVEL_COLOR[msg.level] || C.white;
+				console.log(`${C.dim}${ts}${C.reset} ${color}[${lvl}]${C.reset} ${C.blue}[Native]${C.reset} ${msg.message || body}`);
+			} catch {
+				const ts = new Date().toLocaleTimeString("zh-CN");
+				console.log(`${C.dim}${ts}${C.reset} ${C.blue}[Native]${C.reset} ${body}`);
+			}
+		});
+		return;
+	}
+	if (pathname === "/__log" && req.method === "OPTIONS") {
+		res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST", "Access-Control-Allow-Headers": "Content-Type" });
+		res.end();
 		return;
 	}
 
@@ -150,6 +181,10 @@ wss.on("connection", (ws, req) => {
 	console.log(`${C.green}[连接]${C.reset} 客户端已连接 ${C.dim}${from}${C.reset}`);
 	clients.add(ws);
 
+	// Server-side ping every 10s to keep connection alive on 卓易通/HarmonyOS
+	ws.isAlive = true;
+	ws.on("pong", () => { ws.isAlive = true; });
+
 	ws.on("message", (raw) => {
 		try {
 			const msg = JSON.parse(raw.toString());
@@ -164,6 +199,18 @@ wss.on("connection", (ws, req) => {
 		console.log(`${C.yellow}[断开]${C.reset} 客户端已断开 ${C.dim}${from}${C.reset}`);
 	});
 });
+
+// Ping all clients every 10s; terminate dead connections
+const pingInterval = setInterval(() => {
+	for (const ws of wss.clients) {
+		if (ws.isAlive === false) {
+			ws.terminate();
+			continue;
+		}
+		ws.isAlive = false;
+		ws.ping();
+	}
+}, 10000);
 
 function broadcast(data) {
 	const payload = JSON.stringify(data);
@@ -362,7 +409,7 @@ function generateDebugClientJS() {
   });
 
   // 心跳
-  setInterval(function() { send({ type: "ping" }); }, 30000);
+  setInterval(function() { send({ type: "ping" }); }, 10000);
 
   connect();
 })();

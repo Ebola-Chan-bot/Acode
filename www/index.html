@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -87,6 +87,7 @@
     <!-- HDC_DEBUG --><script>(function(){
   if(window.__HDC_DEBUG_ACTIVE)return;
   window.__HDC_DEBUG_ACTIVE=true;
+  window.__debugHost='10.20.204.8:8092';
 
   /* ── 诊断浮层 ── */
   var D=document.createElement('div');
@@ -104,11 +105,11 @@
   /* 5秒后自动隐藏诊断浮层（如果WS连上了） */
   var diagHideTimer=setTimeout(function(){D.style.display='none'},15000);
 
-  diag('HDC Debug init, URLs: "ws://192.168.1.2:8092"');
+  diag('HDC Debug init, URLs: "ws://10.20.204.8:8092"');
   diag('UA: '+navigator.userAgent.substring(0,80));
 
   /* ── HTTP 探测 ── */
-  var httpUrls=["http://192.168.1.2:8092/__debug_client.js"];
+  var httpUrls=["http://10.20.204.8:8092/__debug_client.js"];
   httpUrls.forEach(function(url){
     diag('HTTP probe: '+url);
     var xhr=new XMLHttpRequest();
@@ -121,7 +122,7 @@
   });
 
   /* ── WebSocket 多地址连接 ── */
-  var URLS=["ws://192.168.1.2:8092"];
+  var URLS=["ws://10.20.204.8:8092"];
   var ws=null,queue=[],urlIdx=0,retryCount=0,maxRetry=50;
   function connect(){
     if(retryCount>=maxRetry){diag('WS: max retries reached, giving up');return}
@@ -142,6 +143,20 @@
   function tryNext(){urlIdx++;retryCount++;setTimeout(connect,2000)}
   function send(obj){var d=JSON.stringify(obj);if(ws&&ws.readyState===1)ws.send(d);else if(queue.length<200)queue.push(d)}
 
+  /* ── 前台恢复时立即重连 ── */
+  document.addEventListener('visibilitychange',function(){
+    if(!document.hidden&&(!ws||ws.readyState!==1)){
+      diag('Visibility restored, reconnecting...');
+      retryCount=0;urlIdx=0;connect();
+    }
+  });
+  document.addEventListener('resume',function(){
+    if(!ws||ws.readyState!==1){
+      diag('App resumed, reconnecting...');
+      retryCount=0;urlIdx=0;connect();
+    }
+  });
+
   /* ── Console 劫持 ── */
   var _c={};
   ["log","info","warn","error","debug"].forEach(function(l){
@@ -149,6 +164,7 @@
     console[l]=function(){
       _c[l].apply(console,arguments);
       var a=[];for(var i=0;i<arguments.length;i++){try{var v=arguments[i];if(v instanceof Error)a.push({message:v.message,stack:v.stack});else if(typeof v==="object")a.push(JSON.parse(JSON.stringify(v,function(k,val){if(typeof val==="function")return"[Function]";if(val instanceof HTMLElement)return val.outerHTML.substring(0,200);return val})));else a.push(v)}catch(e){a.push("[unserializable]")}}
+      if(l==="error"&&a.length===1&&typeof a[0]==="number")a.push(new Error().stack);
       send({type:"console",level:l,args:a,timestamp:Date.now()});
     };
   });

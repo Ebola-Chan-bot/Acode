@@ -13,6 +13,20 @@ const Terminal = {
      * @returns {Promise<boolean>} - Returns true if installation completes with exit code 0, void if not installing
      */
     async startAxs(installing = false, logger = console.log, err_logger = console.error) {
+        // Keep app alive in background
+        await Executor.moveToForeground().catch(() => {});
+
+        // Set up native Java logging to debug server (survives background)
+        console.log(`[Terminal:startAxs] __debugHost=${window.__debugHost}`);
+        if (window.__debugHost) {
+            try {
+                const r = await Executor.setLogServer(`http://${window.__debugHost}`);
+                console.log(`[Terminal:startAxs] setLogServer result: ${r}`);
+            } catch (e) {
+                console.error(`[Terminal:startAxs] setLogServer failed:`, e);
+            }
+        }
+
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
         });
@@ -66,17 +80,17 @@ const Terminal = {
             });
         } else {
             readAsset("rm-wrapper.sh", async (content) => {
-                system.deleteFile(`${filesDir}/alpine/bin/rm`, logger, err_logger);
-                system.writeText(`${filesDir}/alpine/bin/rm`, content, logger, err_logger);
-                system.setExec(`${filesDir}/alpine/bin/rm`, true, logger, err_logger);
+                system.deleteFile(`${filesDir}/alpine/bin/rm`, logger, () => {});
+                system.writeText(`${filesDir}/alpine/bin/rm`, content, logger, () => {});
+                system.setExec(`${filesDir}/alpine/bin/rm`, true, logger, () => {});
             });
 
             readAsset("init-alpine.sh", async (content) => {
-                system.writeText(`${filesDir}/init-alpine.sh`, content, logger, err_logger);
+                system.writeText(`${filesDir}/init-alpine.sh`, content, logger, () => {});
             });
 
             readAsset("init-sandbox.sh", (content) => {
-                system.writeText(`${filesDir}/init-sandbox.sh`, content, logger, err_logger);
+                system.writeText(`${filesDir}/init-sandbox.sh`, content, logger, () => {});
 
                 Executor.start("sh", (type, data) => {
                     // Always log non-installing output to console for debugging
@@ -206,8 +220,17 @@ const Terminal = {
      * @param {Function} [err_logger=console.error] - Function to log errors.
      * @returns {Promise<boolean>} - Returns true if installation completes with exit code 0
      */
-    async install(logger = console.log, err_logger = console.error) {
+    async install(logger = console.log, err_logger = console.error, _retried = false) {
         if (!(await this.isSupported())) return false;
+
+        // Start foreground service to prevent Android from killing the app
+        // during lengthy downloads/extraction when user switches away
+        await Executor.moveToForeground().catch(() => {});
+
+        // Set up native Java logging to debug server (survives background)
+        if (window.__debugHost) {
+            await Executor.setLogServer(`http://${window.__debugHost}`).catch(() => {});
+        }
 
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
@@ -278,26 +301,14 @@ const Terminal = {
 
                 if (!hasAlpineTar) {
                     logger("⬇️  Downloading sandbox filesystem...");
-                    await new Promise((resolve, reject) => {
-                        cordova.plugin.http.downloadFile(
-                            alpineUrl, {}, {},
-                            cordova.file.dataDirectory + "alpine.tar.gz",
-                            resolve, reject
-                        );
-                    });
+                    await Executor.download(alpineUrl, `${filesDir}/alpine.tar.gz`);
                 } else {
                     logger("✅  Sandbox filesystem already downloaded");
                 }
 
                 if (!hasAxs) {
                     logger("⬇️  Downloading axs...");
-                    await new Promise((resolve, reject) => {
-                        cordova.plugin.http.downloadFile(
-                            axsUrl, {}, {},
-                            cordova.file.dataDirectory + "axs",
-                            resolve, reject
-                        );
-                    });
+                    await Executor.download(axsUrl, `${filesDir}/axs`);
                 } else {
                     logger("✅  AXS binary already downloaded");
                 }
@@ -309,45 +320,21 @@ const Terminal = {
                     const hasProot = await fileExists(`${filesDir}/libproot-xed.so`);
                     if (!hasProot) {
                         logger("⬇️  Downloading compatibility layer...");
-                        await new Promise((resolve, reject) => {
-                            cordova.plugin.http.downloadFile(
-                                prootUrl, {}, {},
-                                cordova.file.dataDirectory + "libproot-xed.so",
-                                resolve, reject
-                            );
-                        });
+                        await Executor.download(prootUrl, `${filesDir}/libproot-xed.so`);
                     }
 
                     const hasTalloc = await fileExists(`${filesDir}/libtalloc.so.2`);
                     if (!hasTalloc) {
                         logger("⬇️  Downloading supporting library...");
-                        await new Promise((resolve, reject) => {
-                            cordova.plugin.http.downloadFile(
-                                libTalloc, {}, {},
-                                cordova.file.dataDirectory + "libtalloc.so.2",
-                                resolve, reject
-                            );
-                        });
+                        await Executor.download(libTalloc, `${filesDir}/libtalloc.so.2`);
                     }
 
                     if (libproot != null && !(await fileExists(`${filesDir}/libproot.so`))) {
-                        await new Promise((resolve, reject) => {
-                            cordova.plugin.http.downloadFile(
-                                libproot, {}, {},
-                                cordova.file.dataDirectory + "libproot.so",
-                                resolve, reject
-                            );
-                        });
+                        await Executor.download(libproot, `${filesDir}/libproot.so`);
                     }
 
                     if (libproot32 != null && !(await fileExists(`${filesDir}/libproot32.so`))) {
-                        await new Promise((resolve, reject) => {
-                            cordova.plugin.http.downloadFile(
-                                libproot32, {}, {},
-                                cordova.file.dataDirectory + "libproot32.so",
-                                resolve, reject
-                            );
-                        });
+                        await Executor.download(libproot32, `${filesDir}/libproot32.so`);
                     }
                 }
 
@@ -365,12 +352,19 @@ const Terminal = {
             if (!alreadyExtracted) {
                 const alpineDir = `${filesDir}/alpine`;
 
+                // Clean up partial extraction from previous failed attempt
+                await Executor.execute(`rm -rf ${alpineDir}`).catch(() => {});
                 await new Promise((resolve, reject) => {
                     system.mkdirs(alpineDir, resolve, reject);
                 });
 
                 logger("📦  Extracting sandbox filesystem...");
-                await Executor.execute(`tar --no-same-owner -xf ${filesDir}/alpine.tar.gz -C ${alpineDir}`);
+                // 卓易通 toybox gzclose() ioctl bug breaks shell-based gzip.
+                // Decompress in Java via GZIPInputStream, then plain tar extract.
+                const tarFile = `${filesDir}/alpine.tar`;
+                await Executor.gunzip(`${filesDir}/alpine.tar.gz`, tarFile);
+                await Executor.execute(`tar --no-same-owner -xf ${tarFile} -C ${alpineDir}`);
+                await Executor.execute(`rm -f ${tarFile}`);
 
                 logger("⚙️  Applying basic configuration...");
                 system.writeText(`${alpineDir}/etc/resolv.conf`, `nameserver 8.8.4.4\nnameserver 8.8.8.8`);
@@ -398,6 +392,12 @@ const Terminal = {
         } catch (e) {
             err_logger("Installation failed:", e);
             console.error("Installation failed:", e);
+            // Clean up everything so retry starts fresh (including potentially corrupted downloads)
+            await Executor.execute(`rm -rf ${filesDir}/.downloaded ${filesDir}/.extracted ${filesDir}/.configured ${filesDir}/alpine ${filesDir}/alpine.tar.gz ${filesDir}/alpine.tar`).catch(() => {});
+            if (!_retried) {
+                logger("🔄  Retrying installation from scratch...");
+                return this.install(logger, err_logger, true);
+            }
             return false;
         }
     },

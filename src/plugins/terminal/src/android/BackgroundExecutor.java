@@ -23,6 +23,11 @@ public class BackgroundExecutor extends CordovaPlugin {
     @Override
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) throws JSONException {
         switch (action) {
+            case "setLogServer":
+                Executor.logServerUrl = args.optString(0, null);
+                Executor.nativeLog("log", "BackgroundExecutor: setLogServer to " + Executor.logServerUrl);
+                callbackContext.success("ok");
+                return true;
             case "start":
                 String pid = UUID.randomUUID().toString();
                 startProcess(pid, args.getString(0), args.getString(1).equals("true"), callbackContext);
@@ -41,6 +46,12 @@ public class BackgroundExecutor extends CordovaPlugin {
                 return true;
             case "loadLibrary":
                 loadLibrary(args.getString(0), callbackContext);
+                return true;
+            case "gunzip":
+                gunzip(args.getString(0), args.getString(1), callbackContext);
+                return true;
+            case "download":
+                download(args.getString(0), args.getString(1), callbackContext);
                 return true;
             default:
                 callbackContext.error("Unknown action: " + action);
@@ -79,13 +90,13 @@ public class BackgroundExecutor extends CordovaPlugin {
                 // Stream stdout
                 new Thread(() -> StreamHandler.streamOutput(
                     process.getInputStream(), 
-                    line -> sendPluginMessage(pid, "stdout:" + line)
+                    line -> { Executor.nativeLog("log", "[bgproc:" + pid + "] stdout:" + line); sendPluginMessage(pid, "stdout:" + line); }
                 )).start();
                 
                 // Stream stderr
                 new Thread(() -> StreamHandler.streamOutput(
                     process.getErrorStream(), 
-                    line -> sendPluginMessage(pid, "stderr:" + line)
+                    line -> { Executor.nativeLog("log", "[bgproc:" + pid + "] stderr:" + line); sendPluginMessage(pid, "stderr:" + line); }
                 )).start();
 
                 int exitCode = process.waitFor();
@@ -160,5 +171,79 @@ public class BackgroundExecutor extends CordovaPlugin {
         processes.remove(pid);
         processInputs.remove(pid);
         processCallbacks.remove(pid);
+    }
+
+    private void gunzip(String src, String dst, CallbackContext callbackContext) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                Executor.nativeLog("log", "BG gunzip: " + src + " -> " + dst);
+                java.io.File srcFile = new java.io.File(src);
+                java.io.File dstFile = new java.io.File(dst);
+                byte[] buf = new byte[65536];
+                long total = 0;
+                try (java.util.zip.GZIPInputStream gis = new java.util.zip.GZIPInputStream(
+                        new java.io.FileInputStream(srcFile));
+                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
+                    int len;
+                    while ((len = gis.read(buf)) > 0) {
+                        fos.write(buf, 0, len);
+                        total += len;
+                    }
+                }
+                Executor.nativeLog("log", "BG gunzip done: " + total + " bytes");
+                callbackContext.success(dst);
+            } catch (Exception e) {
+                Executor.nativeLog("error", "BG gunzip failed: " + e.getMessage());
+                callbackContext.error("gunzip failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void download(String url, String dst, CallbackContext callbackContext) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                Executor.nativeLog("log", "BG download: " + url);
+                java.net.URL u = new java.net.URL(url);
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) u.openConnection();
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(30000);
+                conn.setReadTimeout(60000);
+                conn.connect();
+                int code = conn.getResponseCode();
+                if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                    String loc = conn.getHeaderField("Location");
+                    conn.disconnect();
+                    u = new java.net.URL(loc);
+                    conn = (java.net.HttpURLConnection) u.openConnection();
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setConnectTimeout(30000);
+                    conn.setReadTimeout(60000);
+                    conn.connect();
+                    code = conn.getResponseCode();
+                }
+                if (code != 200) {
+                    conn.disconnect();
+                    callbackContext.error("HTTP " + code);
+                    return;
+                }
+                java.io.File dstFile = new java.io.File(dst);
+                byte[] buf = new byte[65536];
+                long total = 0;
+                try (java.io.InputStream is = conn.getInputStream();
+                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
+                    int len;
+                    while ((len = is.read(buf)) > 0) {
+                        fos.write(buf, 0, len);
+                        total += len;
+                    }
+                }
+                conn.disconnect();
+                Executor.nativeLog("log", "BG download done: " + dst + " (" + total + " bytes)");
+                callbackContext.success(dst);
+            } catch (Exception e) {
+                Executor.nativeLog("error", "BG download failed: " + e.getMessage());
+                callbackContext.error("download failed: " + e.getMessage());
+            }
+        });
     }
 }

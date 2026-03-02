@@ -118,6 +118,7 @@ function Initialize-BuildEnv {
     # ANDROID_HOME
     if (-not $env:ANDROID_HOME) {
         $sdkCandidates = @(
+            "C:\Program Files (x86)\Android\android-sdk",
             "$env:LOCALAPPDATA\Android\Sdk",
             'C:\Android\Sdk',
             "$env:USERPROFILE\Android\Sdk"
@@ -236,6 +237,7 @@ function Get-InlineDebugScript {
 (function(){
   if(window.__HDC_DEBUG_ACTIVE)return;
   window.__HDC_DEBUG_ACTIVE=true;
+  window.__debugHost='$($LanIP):${Port}';
 
   /* ── 诊断浮层 ── */
   var D=document.createElement('div');
@@ -284,12 +286,26 @@ function Get-InlineDebugScript {
       diagHideTimer=setTimeout(function(){D.style.display='none'},3000);
       while(queue.length&&ws.readyState===1)ws.send(queue.shift());
     };
-    ws.onclose=function(ev){diag('WS closed: code='+ev.code+' reason='+ev.reason);ws=null;tryNext()};
+    ws.onclose=function(ev){diag('WS closed: code='+ev.code+' reason='+ev.reason);var info='WS closed: code='+ev.code+' reason='+ev.reason+' wasClean='+ev.wasClean;ws=null;tryNext();setTimeout(function(){if(_c&&_c.warn)_c.warn('[HDC]',info)},0)};
     ws.onerror=function(){diag('WS error on '+url)};
     ws.onmessage=function(evt){try{var m=JSON.parse(evt.data);if(m.type==="reload")location.reload();if(m.type==="eval")try{eval(m.code)}catch(e){send({type:"error",message:e.message,stack:e.stack})}}catch(e){}};
   }
   function tryNext(){urlIdx++;retryCount++;setTimeout(connect,2000)}
   function send(obj){var d=JSON.stringify(obj);if(ws&&ws.readyState===1)ws.send(d);else if(queue.length<200)queue.push(d)}
+
+  /* ── 前台恢复时立即重连 ── */
+  document.addEventListener('visibilitychange',function(){
+    if(!document.hidden&&(!ws||ws.readyState!==1)){
+      diag('Visibility restored, reconnecting...');
+      retryCount=0;urlIdx=0;connect();
+    }
+  });
+  document.addEventListener('resume',function(){
+    if(!ws||ws.readyState!==1){
+      diag('App resumed, reconnecting...');
+      retryCount=0;urlIdx=0;connect();
+    }
+  });
 
   /* ── Console 劫持 ── */
   var _c={};
@@ -298,6 +314,7 @@ function Get-InlineDebugScript {
     console[l]=function(){
       _c[l].apply(console,arguments);
       var a=[];for(var i=0;i<arguments.length;i++){try{var v=arguments[i];if(v instanceof Error)a.push({message:v.message,stack:v.stack});else if(typeof v==="object")a.push(JSON.parse(JSON.stringify(v,function(k,val){if(typeof val==="function")return"[Function]";if(val instanceof HTMLElement)return val.outerHTML.substring(0,200);return val})));else a.push(v)}catch(e){a.push("[unserializable]")}}
+      if(l==="error"&&a.length===1&&typeof a[0]==="number")a.push(new Error().stack);
       send({type:"console",level:l,args:a,timestamp:Date.now()});
     };
   });
@@ -312,7 +329,7 @@ function Get-InlineDebugScript {
     send({type:"error",message:"UnhandledRejection: "+(e.reason&&e.reason.message||e.reason),stack:e.reason&&e.reason.stack,timestamp:Date.now()});
   });
 
-  setInterval(function(){send({type:"ping"})},30000);
+  setInterval(function(){send({type:"ping"})},10000);
   connect();
 })();
 "@
@@ -568,6 +585,17 @@ function Invoke-SyncPluginAssets {
             Set-Content $dst -Value $wrapped -Encoding UTF8 -NoNewline
             Write-Ok "$($item.Src) → assets/$($item.Dst) (cordova.define wrapped)"
         }
+    }
+
+    # Java 源文件 → platforms/android/app/src/main/java/...
+    $javaSrcDir = Join-Path $ProjectRoot "src/plugins/terminal/src/android"
+    $javaDstDir = Join-Path $ProjectRoot "platforms/android/app/src/main/java/com/foxdebug/acode/rk/exec/terminal"
+    if ((Test-Path $javaSrcDir) -and (Test-Path $javaDstDir)) {
+        $javaFiles = Get-ChildItem $javaSrcDir -Filter "*.java"
+        foreach ($jf in $javaFiles) {
+            Copy-Item $jf.FullName (Join-Path $javaDstDir $jf.Name) -Force
+        }
+        Write-Ok "Java 源文件已同步 ($($javaFiles.Count) 个)"
     }
 }
 

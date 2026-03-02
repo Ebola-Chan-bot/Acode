@@ -31,6 +31,31 @@ import com.foxdebug.acode.rk.exec.terminal.*;
 
 public class Executor extends CordovaPlugin {
 
+    static volatile String logServerUrl = null;
+    private static final java.util.concurrent.ExecutorService logExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    public static void nativeLog(String level, String message) {
+        String url = logServerUrl;
+        if (url == null) return;
+        logExecutor.execute(() -> {
+            try {
+                java.net.URL u = new java.net.URL(url + "/__log");
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) u.openConnection();
+                c.setRequestMethod("POST");
+                c.setDoOutput(true);
+                c.setConnectTimeout(2000);
+                c.setReadTimeout(2000);
+                c.setRequestProperty("Content-Type", "application/json");
+                String json = "{\"level\":\"" + level + "\",\"message\":\"" + message.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"}";
+                c.getOutputStream().write(json.getBytes("UTF-8"));
+                c.getOutputStream().close();
+                c.getResponseCode();
+                c.disconnect();
+            } catch (Exception ignored) {}
+        });
+    }
+
     private Messenger serviceMessenger;
     private boolean isServiceBound;
     private boolean isServiceBinding; // Track if binding is in progress
@@ -199,6 +224,7 @@ public class Executor extends CordovaPlugin {
                     switch (action) {
                         case "stdout":
                         case "stderr":
+                            nativeLog("log", "[proc:" + pid + "] " + action + ":" + data);
                             PluginResult result = new PluginResult(PluginResult.Status.OK, action + ":" + data);
                             result.setKeepCallback(true);
                             callbackContext.sendPluginResult(result);
@@ -227,6 +253,34 @@ public class Executor extends CordovaPlugin {
             } catch (Exception e) {
                 callbackContext.error("Failed to load library: " + e.getMessage());
             }
+            return true;
+        }
+
+        if (action.equals("setLogServer")) {
+            logServerUrl = args.optString(0, null);
+            Log.d("Executor", "Log server set to: " + logServerUrl);
+            // Test connectivity synchronously on a worker thread
+            cordova.getThreadPool().execute(() -> {
+                String testResult;
+                try {
+                    java.net.URL u = new java.net.URL(logServerUrl + "/__log");
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection) u.openConnection();
+                    c.setRequestMethod("POST");
+                    c.setDoOutput(true);
+                    c.setConnectTimeout(3000);
+                    c.setReadTimeout(3000);
+                    c.setRequestProperty("Content-Type", "application/json");
+                    String json = "{\"level\":\"log\",\"message\":\"nativeLog connectivity test from Java\"}";
+                    c.getOutputStream().write(json.getBytes("UTF-8"));
+                    c.getOutputStream().close();
+                    int code = c.getResponseCode();
+                    c.disconnect();
+                    testResult = "ok, HTTP " + code;
+                } catch (Exception e) {
+                    testResult = "ok, but HTTP test FAILED: " + e.getClass().getName() + ": " + e.getMessage();
+                }
+                callbackContext.success(testResult);
+            });
             return true;
         }
 
@@ -283,6 +337,12 @@ public class Executor extends CordovaPlugin {
                 String pidCheck = args.getString(0);
                 callbackContextMap.put(pidCheck, callbackContext);
                 isProcessRunning(pidCheck);
+                return true;
+            case "gunzip":
+                gunzip(args.getString(0), args.getString(1), callbackContext);
+                return true;
+            case "download":
+                download(args.getString(0), args.getString(1), callbackContext);
                 return true;
             default:
                 callbackContext.error("Unknown action: " + action);
@@ -407,6 +467,81 @@ public class Executor extends CordovaPlugin {
 
     private void cleanupCallback(String id) {
         callbackContextMap.remove(id);
+    }
+
+    private void gunzip(String src, String dst, CallbackContext callbackContext) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                nativeLog("log", "gunzip: " + src + " -> " + dst);
+                java.io.File srcFile = new java.io.File(src);
+                java.io.File dstFile = new java.io.File(dst);
+                byte[] buf = new byte[65536];
+                long total = 0;
+                try (java.util.zip.GZIPInputStream gis = new java.util.zip.GZIPInputStream(
+                        new java.io.FileInputStream(srcFile));
+                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
+                    int len;
+                    while ((len = gis.read(buf)) > 0) {
+                        fos.write(buf, 0, len);
+                        total += len;
+                    }
+                }
+                nativeLog("log", "gunzip done: " + total + " bytes");
+                callbackContext.success(dst);
+            } catch (Exception e) {
+                nativeLog("error", "gunzip failed: " + e.getMessage());
+                callbackContext.error("gunzip failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void download(String url, String dst, CallbackContext callbackContext) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                nativeLog("log", "download: " + url);
+                java.net.URL u = new java.net.URL(url);
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) u.openConnection();
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(30000);
+                conn.setReadTimeout(60000);
+                conn.connect();
+                int code = conn.getResponseCode();
+                // Follow redirects across protocols (HTTP→HTTPS)
+                if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                    String loc = conn.getHeaderField("Location");
+                    conn.disconnect();
+                    u = new java.net.URL(loc);
+                    conn = (java.net.HttpURLConnection) u.openConnection();
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setConnectTimeout(30000);
+                    conn.setReadTimeout(60000);
+                    conn.connect();
+                    code = conn.getResponseCode();
+                }
+                if (code != 200) {
+                    conn.disconnect();
+                    callbackContext.error("HTTP " + code);
+                    return;
+                }
+                java.io.File dstFile = new java.io.File(dst);
+                byte[] buf = new byte[65536];
+                long total = 0;
+                try (java.io.InputStream is = conn.getInputStream();
+                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
+                    int len;
+                    while ((len = is.read(buf)) > 0) {
+                        fos.write(buf, 0, len);
+                        total += len;
+                    }
+                }
+                conn.disconnect();
+                nativeLog("log", "download done: " + dst + " (" + total + " bytes)");
+                callbackContext.success(dst);
+            } catch (Exception e) {
+                callbackContext.error("download failed: " + e.getMessage());
+                nativeLog("error", "download failed: " + e.getMessage());
+            }
+        });
     }
 
     @Override
