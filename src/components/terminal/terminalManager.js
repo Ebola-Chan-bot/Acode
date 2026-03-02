@@ -246,7 +246,9 @@ class TerminalManager {
 
 						// Connect to session if in server mode
 						if (terminalComponent.serverMode) {
+							console.log(`[TerminalManager] connecting to session, pid=${terminalOptions.pid || "auto"}...`);
 							await terminalComponent.connectToSession(terminalOptions.pid);
+							console.log(`[TerminalManager] connectToSession resolved, component.pid=${terminalComponent.pid}`);
 						} else {
 							// For local mode, just write a welcome message
 							terminalComponent.write(
@@ -323,13 +325,14 @@ class TerminalManager {
 
 	/**
 	 * Check if terminal is installed and install if needed
+	 * @param {boolean} [forceReinstall=false] - Whether to force reinstall even if already installed
 	 * @returns {Promise<{success: boolean, error?: string}>}
 	 */
-	async checkAndInstallTerminal() {
+	async checkAndInstallTerminal(forceReinstall = false) {
 		try {
 			// Check if terminal is already installed
 			const isInstalled = await Terminal.isInstalled();
-			if (isInstalled) {
+			if (isInstalled && !forceReinstall) {
 				return { success: true };
 			}
 
@@ -611,15 +614,46 @@ class TerminalManager {
 			console.log(`Terminal ${terminalId} disconnected`);
 		};
 
-		terminalComponent.onError = (error) => {
+		terminalComponent.onError = async (error) => {
 			console.error(`Terminal ${terminalId} error:`, error);
 
 			// Close the terminal and remove the tab
 			this.closeTerminal(terminalId, true);
 
+			// Auto-repair: clear .configured and immediately trigger reinstall flow
+			let resetOk = false;
+			try {
+				resetOk = await Terminal.resetConfigured();
+				console.log(`[Terminal] resetConfigured after connection error: ${resetOk}`);
+			} catch (_) { /* ignore */ }
+
+			let repair = { success: false, error: "reinstall not attempted" };
+			try {
+				repair = await this.checkAndInstallTerminal(true);
+				console.log(`[Terminal] checkAndInstallTerminal result: ${JSON.stringify(repair)}`);
+			} catch (installError) {
+				repair = {
+					success: false,
+					error: installError?.message || String(installError),
+				};
+			}
+
 			// Show alert for connection error
 			const errorMessage = error?.message || "Connection lost";
-			alert(strings["error"], `Terminal connection error: ${errorMessage}`);
+			if (repair.success) {
+				const resetNote = resetOk
+					? ""
+					: "\nNote: resetConfigured=false, but reinstall completed.";
+				alert(
+					strings["error"],
+					`Terminal connection error: ${errorMessage}\nTerminal environment re-configured. Please open terminal again.${resetNote}`,
+				);
+			} else {
+				alert(
+					strings["error"],
+					`Terminal connection error: ${errorMessage}\nAuto-repair failed: ${repair.error || "unknown"}\nresetConfigured=${resetOk}`,
+				);
+			}
 		};
 
 		terminalComponent.onTitleChange = async (title) => {

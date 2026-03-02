@@ -581,31 +581,60 @@ export default class TerminalComponent {
 
 		try {
 			// Check if terminal is installed before starting AXS
-			if (!(await Terminal.isInstalled())) {
+			const installed = await Terminal.isInstalled();
+			console.log(`[Terminal:createSession] isInstalled=${installed}`);
+			if (!installed) {
 				throw new Error(
 					"Terminal not installed. Please install terminal first.",
 				);
 			}
 
 			// Start AXS if not running
-			if (!(await Terminal.isAxsRunning())) {
+			const axsRunning = await Terminal.isAxsRunning();
+			console.log(`[Terminal:createSession] isAxsRunning=${axsRunning}`);
+
+			const pollAxs = async (maxRetries = 30, intervalMs = 1000) => {
+				for (let i = 0; i < maxRetries; i++) {
+					await new Promise((r) => setTimeout(r, intervalMs));
+					const running = await Terminal.isAxsRunning();
+					if (running) {
+						console.log(`[Terminal:createSession] pollAxs: AXS ready after ${i + 1}s`);
+						return true;
+					}
+					if (i % 5 === 4) {
+						console.log(`[Terminal:createSession] pollAxs: waiting... (${i + 1}/${maxRetries})`);
+					}
+				}
+				return false;
+			};
+
+			if (!axsRunning) {
+				console.log('[Terminal:createSession] calling startAxs(false)...');
 				await Terminal.startAxs(false, () => {}, console.error);
 
-				// Check if AXS started with interval polling
-				const maxRetries = 10;
-				let retries = 0;
-				while (retries < maxRetries) {
-					await new Promise((resolve) => setTimeout(resolve, 1000));
-					if (await Terminal.isAxsRunning()) {
-						break;
-					}
-					retries++;
-				}
+				// Two-phase startup: proot --setup-only takes ~5-8s, then AXS starts.
+				// Wait up to 30s before attempting repair.
+				const pollResult = await pollAxs(30);
+				console.log(`[Terminal:createSession] pollAxs result=${pollResult}`);
+				if (!pollResult) {
+					// AXS failed to start — attempt auto-repair
+					toast("Repairing terminal environment...");
+					console.log("[Terminal] AXS failed to start, attempting repair");
 
-				// If AXS still not running after retries, throw error
-				if (!(await Terminal.isAxsRunning())) {
-					toast("Failed to start AXS server after multiple attempts");
-					//throw new Error("Failed to start AXS server after multiple attempts");
+					try { await Terminal.stopAxs(); } catch (_) { /* ignore */ }
+
+					// Re-run installing flow to repair packages / config
+					const repairOk = await Terminal.startAxs(true, console.log, console.error);
+					if (repairOk) {
+						// Start AXS again after repair
+						await Terminal.startAxs(false, () => {}, console.error);
+					}
+
+					if (!(await pollAxs(30))) {
+						// Still broken — clear .configured so next open re-triggers install
+						try { await Terminal.resetConfigured(); } catch (_) { /* ignore */ }
+						throw new Error("Failed to start AXS server after repair attempt");
+					}
 				}
 			}
 
@@ -614,26 +643,107 @@ export default class TerminalComponent {
 				rows: this.terminal.rows,
 			};
 
-			const response = await fetch(
-				`http://localhost:${this.options.port}/terminals`,
-				{
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify(requestBody),
-				},
-			);
+			console.log(`[Terminal:createSession] AXS ready, creating session on port ${this.options.port}...`);
 
-			if (!response.ok) {
-				throw new Error(`HTTP error! status: ${response.status}`);
+			// Helper: try to create a session by fetching POST /terminals
+			// Returns { host, pid } on success, or null on complete failure.
+			// Throws on PTY error (AXS reachable but can't create terminal).
+			const tryCreateSession = async (hostList, sessionPort) => {
+				console.log(`[Terminal:createSession] trying hosts: ${hostList.join(", ")}, port: ${sessionPort}`);
+				for (const host of hostList) {
+					try {
+						const testResp = await fetch(`http://${host}:${sessionPort}/terminals`, {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify(requestBody),
+						});
+						if (testResp.ok) {
+							const data = await testResp.text();
+							const trimmed = data.trim();
+							// Detect AXS error response (e.g. PTY failure)
+							if (trimmed.startsWith('{')) {
+								try {
+									const errObj = JSON.parse(trimmed);
+									if (errObj.error) {
+										console.error(`[Terminal:createSession] AXS error on ${host}: ${errObj.error}`);
+										// Return special marker for PTY/server error
+										return { host, pid: trimmed, axsError: errObj.error };
+									}
+								} catch (_) { /* not JSON, treat as PID */ }
+							}
+							console.log(`[Terminal:createSession] connected via ${host}, pid=${trimmed}`);
+							return { host, pid: trimmed };
+						}
+					} catch (e) {
+						console.log(`[Terminal:createSession] ${host} failed: ${e.message}`);
+					}
+				}
+				return null;
+			};
+
+			// Build list of hosts to try, in priority order:
+			// 1. Terminal.axsHost — parsed from AXS "listening on X:Y" output (most reliable)
+			// 2. localhost — works on normal devices where loopback is shared
+			// 3. getDeviceIp() — LAN IP fallback for 卓易通/HarmonyOS network isolation
+			const buildHostList = async () => {
+				const hosts = [];
+				if (Terminal.axsHost && Terminal.axsHost !== "127.0.0.1") {
+					hosts.push(Terminal.axsHost);
+				}
+				hosts.push("localhost");
+				const deviceIp = await Terminal.getDeviceIp();
+				if (deviceIp && deviceIp !== "localhost" && !hosts.includes(deviceIp)) {
+					hosts.push(deviceIp);
+				}
+				return hosts;
+			};
+
+			const port = Terminal.axsPort || this.options.port;
+			const hosts = await buildHostList();
+			let result = await tryCreateSession(hosts, port);
+
+			// === Fallback: If inside-proot AXS is unreachable, switch to outside-proot ===
+			if (!result && !Terminal._outsideProot) {
+				console.log("[Terminal:createSession] Inside-proot AXS unreachable from WebView, switching to outside-proot mode...");
+				try { await Terminal.stopAxs(); } catch (_) { /* ignore */ }
+				Terminal._outsideProot = true;
+
+				// Start AXS outside proot (fire-and-forget — pollAxs will wait)
+				Terminal.startAxs(false, () => {}, console.error);
+
+				// Wait for outside-proot AXS to start
+				const outsidePoll = await pollAxs(20);
+				console.log(`[Terminal:createSession] outside-proot pollAxs result=${outsidePoll}`);
+				if (outsidePoll) {
+					const retryPort = Terminal.axsPort || this.options.port;
+					const retryHosts = await buildHostList();
+					result = await tryCreateSession(retryHosts, retryPort);
+				}
 			}
 
-			const data = await response.text();
-			this.pid = data.trim();
+			if (!result) {
+				const modes = Terminal._outsideProot ? "inside-proot + outside-proot" : "inside-proot";
+				throw new Error(`Cannot reach AXS on any host (tried ${modes} modes)`);
+			}
+
+			// Check for AXS-level error (e.g. PTY Permission Denied)
+			if (result.axsError) {
+				console.error(`[Terminal:createSession] AXS server error: ${result.axsError}`);
+				// Still set the host for potential diagnostics, but the session is broken
+				this._axsHost = result.host;
+				this.pid = result.pid;
+				// Don't throw — let the WebSocket attempt show the actual failure,
+				// so user sees "Connection lost" rather than a cryptic error
+				console.log(`[Terminal:createSession] WARNING: session has AXS error, WebSocket will likely fail`);
+				return this.pid;
+			}
+
+			this._axsHost = result.host;
+			this.pid = result.pid;
+			console.log(`[Terminal:createSession] session created, pid=${this.pid}`);
 			return this.pid;
 		} catch (error) {
-			console.error("Failed to create terminal session:", error);
+			console.error("[Terminal:createSession] FAILED:", error?.message || error);
 			throw error;
 		}
 	}
@@ -655,11 +765,15 @@ export default class TerminalComponent {
 
 		this.pid = pid;
 
-		const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
+		const wsHost = this._axsHost || "localhost";
+		const wsPort = Terminal.axsPort || this.options.port;
+		const wsUrl = `ws://${wsHost}:${wsPort}/terminals/${pid}`;
+		console.log(`[Terminal:connectToSession] connecting WebSocket to ${wsUrl}`);
 
 		this.websocket = new WebSocket(wsUrl);
 
 		this.websocket.onopen = () => {
+			console.log(`[Terminal:connectToSession] WebSocket opened for pid=${pid}`);
 			this.isConnected = true;
 			this.onConnect?.();
 
@@ -690,12 +804,13 @@ export default class TerminalComponent {
 		};
 
 		this.websocket.onclose = (event) => {
+			console.log(`[Terminal:connectToSession] WebSocket closed code=${event.code} reason=${event.reason} wasClean=${event.wasClean}`);
 			this.isConnected = false;
 			this.onDisconnect?.();
 		};
 
 		this.websocket.onerror = (error) => {
-			console.error("WebSocket error:", error);
+			console.error(`[Terminal:connectToSession] WebSocket error:`, error?.message || error?.type || error);
 			this.onError?.(error);
 		};
 	}
@@ -709,8 +824,10 @@ export default class TerminalComponent {
 		if (!this.pid || !this.serverMode) return;
 
 		try {
+			const host = this._axsHost || "localhost";
+			const port = Terminal.axsPort || this.options.port;
 			await fetch(
-				`http://localhost:${this.options.port}/terminals/${this.pid}/resize`,
+				`http://${host}:${port}/terminals/${this.pid}/resize`,
 				{
 					method: "POST",
 					headers: {
