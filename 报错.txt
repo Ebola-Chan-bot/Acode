@@ -1,28 +1,17 @@
 🚀 Installing Terminal Environment...
 This may take a few minutes depending on your connection.
 
-⬇️  Downloading sandbox filesystem...
-⬇️  Downloading axs...
-🐧  F-Droid flavor detected, checking additional files...
-⬇️  Downloading compatibility layer...
-⬇️  Downloading supporting library...
-✅  All downloads completed
-📁  Setting up directories...
-📦  Extracting sandbox filesystem...
-⚙️  Applying basic configuration...
-✅  Extraction complete
+✅  Downloads cached, skipping download phase
+✅  Extraction cached, skipping extraction phase
 ⚙️  Updating sandbox enviroment...
 OK
 File written successfully
 OK
 File written successfully
-OK
-File written successfully
-OK
 File written successfully
 DEBUG-SANDBOX: PROOT=/data/user/0/com.foxdebug.acode/files/libproot-xed.so
 DEBUG-SANDBOX: PREFIX=/data/user/0/com.foxdebug.acode/files
-DEBUG-SANDBOX: init-alpine.sh=-rwx------ 1 u0_a138 u0_a138 15247 2026-03-03 19:02 /data/user/0/com.foxdebug.acode/files/init-alpine.sh
+DEBUG-SANDBOX: init-alpine.sh=-rwx------ 1 u0_a138 u0_a138 12610 2026-03-03 19:14 /data/user/0/com.foxdebug.acode/files/init-alpine.sh
 DEBUG-SANDBOX: /bin/sh in rootfs=lrwxrwxrwx 1 u0_a138 u0_a138 12 2024-12-05 20:20 /data/user/0/com.foxdebug.acode/files/alpine/bin/sh -> /bin/busybox
 DEBUG-SANDBOX: busybox=-rwxr-xr-x 1 u0_a138 u0_a138 919304 2024-11-20 05:09 /data/user/0/com.foxdebug.acode/files/alpine/bin/busybox
 DEBUG-SANDBOX: running proot with args: --kill-on-exit -b /apex -b /odm -b /system/product -b /system -b /system/system_ext -b /vendor -b /linkerconfig/ld.config.txt -b /linkerconfig/com.android.art/ld.config.txt -b /sdcard -b /storage -b /dev -b /data -b /dev/urandom:/dev/random -b /proc -b /sys -b /data/user/0/com.foxdebug.acode/files -b /data/user/0/com.foxdebug.acode/files/public:/public -b /data/user/0/com.foxdebug.acode/files/alpine/tmp:/dev/shm -b /proc/self/fd:/dev/fd -b /proc/self/fd/0:/dev/stdin -b /proc/self/fd/1:/dev/stdout -b /proc/self/fd/2:/dev/stderr -r /data/user/0/com.foxdebug.acode/files/alpine -0 --link2symlink -L
@@ -50,6 +39,7 @@ DEBUG-PTY-OUTSIDE: getenforce: getenforce: Couldn't get enforcing status: Permis
 DEBUG-PTY-OUTSIDE: SELinux context: u:r:aoco_untrusted_app_27:s0:c138,c256,c512,c768
 DEBUG-PTY-OUTSIDE: /dev/ptmx context: crw-rw-rw- 1 root root u:object_r:aoco_ptmx_device:s0  5,   2 2026-03-01 02:26 /dev/ptmx
 DEBUG-PTY-OUTSIDE: /dev/pts context: ls: /dev/pts: Permission denied
+DEBUG-PTY-OUTSIDE: no pre-compiled pty_test found
 DEBUG-PTY-OUTSIDE: === end PTY diagnostic ===
 DEBUG-ALPINE: script started, args=--installing
 DEBUG-PTY-INSIDE: === PTY diagnostic (inside proot) ===
@@ -58,21 +48,19 @@ DEBUG-PTY-INSIDE: /dev/ptmx exists: YES
 DEBUG-PTY-INSIDE: /dev/ptmx stat: crw-rw-rw-    1 root     root        5,   2 Feb 28 18:26 /dev/ptmx
 DEBUG-PTY-INSIDE: /dev/pts exists: NO
 DEBUG-PTY-INSIDE: /dev/pts stat: ls: /dev/pts: Permission denied
-DEBUG-PTY-INSIDE: /dev/pts contents: ls: /dev/pts/: Permission denied
+DEBUG-PTY-INSIDE: /dev/pts contents: 
 DEBUG-PTY-INSIDE: /dev/pts/ptmx stat: ls: /dev/pts/ptmx: No such file or directory
 DEBUG-PTY-INSIDE: /dev/pt*: ls: /dev/pt*: No such file or directory
 DEBUG-PTY-INSIDE: /proc/mounts devpts: NOT MOUNTED
-DEBUG-PTY-INSIDE: /proc/filesystems: not found
+DEBUG-PTY-INSIDE: /proc/filesystems: grep: /proc/filesystems: Permission denied
+not found
 DEBUG-PTY-INSIDE: id: uid=0(root) gid=0(root) groups=3003,9997,20138,50138
-DEBUG-PTY-INSIDE: SELinux: 
+DEBUG-PTY-INSIDE: SELinux: u:r:aoco_untrusted_app_27:s0:c138,c256,c512,c768
 DEBUG-PTY-INSIDE: open(/dev/ptmx) = SUCCESS
-DEBUG-PTY-INSIDE: /proc/self/fd/3: lrwx------    1 root     root            64 Mar  3 11:04 /proc/self/fd/3 -> /dev/ptmx
+DEBUG-PTY-INSIDE: /proc/self/fd/3: lrwx------    1 root     root            64 Mar  3 11:14 /proc/self/fd/3 -> /dev/ptmx
 DEBUG-PTY-INSIDE: fdinfo/3: cat: can't open '/proc/self/fdinfo/3': No such file or directory
 DEBUG-PTY-INSIDE: /dev/pts/ after open: ls: /dev/pts/: Permission denied
-DEBUG-PTY-INSIDE: gcc not available, trying to install...
-fetch https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/APKINDEX.tar.gz
-fetch https://dl-cdn.alpinelinux.org/alpine/v3.21/community/aarch64/APKINDEX.tar.gz
-DEBUG-PTY-INSIDE: cannot install gcc, skipping C test
+DEBUG-PTY-INSIDE: no pre-compiled pty_test found (push to /sdcard/Download/pty_test)
 DEBUG-PTY-INSIDE: === end PTY diagnostic ===
 [*] Installing packages: bash command-not-found tzdata gcc musl-dev
 fetch https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/APKINDEX.tar.gz
@@ -82,13 +70,3 @@ fetch https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/APKINDEX.tar.gz
 fetch https://dl-cdn.alpinelinux.org/alpine/v3.21/community/aarch64/APKINDEX.tar.gz
 [!] Retrying with mirror...
 fetch https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main/aarch64/APKINDEX.tar.gz
-fetch https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community/aarch64/APKINDEX.tar.gz
-[!] bash still missing
-[!] Some packages failed to install
-Configuring timezone...
-Failed to detect timezone
-Some packages failed to install (network issue?).
-Terminal will use /bin/sh. To install bash later, run:
-apk update && apk add bash wget
-DEBUG-SANDBOX: proot exited with code 0
-exit 0
