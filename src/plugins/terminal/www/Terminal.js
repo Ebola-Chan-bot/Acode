@@ -27,25 +27,34 @@ const Terminal = {
             }
         }
 
+        console.log("[Terminal:startAxs] getting filesDir...");
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
         });
+        console.log("[Terminal:startAxs] filesDir=" + filesDir);
 
         // === Run PTY capability test immediately (no sandbox needed) ===
         try {
+            console.log("[PTY-TEST] copying asset...");
             await new Promise((resolve, reject) => {
                 system.copyAsset("pty_test", `${filesDir}/pty_test`, resolve, reject);
             });
+            console.log("[PTY-TEST] setting exec permission...");
             await new Promise((resolve, reject) => {
                 system.setExec(`${filesDir}/pty_test`, "true", resolve, reject);
             });
-            const ptyResult = await Executor.execute(`${filesDir}/pty_test`);
+            console.log("[PTY-TEST] executing pty_test (10s timeout)...");
+            const ptyResult = await Promise.race([
+                Executor.execute(`${filesDir}/pty_test`),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("pty_test timed out after 10s")), 10000))
+            ]);
             console.log("[PTY-TEST] " + ptyResult);
             logger("[PTY-TEST] " + ptyResult);
         } catch (e) {
             console.error("[PTY-TEST] failed:", e);
             logger("[PTY-TEST] error: " + e);
         }
+        console.log("[PTY-TEST] done, continuing startAxs...");
         // === End PTY test ===
 
         if (installing) {

@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 
 /* TIOCGPTPEER may not be defined in older headers */
 #ifndef TIOCGPTPEER
@@ -105,21 +106,39 @@ int main(void) {
         snprintf(detail, sizeof(detail), "slave_fd=%d", slave_fd);
         test_result("TEST6_TIOCGPTPEER", 1, detail);
 
-        /* TEST 7: verify the PTY pair actually works (read/write) */
-        const char *msg = "HELLO_PTY";
+        /* TEST 7: verify the PTY pair actually works (write slave, read master) */
+        /* Slave → Master is the "process output" direction and won't block */
+        const char *msg = "HELLO_PTY\n";
         char buf[64] = {0};
         ssize_t nw, nr;
 
-        /* Write to master, read from slave */
-        nw = write(master_fd, msg, strlen(msg));
+        /* Set master to non-blocking so read won't hang */
+        int flags = fcntl(master_fd, F_GETFL);
+        fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+
+        /* Also disable echo on slave to avoid loopback noise */
+        struct termios tio;
+        if (tcgetattr(slave_fd, &tio) == 0) {
+            tio.c_lflag &= ~(ECHO | ECHONL);
+            tcsetattr(slave_fd, TCSANOW, &tio);
+        }
+
+        /* Write to slave (simulates process output), read from master */
+        nw = write(slave_fd, msg, strlen(msg));
         if (nw > 0) {
-            nr = read(slave_fd, buf, sizeof(buf) - 1);
+            usleep(50000); /* 50ms for data to propagate */
+            nr = read(master_fd, buf, sizeof(buf) - 1);
             if (nr > 0) {
                 buf[nr] = '\0';
-                if (strncmp(buf, msg, strlen(msg)) == 0) {
-                    test_result("TEST7_pty_rw", 1, "master->slave OK");
+                /* Strip \r\n added by line discipline */
+                char *p = buf; while (*p == '\r' || *p == '\n') p++;
+                char *end = p + strlen(p);
+                while (end > p && (end[-1] == '\r' || end[-1] == '\n')) end--;
+                *end = '\0';
+                if (strstr(p, "HELLO_PTY")) {
+                    test_result("TEST7_pty_rw", 1, "slave->master OK");
                 } else {
-                    snprintf(detail, sizeof(detail), "got '%s' expected '%s'", buf, msg);
+                    snprintf(detail, sizeof(detail), "got '%s' expected contains 'HELLO_PTY'", p);
                     test_result("TEST7_pty_rw", 0, detail);
                 }
             } else {
