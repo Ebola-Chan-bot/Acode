@@ -9,13 +9,13 @@
 .\Acode\scripts\hdc-debug\deploy.ps1 -Action full
 
 # 仅 Gradle 构建 + 推送（跳过 rspack，适合只改了脚本/Java/assets）
-.\scripts\hdc-debug\deploy.ps1 -Action bp
+.\Acode\scripts\hdc-debug\deploy.ps1 -Action bp
 
 # 仅推送已构建的 APK
 .\Acode\scripts\hdc-debug\deploy.ps1 -Action push
 
 # 启动调试服务器（LAN 模式，不用 rport）
-.\scripts\hdc-debug\deploy.ps1 -Action server
+.\Acode\scripts\hdc-debug\deploy.ps1 -Action server
 ```
 
 ### 目标设备

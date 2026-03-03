@@ -34,108 +34,32 @@ else
     echo "DEBUG-PTY-INSIDE: open error: $(exec 3<>/dev/ptmx 2>&1)"
 fi
 
-# Test 2: Compile and run a C program that tests openpty() and TIOCGPTPEER
-if command -v gcc >/dev/null 2>&1; then
-    echo "DEBUG-PTY-INSIDE: gcc available, compiling PTY test..."
-    cat > /tmp/pty_test.c << 'CEOF'
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
-#include <errno.h>
-#include <sys/ioctl.h>
+# Test 2: Run pre-compiled PTY test binary (cross-compiled with NDK)
+# Look for it in several possible locations
+PTY_TEST=""
+for p in /sdcard/Download/pty_test /storage/emulated/0/Download/pty_test /storage/media/100/local/files/Docs/Download/pty_test; do
+    if [ -f "$p" ]; then
+        PTY_TEST="$p"
+        break
+    fi
+done
 
-/* TIOCGPTPEER: get slave fd directly from master fd (Linux 4.13+) */
-#ifndef TIOCGPTPEER
-#define TIOCGPTPEER _IO('T', 0x41)
-#endif
-
-int main() {
-    int master_fd, slave_fd, ret;
-    char slave_name[256];
-
-    printf("=== PTY C Test ===\n");
-
-    /* Test 1: open /dev/ptmx */
-    master_fd = open("/dev/ptmx", O_RDWR | O_NOCTTY);
-    if (master_fd < 0) {
-        printf("TEST1 open(/dev/ptmx): FAIL errno=%d (%s)\n", errno, strerror(errno));
-        /* Try /dev/pts/ptmx as alternative */
-        master_fd = open("/dev/pts/ptmx", O_RDWR | O_NOCTTY);
-        if (master_fd < 0) {
-            printf("TEST1 open(/dev/pts/ptmx): FAIL errno=%d (%s)\n", errno, strerror(errno));
-            printf("=== No PTY master available, all tests skipped ===\n");
-            return 1;
-        }
-        printf("TEST1 open(/dev/pts/ptmx): OK fd=%d\n", master_fd);
-    } else {
-        printf("TEST1 open(/dev/ptmx): OK fd=%d\n", master_fd);
-    }
-
-    /* Test 2: grantpt + unlockpt */
-    ret = grantpt(master_fd);
-    printf("TEST2 grantpt: %s errno=%d (%s)\n", ret==0?"OK":"FAIL", errno, ret?strerror(errno):"none");
-
-    ret = unlockpt(master_fd);
-    printf("TEST3 unlockpt: %s errno=%d (%s)\n", ret==0?"OK":"FAIL", errno, ret?strerror(errno):"none");
-
-    /* Test 3: ptsname - get slave path */
-    char *name = ptsname(master_fd);
-    if (name) {
-        printf("TEST4 ptsname: OK -> %s\n", name);
-        strncpy(slave_name, name, sizeof(slave_name)-1);
-
-        /* Test 4: open slave via path */
-        slave_fd = open(slave_name, O_RDWR | O_NOCTTY);
-        if (slave_fd >= 0) {
-            printf("TEST5 open(slave_path): OK fd=%d\n", slave_fd);
-            close(slave_fd);
-        } else {
-            printf("TEST5 open(slave_path=%s): FAIL errno=%d (%s)\n", slave_name, errno, strerror(errno));
-        }
-    } else {
-        printf("TEST4 ptsname: FAIL errno=%d (%s)\n", errno, strerror(errno));
-    }
-
-    /* Test 5: TIOCGPTPEER ioctl (Linux 4.13+) */
-    /* This gets the slave fd directly without needing /dev/pts/ access */
-    errno = 0;
-    slave_fd = ioctl(master_fd, TIOCGPTPEER, O_RDWR | O_NOCTTY);
-    if (slave_fd >= 0) {
-        printf("TEST6 TIOCGPTPEER: OK fd=%d  *** THIS BYPASSES /dev/pts ***\n", slave_fd);
-        close(slave_fd);
-    } else {
-        printf("TEST6 TIOCGPTPEER: FAIL errno=%d (%s)\n", errno, strerror(errno));
-    }
-
-    /* Test 6: openpty() - the function AXS actually uses */
-    /* Need pty.h */
-    close(master_fd);
-
-    printf("=== End PTY C Test ===\n");
-    return 0;
-}
-CEOF
-    gcc -o /tmp/pty_test /tmp/pty_test.c 2>&1
-    if [ -f /tmp/pty_test ]; then
-        echo "DEBUG-PTY-INSIDE: C test compiled, running..."
+if [ -n "$PTY_TEST" ]; then
+    echo "DEBUG-PTY-INSIDE: found pre-compiled test at $PTY_TEST"
+    cp "$PTY_TEST" /tmp/pty_test 2>&1
+    chmod 755 /tmp/pty_test 2>&1
+    if [ -x /tmp/pty_test ]; then
+        echo "DEBUG-PTY-INSIDE: running pre-compiled PTY test..."
         /tmp/pty_test 2>&1 | while IFS= read -r line; do
             echo "DEBUG-PTY-INSIDE: [C] $line"
         done
-        rm -f /tmp/pty_test /tmp/pty_test.c
+        rm -f /tmp/pty_test
     else
-        echo "DEBUG-PTY-INSIDE: C test compile FAILED"
+        echo "DEBUG-PTY-INSIDE: failed to make pty_test executable"
+        ls -la /tmp/pty_test 2>&1
     fi
 else
-    echo "DEBUG-PTY-INSIDE: gcc not available, trying to install..."
-    apk add --no-scripts gcc musl-dev 2>/dev/null
-    if command -v gcc >/dev/null 2>&1; then
-        echo "DEBUG-PTY-INSIDE: gcc installed, will test on next run"
-    else
-        echo "DEBUG-PTY-INSIDE: cannot install gcc, skipping C test"
-    fi
+    echo "DEBUG-PTY-INSIDE: no pre-compiled pty_test found (push to /sdcard/Download/pty_test)"
 fi
 
 echo "DEBUG-PTY-INSIDE: === end PTY diagnostic ==="

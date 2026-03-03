@@ -140,6 +140,31 @@ echo "DEBUG-PTY-OUTSIDE: SELinux context: $(cat /proc/self/attr/current 2>&1)"
 echo "DEBUG-PTY-OUTSIDE: /dev/ptmx context: $(ls -laZ /dev/ptmx 2>&1)"
 echo "DEBUG-PTY-OUTSIDE: /dev/pts context: $(ls -ladZ /dev/pts 2>&1)"
 
+# Test 5: Run pre-compiled PTY test binary outside proot
+PTY_TEST_OUT=""
+for p in /sdcard/Download/pty_test /storage/emulated/0/Download/pty_test /storage/media/100/local/files/Docs/Download/pty_test; do
+    if [ -f "$p" ]; then
+        PTY_TEST_OUT="$p"
+        break
+    fi
+done
+if [ -n "$PTY_TEST_OUT" ]; then
+    echo "DEBUG-PTY-OUTSIDE: found pre-compiled test at $PTY_TEST_OUT"
+    cp "$PTY_TEST_OUT" "$PREFIX/pty_test" 2>&1
+    chmod 755 "$PREFIX/pty_test" 2>&1
+    if [ -x "$PREFIX/pty_test" ]; then
+        echo "DEBUG-PTY-OUTSIDE: running pre-compiled PTY test..."
+        "$PREFIX/pty_test" 2>&1 | while IFS= read -r line; do
+            echo "DEBUG-PTY-OUTSIDE: [C] $line"
+        done
+        rm -f "$PREFIX/pty_test"
+    else
+        echo "DEBUG-PTY-OUTSIDE: failed to make pty_test executable"
+    fi
+else
+    echo "DEBUG-PTY-OUTSIDE: no pre-compiled pty_test found"
+fi
+
 echo "DEBUG-PTY-OUTSIDE: === end PTY diagnostic ==="
 
 # --setup-only mode: run init-alpine.sh for setup, then RETURN to caller
