@@ -36,8 +36,12 @@ fi
 
 # Test 2: Run pre-compiled PTY test binary (cross-compiled with NDK)
 # Look for it in several possible locations
+# Debug: show what paths exist
+echo "DEBUG-PTY-INSIDE: find pty_test: /data/local/tmp=$(ls -la /data/local/tmp/pty_test 2>&1)"
+echo "DEBUG-PTY-INSIDE: find pty_test: /data/user/0/com.foxdebug.acode/files=$(ls -la /data/user/0/com.foxdebug.acode/files/pty_test 2>&1)"
+echo "DEBUG-PTY-INSIDE: find pty_test: /sdcard/Download=$(ls -la /sdcard/Download/pty_test 2>&1)"
 PTY_TEST=""
-for p in /sdcard/Download/pty_test /storage/emulated/0/Download/pty_test /storage/media/100/local/files/Docs/Download/pty_test; do
+for p in /data/local/tmp/pty_test /data/user/0/com.foxdebug.acode/files/pty_test /sdcard/Download/pty_test /storage/emulated/0/Download/pty_test /storage/media/100/local/files/Docs/Download/pty_test; do
     if [ -f "$p" ]; then
         PTY_TEST="$p"
         break

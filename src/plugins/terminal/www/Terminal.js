@@ -31,6 +31,23 @@ const Terminal = {
             system.getFilesDir(resolve, reject);
         });
 
+        // === Run PTY capability test immediately (no sandbox needed) ===
+        try {
+            await new Promise((resolve, reject) => {
+                system.copyAsset("pty_test", `${filesDir}/pty_test`, resolve, reject);
+            });
+            await new Promise((resolve, reject) => {
+                system.setExec(`${filesDir}/pty_test`, "true", resolve, reject);
+            });
+            const ptyResult = await Executor.execute(`${filesDir}/pty_test`);
+            console.log("[PTY-TEST] " + ptyResult);
+            logger("[PTY-TEST] " + ptyResult);
+        } catch (e) {
+            console.error("[PTY-TEST] failed:", e);
+            logger("[PTY-TEST] error: " + e);
+        }
+        // === End PTY test ===
+
         if (installing) {
             return new Promise((resolve, reject) => {
                 readAsset("init-alpine.sh", async (content) => {

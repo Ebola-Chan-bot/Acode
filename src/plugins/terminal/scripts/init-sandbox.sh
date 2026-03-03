@@ -141,8 +141,12 @@ echo "DEBUG-PTY-OUTSIDE: /dev/ptmx context: $(ls -laZ /dev/ptmx 2>&1)"
 echo "DEBUG-PTY-OUTSIDE: /dev/pts context: $(ls -ladZ /dev/pts 2>&1)"
 
 # Test 5: Run pre-compiled PTY test binary outside proot
+# Debug: show what paths exist
+echo "DEBUG-PTY-OUTSIDE: find pty_test: ls /data/local/tmp/pty_test=$(ls -la /data/local/tmp/pty_test 2>&1)"
+echo "DEBUG-PTY-OUTSIDE: find pty_test: ls /sdcard/Download/pty_test=$(ls -la /sdcard/Download/pty_test 2>&1)"
+echo "DEBUG-PTY-OUTSIDE: find pty_test: ls $PREFIX/pty_test=$(ls -la $PREFIX/pty_test 2>&1)"
 PTY_TEST_OUT=""
-for p in /sdcard/Download/pty_test /storage/emulated/0/Download/pty_test /storage/media/100/local/files/Docs/Download/pty_test; do
+for p in /data/local/tmp/pty_test $PREFIX/pty_test /sdcard/Download/pty_test /storage/emulated/0/Download/pty_test /storage/media/100/local/files/Docs/Download/pty_test; do
     if [ -f "$p" ]; then
         PTY_TEST_OUT="$p"
         break

@@ -445,11 +445,14 @@ function Invoke-GradleBuild {
     Write-Step "Gradle 构建 debug APK"
     Push-Location (Split-Path $GradlewBat)
     try {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         & $GradlewBat assembleDebug 2>&1 | ForEach-Object {
             if ($_ -match 'BUILD (SUCCESSFUL|FAILED)') {
                 Write-Host "  $_" -ForegroundColor $(if ($_ -match 'SUCCESSFUL') { 'Green' } else { 'Red' })
             }
         }
+        $ErrorActionPreference = $prevEAP
         if ($LASTEXITCODE -ne 0) {
             Write-Err "Gradle 构建失败 (exit code: $LASTEXITCODE)"
             exit 1
@@ -541,14 +544,16 @@ function Invoke-Push {
 # ─── 同步插件脚本/资源到平台目录 ──────────────────────────────────────
 function Invoke-SyncPluginAssets {
     $PlatformAssets = Join-Path $ProjectRoot "platforms/android/app/src/main/assets"
+    $PlatformJavaRoot = Join-Path $ProjectRoot "platforms/android/app/src/main/java"
+
     if (-not (Test-Path $PlatformAssets)) {
         Write-Warn "平台 assets 目录不存在，跳过插件同步"
         return
     }
 
-    Write-Step "同步插件脚本到平台 assets"
+    Write-Step "同步插件资源到平台目录"
 
-    # Shell 脚本 → assets 根目录
+    # ── 1. Shell 脚本 → assets 根目录 ──
     $shellScripts = @(
         @{ Src = "src/plugins/terminal/scripts/init-alpine.sh";   Dst = "init-alpine.sh" },
         @{ Src = "src/plugins/terminal/scripts/init-sandbox.sh";  Dst = "init-sandbox.sh" },
@@ -566,37 +571,93 @@ function Invoke-SyncPluginAssets {
         }
     }
 
-    # JS 插件文件 → assets/www/plugins/...
-    # Cordova 平台中的 JS 文件需要 cordova.define() 包装器
-    $jsPlugins = @(
-        @{ Src = "src/plugins/terminal/www/Terminal.js"; Dst = "www/plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"; ModuleId = "com.foxdebug.acode.rk.exec.terminal.Terminal" },
-        @{ Src = "src/plugins/terminal/www/Executor.js";  Dst = "www/plugins/com.foxdebug.acode.rk.exec.terminal/www/Executor.js"; ModuleId = "com.foxdebug.acode.rk.exec.terminal.Executor" }
+    # ── 2. 二进制 assets（如 pty_test）──
+    $binaryAssets = @(
+        @{ Src = "scripts/hdc-debug/pty_test"; Dst = "pty_test" }
     )
-
-    foreach ($item in $jsPlugins) {
+    foreach ($item in $binaryAssets) {
         $src = Join-Path $ProjectRoot $item.Src
         $dst = Join-Path $PlatformAssets $item.Dst
         if (Test-Path $src) {
-            $dstDir = Split-Path $dst
-            if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
-            # 读取源码并用 cordova.define() 包装
-            $jsContent = Get-Content $src -Raw -Encoding UTF8
-            $wrapped = "cordova.define(""$($item.ModuleId)"", function(require, exports, module) {`n${jsContent}`n});`n"
-            Set-Content $dst -Value $wrapped -Encoding UTF8 -NoNewline
-            Write-Ok "$($item.Src) → assets/$($item.Dst) (cordova.define wrapped)"
+            Copy-Item $src $dst -Force
+            Write-Ok "$($item.Src) → assets/$($item.Dst)"
         }
     }
 
-    # Java 源文件 → platforms/android/app/src/main/java/...
-    $javaSrcDir = Join-Path $ProjectRoot "src/plugins/terminal/src/android"
-    $javaDstDir = Join-Path $ProjectRoot "platforms/android/app/src/main/java/com/foxdebug/acode/rk/exec/terminal"
-    if ((Test-Path $javaSrcDir) -and (Test-Path $javaDstDir)) {
-        $javaFiles = Get-ChildItem $javaSrcDir -Filter "*.java"
-        foreach ($jf in $javaFiles) {
-            Copy-Item $jf.FullName (Join-Path $javaDstDir $jf.Name) -Force
+    # ── 3. JS 插件（自动读取 cordova_plugins.js 的 moduleId，cordova.define 包装）──
+    $cordovaPluginsJs = Join-Path $PlatformAssets "www/cordova_plugins.js"
+    $moduleIdMap = @{}  # "plugins/xxx/www/file.js" → moduleId
+    if (Test-Path $cordovaPluginsJs) {
+        $cpContent = Get-Content $cordovaPluginsJs -Raw -Encoding UTF8
+        $idMatches = [regex]::Matches($cpContent, '"id":\s*"([^"]+)"[^}]*?"file":\s*"([^"]+)"')
+        foreach ($m in $idMatches) {
+            $moduleIdMap[$m.Groups[2].Value] = $m.Groups[1].Value
         }
-        Write-Ok "Java 源文件已同步 ($($javaFiles.Count) 个)"
     }
+
+    # src/plugins 目录名 → 平台 cordova pluginId
+    $pluginDirToId = @{
+        "terminal"                 = "com.foxdebug.acode.rk.exec.terminal"
+        "system"                   = "cordova-plugin-system"
+        "custom-tabs"              = "com.foxdebug.acode.rk.customtabs"
+        "pluginContext"            = "com.foxdebug.acode.rk.plugin.plugincontext"
+        "cordova-plugin-buildinfo" = "cordova-plugin-buildinfo"
+        "ftp"                      = "cordova-plugin-ftp"
+        "iap"                      = "cordova-plugin-iap"
+        "sdcard"                   = "cordova-plugin-sdcard"
+        "server"                   = "cordova-plugin-server"
+        "sftp"                     = "cordova-plugin-sftp"
+        "websocket"                = "cordova-plugin-websocket"
+    }
+
+    $jsCount = 0
+    foreach ($dir in $pluginDirToId.Keys) {
+        $pluginId = $pluginDirToId[$dir]
+        $srcWww = Join-Path $ProjectRoot "src/plugins/$dir/www"
+        if (-not (Test-Path $srcWww)) { continue }
+
+        Get-ChildItem $srcWww -Filter "*.js" | ForEach-Object {
+            $jsFile = $_
+            $platformRelPath = "plugins/$pluginId/www/$($jsFile.Name)"
+            $dst = Join-Path $PlatformAssets "www/$platformRelPath"
+
+            $moduleId = $moduleIdMap[$platformRelPath]
+            if (-not $moduleId) {
+                Write-Warn "找不到 moduleId: $platformRelPath (可能未在 cordova_plugins.js 注册)，跳过"
+                return
+            }
+
+            $dstDir = Split-Path $dst
+            if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
+
+            $jsContent = Get-Content $jsFile.FullName -Raw -Encoding UTF8
+            $wrapped = "cordova.define(""$moduleId"", function(require, exports, module) {`n${jsContent}`n});`n"
+            Set-Content $dst -Value $wrapped -Encoding UTF8 -NoNewline
+            $jsCount++
+            Write-Ok "src/plugins/$dir/www/$($jsFile.Name) → [$moduleId]"
+        }
+    }
+    Write-Ok "JS 插件已同步 ($jsCount 个，含 cordova.define 包装)"
+
+    # ── 4. Java 源文件（自动读取 package 声明确定目标路径）──
+    $javaCount = 0
+    $pluginSrcBase = Join-Path $ProjectRoot "src/plugins"
+    Get-ChildItem $pluginSrcBase -Directory | ForEach-Object {
+        $javaFiles = Get-ChildItem $_.FullName -Filter "*.java" -Recurse
+        foreach ($jf in $javaFiles) {
+            $firstLines = Get-Content $jf.FullName -TotalCount 10 -Encoding UTF8
+            $pkgMatch = $firstLines | Select-String -Pattern '^\s*package\s+([^;]+);' | Select-Object -First 1
+            if ($pkgMatch) {
+                $pkgPath = $pkgMatch.Matches[0].Groups[1].Value.Replace('.', '/')
+                $dstDir = Join-Path $PlatformJavaRoot $pkgPath
+                if (Test-Path $dstDir) {
+                    Copy-Item $jf.FullName (Join-Path $dstDir $jf.Name) -Force
+                    $javaCount++
+                }
+            }
+        }
+    }
+    Write-Ok "Java 源文件已同步 ($javaCount 个)"
 }
 
 # ─── 同步 www/build 到平台目录 ────────────────────────────────────────
