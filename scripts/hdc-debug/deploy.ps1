@@ -571,9 +571,9 @@ function Invoke-SyncPluginAssets {
         }
     }
 
-    # ── 2. 二进制 assets（如 pty_test）──
+    # ── 2. 二进制 assets──
     $binaryAssets = @(
-        @{ Src = "scripts/hdc-debug/pty_test"; Dst = "pty_test" }
+        @{ Src = "../acodex_server/target/aarch64-linux-android/release/axs"; Dst = "axs" }
     )
     foreach ($item in $binaryAssets) {
         $src = Join-Path $ProjectRoot $item.Src
@@ -581,6 +581,8 @@ function Invoke-SyncPluginAssets {
         if (Test-Path $src) {
             Copy-Item $src $dst -Force
             Write-Ok "$($item.Src) → assets/$($item.Dst)"
+        } else {
+            Write-Warn "源文件不存在: $($item.Src)"
         }
     }
 

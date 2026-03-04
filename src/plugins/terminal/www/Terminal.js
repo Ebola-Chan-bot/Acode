@@ -16,46 +16,15 @@ const Terminal = {
         // Keep app alive in background
         await Executor.moveToForeground().catch(() => {});
 
-        // Set up native Java logging to debug server (survives background)
-        console.log(`[Terminal:startAxs] __debugHost=${window.__debugHost}`);
         if (window.__debugHost) {
             try {
-                const r = await Executor.setLogServer(`http://${window.__debugHost}`);
-                console.log(`[Terminal:startAxs] setLogServer result: ${r}`);
-            } catch (e) {
-                console.error(`[Terminal:startAxs] setLogServer failed:`, e);
-            }
+                await Executor.setLogServer(`http://${window.__debugHost}`);
+            } catch (e) {}
         }
 
-        console.log("[Terminal:startAxs] getting filesDir...");
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
         });
-        console.log("[Terminal:startAxs] filesDir=" + filesDir);
-
-        // === Run PTY capability test immediately (no sandbox needed) ===
-        try {
-            console.log("[PTY-TEST] copying asset...");
-            await new Promise((resolve, reject) => {
-                system.copyAsset("pty_test", `${filesDir}/pty_test`, resolve, reject);
-            });
-            console.log("[PTY-TEST] setting exec permission...");
-            await new Promise((resolve, reject) => {
-                system.setExec(`${filesDir}/pty_test`, "true", resolve, reject);
-            });
-            console.log("[PTY-TEST] executing pty_test (10s timeout)...");
-            const ptyResult = await Promise.race([
-                Executor.execute(`${filesDir}/pty_test`),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("pty_test timed out after 10s")), 10000))
-            ]);
-            console.log("[PTY-TEST] " + ptyResult);
-            logger("[PTY-TEST] " + ptyResult);
-        } catch (e) {
-            console.error("[PTY-TEST] failed:", e);
-            logger("[PTY-TEST] error: " + e);
-        }
-        console.log("[PTY-TEST] done, continuing startAxs...");
-        // === End PTY test ===
 
         if (installing) {
             return new Promise((resolve, reject) => {
@@ -83,10 +52,8 @@ const Terminal = {
                                 // Then create it as a file via writeText (idempotent).
                                 const writeMarker = () => {
                                     system.writeText(`${filesDir}/.configured`, "1", () => {
-                                        console.log(`[Terminal:startAxs] .configured marker created`);
                                         resolve(true);
                                     }, (err) => {
-                                        console.error(`[Terminal:startAxs] Failed to create .configured:`, err);
                                         resolve(true); // still consider install OK
                                     });
                                 };
@@ -119,8 +86,6 @@ const Terminal = {
                 system.writeText(`${filesDir}/init-sandbox.sh`, content, logger, () => {});
 
                 Executor.start("sh", (type, data) => {
-                    // Always log non-installing output to console for debugging
-                    console.log(`[Terminal:startAxs:non-install] ${type} ${data}`);
                     // Parse AXS listening address from stdout or stderr
                     // (Rust tracing/log may write to either stream)
                     if ((type === 'stdout' || type === 'stderr') && data.includes('listening on')) {
@@ -130,39 +95,30 @@ const Terminal = {
                             Terminal.axsPort = parseInt(match[2]);
                             Terminal._axsRunning = true;
                             Terminal._axsMode = Terminal._outsideProot ? 'outside-proot' : 'inside-proot';
-                            console.log(`[Terminal:startAxs] AXS address detected: ${Terminal.axsHost}:${Terminal.axsPort} (mode=${Terminal._axsMode})`);
                         }
                     }
                     // Detect AXS exit
                     if (type === 'exit') {
                         Terminal._axsRunning = false;
                         Terminal._axsMode = null;
-                        console.log(`[Terminal:startAxs:non-install] process exited: ${data}`);
                     }
                 }).then(async (uuid) => {
                     if (Terminal._outsideProot) {
                         // === Outside-proot mode (fallback) ===
                         // AXS runs outside proot for network accessibility.
-                        // PTY may fail on some devices (卓易通/HarmonyOS).
+                        // Use bash+initrc when available (MOTD + readline);
+                        // fall back to /bin/sh -l otherwise.
                         const cmd = [
                             `source ${filesDir}/init-sandbox.sh --setup-only`,
-                            // PTY diagnostics
-                            `echo "DEBUG-PTY: /dev/ptmx: $(ls -la /dev/ptmx 2>&1)"`,
-                            `echo "DEBUG-PTY: /dev/pts: $(ls -la /dev/pts/ 2>&1)"`,
-                            `echo "DEBUG-PTY: id: $(id 2>&1)"`,
-                            `echo "DEBUG-PTY: getenforce: $(getenforce 2>&1)"`,
-                            // Determine which shell is available in Alpine
-                            `if [ -f "$PREFIX/alpine/usr/bin/bash" ] || [ -f "$PREFIX/alpine/bin/bash" ]; then`,
-                            `    SHELL_CMD="/bin/bash --rcfile $PREFIX/alpine/initrc -i"`,
+                            `if [ -x "$PREFIX/alpine/usr/bin/bash" ]; then`,
+                            `  SHELL_CMD="bash --rcfile /initrc -i"`,
                             `else`,
-                            `    SHELL_CMD="/bin/sh -l"`,
+                            `  SHELL_CMD="/bin/sh -l"`,
                             `fi`,
                             // Start AXS outside proot
-                            `echo "DEBUG-PHASE2: starting AXS outside proot"`,
                             `"$PREFIX/axs" --ip --allow-any-origin -c "$PROOT $ARGS $SHELL_CMD" &`,
                             `AXS_PID=$!`,
                             `echo $AXS_PID > $PREFIX/pid`,
-                            `echo "DEBUG-PHASE2: AXS PID=$AXS_PID"`,
                             `wait $AXS_PID`,
                         ].join('\n');
                         await Executor.write(uuid, cmd);
@@ -174,7 +130,7 @@ const Terminal = {
                         await Executor.write(uuid, `source ${filesDir}/init-sandbox.sh; exit`);
                     }
                 }).catch((error) => {
-                    console.error(`[Terminal:startAxs:non-install] Executor failed:`, error);
+                    console.error(error);
                 });
             });
         }
@@ -189,7 +145,10 @@ const Terminal = {
         Terminal._axsMode = null;
         Terminal.axsHost = null;
         Terminal.axsPort = null;
-        await Executor.execute(`kill -KILL $(cat $PREFIX/pid)`);
+        const filesDir = await new Promise((resolve, reject) => {
+            system.getFilesDir(resolve, reject);
+        });
+        await Executor.execute(`kill -KILL $(cat ${filesDir}/pid) 2>/dev/null`);
     },
 
     /**
@@ -212,7 +171,7 @@ const Terminal = {
 
         if (!pidExists) return false;
 
-        const result = await Executor.BackgroundExecutor.execute(`kill -0 $(cat $PREFIX/pid) 2>/dev/null && echo "true" || echo "false"`);
+        const result = await Executor.BackgroundExecutor.execute(`kill -0 $(cat ${filesDir}/pid) 2>/dev/null && echo "true" || echo "false"`);
         return String(result).toLowerCase() === "true";
     },
 
@@ -229,10 +188,8 @@ const Terminal = {
                 `ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K[0-9.]+' || hostname -I 2>/dev/null | awk '{print $1}' || echo localhost`
             );
             const ip = String(result).trim();
-            console.log(`[Terminal:getDeviceIp] detected: ${ip}`);
             return ip && ip !== "" ? ip : "localhost";
         } catch (e) {
-            console.error(`[Terminal:getDeviceIp] failed:`, e);
             return "localhost";
         }
     },
@@ -275,8 +232,6 @@ const Terminal = {
         const alreadyDownloaded = await fileExists(`${filesDir}/.downloaded`);
         const alreadyExtracted = await fileExists(`${filesDir}/.extracted`);
         const alreadyConfigured = await fileExists(`${filesDir}/.configured`);
-
-        console.log(`[Terminal:install] stages: downloaded=${alreadyDownloaded} extracted=${alreadyExtracted} configured=${alreadyConfigured}`);
 
         // Only do full cleanup if nothing was downloaded yet (fresh install)
         if (!alreadyDownloaded) {
@@ -333,8 +288,22 @@ const Terminal = {
                 }
 
                 if (!hasAxs) {
-                    logger("⬇️  Downloading axs...");
-                    await Executor.download(axsUrl, `${filesDir}/axs`);
+                    let copiedFromAsset = false;
+                    try {
+                        logger("📦  Copying bundled axs from assets...");
+                        await new Promise((resolve, reject) => {
+                            system.copyAsset("axs", `${filesDir}/axs`, resolve, reject);
+                        });
+                        copiedFromAsset = true;
+                        logger("✅  Bundled AXS copied from assets");
+                    } catch (assetError) {
+                        
+                    }
+
+                    if (!copiedFromAsset) {
+                        logger("⬇️  Downloading axs...");
+                        await Executor.download(axsUrl, `${filesDir}/axs`);
+                    }
                 } else {
                     logger("✅  AXS binary already downloaded");
                 }
@@ -463,7 +432,6 @@ const Terminal = {
             });
 
             const result = alpineExists && downloaded && extracted && configured;
-            console.log(`[Terminal:isInstalled] alpine=${alpineExists} downloaded=${downloaded} extracted=${extracted} configured=${configured} => ${result}`);
             resolve(result);
         });
     },

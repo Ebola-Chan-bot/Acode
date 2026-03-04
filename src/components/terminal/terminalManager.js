@@ -199,14 +199,6 @@ class TerminalManager {
 				? `Terminal ${terminalNumber}`
 				: terminalName;
 
-			// Check if terminal is installed before proceeding
-			if (isServerMode) {
-				const installationResult = await this.checkAndInstallTerminal();
-				if (!installationResult.success) {
-					throw new Error(installationResult.error);
-				}
-			}
-
 			// Create terminal component
 			const terminalComponent = new TerminalComponent({
 				serverMode: isServerMode,
@@ -244,11 +236,18 @@ class TerminalManager {
 						// Mount terminal component
 						terminalComponent.mount(terminalContainer);
 
+						if (terminalComponent.serverMode) {
+							const installationResult = await this.checkAndInstallTerminal(false, {
+								component: terminalComponent,
+							});
+							if (!installationResult.success) {
+								throw new Error(installationResult.error);
+							}
+						}
+
 						// Connect to session if in server mode
 						if (terminalComponent.serverMode) {
-							console.log(`[TerminalManager] connecting to session, pid=${terminalOptions.pid || "auto"}...`);
 							await terminalComponent.connectToSession(terminalOptions.pid);
-							console.log(`[TerminalManager] connectToSession resolved, component.pid=${terminalComponent.pid}`);
 						} else {
 							// For local mode, just write a welcome message
 							terminalComponent.write(
@@ -328,7 +327,7 @@ class TerminalManager {
 	 * @param {boolean} [forceReinstall=false] - Whether to force reinstall even if already installed
 	 * @returns {Promise<{success: boolean, error?: string}>}
 	 */
-	async checkAndInstallTerminal(forceReinstall = false) {
+	async checkAndInstallTerminal(forceReinstall = false, progressTerminal = null) {
 		try {
 			// Check if terminal is already installed
 			const isInstalled = await Terminal.isInstalled();
@@ -345,8 +344,11 @@ class TerminalManager {
 				};
 			}
 
-			// Create installation progress terminal
-			const installTerminal = await this.createInstallationTerminal();
+			// Create installation progress terminal (or reuse current one)
+			const installTerminal = progressTerminal || await this.createInstallationTerminal();
+			if (progressTerminal?.component) {
+				installTerminal.component.write("\x1b[33mInstalling terminal environment...\x1b[0m\r\n");
+			}
 
 			// Install terminal with progress logging
 			const installResult = await Terminal.install(
@@ -506,25 +508,11 @@ class TerminalManager {
 
 		// Handle tab focus/blur
 		terminalFile.onfocus = () => {
-			// Guarded fit on focus: only fit if cols/rows would change, then focus
-			const run = () => {
-				try {
-					const pd = terminalComponent.fitAddon?.proposeDimensions?.();
-					if (
-						pd &&
-						(pd.cols !== terminalComponent.terminal.cols ||
-							pd.rows !== terminalComponent.terminal.rows)
-					) {
-						terminalComponent.fitAddon.fit();
-					}
-				} catch {}
-				terminalComponent.focus();
-			};
-			if (typeof requestAnimationFrame === "function") {
-				requestAnimationFrame(run);
-			} else {
-				setTimeout(run, 0);
-			}
+			// Do NOT forcefully call fit() here, as the DOM might still be animating
+			// or transitioning from display:none.
+			// terminalFile._resizeObserver (ResizeObserver) already handles fitting 
+			// securely when the container's true dimensions are realized.
+			terminalComponent.focus();
 		};
 
 		// Handle tab close
@@ -575,6 +563,11 @@ class TerminalManager {
 						return;
 					}
 
+					// Ignore resizes where the container is hidden or too small
+					if (width < 10 || height < 10) {
+						return;
+					}
+
 					// Only fit if actual size changed to reduce reflows
 					if (
 						Math.abs(width - lastWidth) > 0.5 ||
@@ -620,40 +613,12 @@ class TerminalManager {
 			// Close the terminal and remove the tab
 			this.closeTerminal(terminalId, true);
 
-			// Auto-repair: clear .configured and immediately trigger reinstall flow
-			let resetOk = false;
-			try {
-				resetOk = await Terminal.resetConfigured();
-				console.log(`[Terminal] resetConfigured after connection error: ${resetOk}`);
-			} catch (_) { /* ignore */ }
-
-			let repair = { success: false, error: "reinstall not attempted" };
-			try {
-				repair = await this.checkAndInstallTerminal(true);
-				console.log(`[Terminal] checkAndInstallTerminal result: ${JSON.stringify(repair)}`);
-			} catch (installError) {
-				repair = {
-					success: false,
-					error: installError?.message || String(installError),
-				};
-			}
-
 			// Show alert for connection error
 			const errorMessage = error?.message || "Connection lost";
-			if (repair.success) {
-				const resetNote = resetOk
-					? ""
-					: "\nNote: resetConfigured=false, but reinstall completed.";
-				alert(
-					strings["error"],
-					`Terminal connection error: ${errorMessage}\nTerminal environment re-configured. Please open terminal again.${resetNote}`,
-				);
-			} else {
-				alert(
-					strings["error"],
-					`Terminal connection error: ${errorMessage}\nAuto-repair failed: ${repair.error || "unknown"}\nresetConfigured=${resetOk}`,
-				);
-			}
+			alert(
+				strings["error"],
+				`Terminal connection error: ${errorMessage}`,
+			);
 		};
 
 		terminalComponent.onTitleChange = async (title) => {
@@ -695,6 +660,49 @@ class TerminalManager {
 			terminalFile._skipTerminalCloseConfirm = true;
 			terminalFile.remove(true);
 			toast(message);
+		};
+
+		// Auto-recovery for corrupted rootfs (in-place, no new tab or toast)
+		terminalComponent.onCrashData = async (reason) => {
+			if (reason === "relocation_error") {
+				try {
+					// Disconnect websocket to stop feeding garbage
+					if (terminalComponent.websocket) {
+						terminalComponent.websocket.close();
+					}
+					terminalComponent.isConnected = false;
+
+					// Write recovery status directly into the current terminal
+					terminalComponent.clear();
+					terminalComponent.write("\x1b[33m⚠ Detected terminal environment corruption (libc/readline).\x1b[0m\r\n");
+					terminalComponent.write("\x1b[33m  Starting automatic repair...\x1b[0m\r\n\r\n");
+
+					// Uninstall corrupted rootfs
+					terminalComponent.write("Removing corrupted rootfs...\r\n");
+					if (window.Terminal && typeof window.Terminal.uninstall === "function") {
+						await window.Terminal.uninstall();
+					}
+					terminalComponent.write("Rootfs removed. Reinstalling...\r\n\r\n");
+
+					// Reinstall, routing all progress output to this terminal
+					const result = await this.checkAndInstallTerminal(true, {
+						component: terminalComponent,
+					});
+
+					if (result.success) {
+						terminalComponent.write("\r\n\x1b[32m✔ Recovery complete. Reconnecting session...\x1b[0m\r\n");
+						// Clear the terminal buffer so the new shell prompt starts clean
+						terminalComponent.clear();
+						// Reconnect a fresh session in the same terminal
+						await terminalComponent.connectToSession();
+					} else {
+						terminalComponent.write(`\r\n\x1b[31m✘ Recovery failed: ${result.error}\x1b[0m\r\n`);
+					}
+				} catch (e) {
+					console.error("In-place terminal recovery failed:", e);
+					terminalComponent.write(`\r\n\x1b[31m✘ Recovery error: ${e.message}\x1b[0m\r\n`);
+				}
+			}
 		};
 
 		// Handle acode CLI open commands (OSC 7777)

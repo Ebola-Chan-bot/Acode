@@ -1,73 +1,6 @@
-echo "DEBUG-ALPINE: script started, args=$@"
-set -x
-
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/share/bin:/usr/share/sbin:/usr/local/bin:/usr/local/sbin:/system/bin:/system/xbin:$PREFIX/local/bin
-export PS1="\[\e[38;5;46m\]\u\[\033[39m\]@localhost \[\033[39m\]\w \[\033[0m\]\\$ "
 export HOME=/home
 export TERM=xterm-256color
-
-# === PTY diagnostics (INSIDE proot) ===
-echo "DEBUG-PTY-INSIDE: === PTY diagnostic (inside proot) ==="
-echo "DEBUG-PTY-INSIDE: kernel: $(uname -r 2>&1)"
-echo "DEBUG-PTY-INSIDE: /dev/ptmx exists: $(test -e /dev/ptmx && echo YES || echo NO)"
-echo "DEBUG-PTY-INSIDE: /dev/ptmx stat: $(ls -la /dev/ptmx 2>&1)"
-echo "DEBUG-PTY-INSIDE: /dev/pts exists: $(test -e /dev/pts && echo YES || echo NO)"
-echo "DEBUG-PTY-INSIDE: /dev/pts stat: $(ls -lad /dev/pts 2>&1)"
-echo "DEBUG-PTY-INSIDE: /dev/pts contents: $(ls -la /dev/pts/ 2>&1)"
-echo "DEBUG-PTY-INSIDE: /dev/pts/ptmx stat: $(ls -la /dev/pts/ptmx 2>&1)"
-echo "DEBUG-PTY-INSIDE: /dev/pt*: $(ls -la /dev/pt* 2>&1)"
-echo "DEBUG-PTY-INSIDE: /proc/mounts devpts: $(grep devpts /proc/mounts 2>&1 || echo 'NOT MOUNTED')"
-echo "DEBUG-PTY-INSIDE: /proc/filesystems: $(grep pts /proc/filesystems 2>&1 || echo 'not found')"
-echo "DEBUG-PTY-INSIDE: id: $(id 2>&1)"
-echo "DEBUG-PTY-INSIDE: SELinux: $(cat /proc/self/attr/current 2>&1)"
-
-# Test 1: Actually open /dev/ptmx from shell
-if exec 3<>/dev/ptmx 2>/dev/null; then
-    echo "DEBUG-PTY-INSIDE: open(/dev/ptmx) = SUCCESS"
-    echo "DEBUG-PTY-INSIDE: /proc/self/fd/3: $(ls -la /proc/self/fd/3 2>&1)"
-    echo "DEBUG-PTY-INSIDE: fdinfo/3: $(cat /proc/self/fdinfo/3 2>&1)"
-    # Check if slave appeared in /dev/pts/
-    echo "DEBUG-PTY-INSIDE: /dev/pts/ after open: $(ls -la /dev/pts/ 2>&1)"
-    exec 3>&- 2>/dev/null
-else
-    echo "DEBUG-PTY-INSIDE: open(/dev/ptmx) = FAILED"
-    echo "DEBUG-PTY-INSIDE: open error: $(exec 3<>/dev/ptmx 2>&1)"
-fi
-
-# Test 2: Run pre-compiled PTY test binary (cross-compiled with NDK)
-# Look for it in several possible locations
-# Debug: show what paths exist
-echo "DEBUG-PTY-INSIDE: find pty_test: /data/local/tmp=$(ls -la /data/local/tmp/pty_test 2>&1)"
-echo "DEBUG-PTY-INSIDE: find pty_test: /data/user/0/com.foxdebug.acode/files=$(ls -la /data/user/0/com.foxdebug.acode/files/pty_test 2>&1)"
-echo "DEBUG-PTY-INSIDE: find pty_test: /sdcard/Download=$(ls -la /sdcard/Download/pty_test 2>&1)"
-PTY_TEST=""
-for p in /data/local/tmp/pty_test /data/user/0/com.foxdebug.acode/files/pty_test /sdcard/Download/pty_test /storage/emulated/0/Download/pty_test /storage/media/100/local/files/Docs/Download/pty_test; do
-    if [ -f "$p" ]; then
-        PTY_TEST="$p"
-        break
-    fi
-done
-
-if [ -n "$PTY_TEST" ]; then
-    echo "DEBUG-PTY-INSIDE: found pre-compiled test at $PTY_TEST"
-    cp "$PTY_TEST" /tmp/pty_test 2>&1
-    chmod 755 /tmp/pty_test 2>&1
-    if [ -x /tmp/pty_test ]; then
-        echo "DEBUG-PTY-INSIDE: running pre-compiled PTY test..."
-        /tmp/pty_test 2>&1 | while IFS= read -r line; do
-            echo "DEBUG-PTY-INSIDE: [C] $line"
-        done
-        rm -f /tmp/pty_test
-    else
-        echo "DEBUG-PTY-INSIDE: failed to make pty_test executable"
-        ls -la /tmp/pty_test 2>&1
-    fi
-else
-    echo "DEBUG-PTY-INSIDE: no pre-compiled pty_test found (push to /sdcard/Download/pty_test)"
-fi
-
-echo "DEBUG-PTY-INSIDE: === end PTY diagnostic ==="
-
 
 if [ ! -f /linkerconfig/ld.config.txt ]; then
     mkdir -p /linkerconfig
@@ -77,7 +10,7 @@ fi
 
 if [ "$1" = "--installing" ]; then
     # ── Package installation (only during install/repair) ──
-    required_packages="bash command-not-found tzdata wget gcc musl-dev"
+    required_packages="bash command-not-found tzdata wget"
     missing_packages=""
 
     # Check by file existence rather than apk info (which is unreliable in proot)
@@ -85,8 +18,6 @@ if [ "$1" = "--installing" ]; then
     [ ! -f /usr/bin/command-not-found ] && missing_packages="$missing_packages command-not-found"
     [ ! -f /usr/share/zoneinfo/UTC ] && missing_packages="$missing_packages tzdata"
     [ ! -f /usr/bin/wget ] && missing_packages="$missing_packages wget"
-    [ ! -f /usr/bin/gcc ] && missing_packages="$missing_packages gcc"
-    [ ! -f /usr/include/stdlib.h ] && missing_packages="$missing_packages musl-dev"
 
     PACKAGES_OK=true
     if [ -n "$missing_packages" ]; then
@@ -174,90 +105,29 @@ Working with packages:
 EOF
     fi
 
-    # Create acode CLI tool
-    if [ ! -e "$PREFIX/alpine/usr/local/bin/acode" ]; then
-        mkdir -p "$PREFIX/alpine/usr/local/bin"
-        cat <<'ACODE_CLI' > "$PREFIX/alpine/usr/local/bin/acode"
-#!/bin/bash
-# acode - Open files/folders in Acode editor
-# Uses OSC escape sequences to communicate with the Acode terminal
+    # Create /etc/profile.d/acode.sh — sourced by ALL login shells (ash + bash)
+    # This ensures MOTD and a sane PS1 even when bash is not installed.
+    mkdir -p "$PREFIX/alpine/etc/profile.d"
+    cat <<'PROFILE' > "$PREFIX/alpine/etc/profile.d/acode.sh"
+# Acode terminal profile (works in ash and bash)
+export HOME=/home
+export TERM=xterm-256color
+export PIP_BREAK_SYSTEM_PACKAGES=1
 
-usage() {
-    echo "Usage: acode [file/folder...]"
-    echo ""
-    echo "Open files or folders in Acode editor."
-    echo ""
-    echo "Examples:"
-    echo "  acode file.txt      # Open a file"
-    echo "  acode .             # Open current folder"
-    echo "  acode ~/project     # Open a folder"
-    echo "  acode -h, --help    # Show this help"
-}
-
-get_abs_path() {
-    local path="$1"
-    local abs_path=""
-
-    if command -v realpath >/dev/null 2>&1; then
-        abs_path=$(realpath -- "$path" 2>/dev/null)
-    fi
-
-    if [[ -z "$abs_path" ]]; then
-        if [[ -d "$path" ]]; then
-            abs_path=$(cd -- "$path" 2>/dev/null && pwd -P)
-        elif [[ -e "$path" ]]; then
-            local dir_name file_name
-            dir_name=$(dirname -- "$path")
-            file_name=$(basename -- "$path")
-            abs_path="$(cd -- "$dir_name" 2>/dev/null && pwd -P)/$file_name"
-        elif [[ "$path" == /* ]]; then
-            abs_path="$path"
-        else
-            abs_path="$PWD/$path"
-        fi
-    fi
-
-    echo "$abs_path"
-}
-
-open_in_acode() {
-    local path=$(get_abs_path "$1")
-    local type="file"
-    [[ -d "$path" ]] && type="folder"
-    
-    # Send OSC 7777 escape sequence: \e]7777;cmd;type;path\a
-    # The terminal component will intercept and handle this
-    printf '\e]7777;open;%s;%s\a' "$type" "$path"
-}
-
-if [[ $# -eq 0 ]]; then
-    open_in_acode "."
-    exit 0
+# MOTD is displayed by initrc (bash) or here for ash-only fallback
+if [ -z "$BASH_VERSION" ] && [ -s /etc/acode_motd ]; then
+    cat /etc/acode_motd
 fi
 
-for arg in "$@"; do
-    case "$arg" in
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            if [[ -e "$arg" ]]; then
-                open_in_acode "$arg"
-            else
-                echo "Error: '$arg' does not exist" >&2
-                exit 1
-            fi
-            ;;
-    esac
-done
-ACODE_CLI
-        chmod +x "$PREFIX/alpine/usr/local/bin/acode"
-    fi
+# Simple PS1 compatible with ash (no \[...\] readline markers)
+# ash supports \u \h \w \$ natively
+PS1='\u@localhost:\w\$ '
+export PS1
+PROFILE
+    chmod +x "$PREFIX/alpine/etc/profile.d/acode.sh"
 
-    # Create initrc if it doesn't exist
+    # Create/update initrc (always overwrite to keep in sync with app updates)
     #initrc runs in bash so we can use bash features 
-if [ ! -e "$PREFIX/alpine/initrc" ]; then
     cat <<'EOF' > "$PREFIX/alpine/initrc"
 # Source rc files if they exist
 
@@ -315,11 +185,67 @@ if [ -f /etc/bash/bashrc ]; then
     source /etc/bash/bashrc
 fi
 
-
-# Display MOTD if available
+# Display MOTD (only source that reliably runs in proot bash)
 if [ -s /etc/acode_motd ]; then
     cat /etc/acode_motd
 fi
+
+# acode CLI function (defined here to avoid proot shebang issues)
+_acode_get_abs_path() {
+    local path="$1" abs_path=""
+    if command -v realpath >/dev/null 2>&1; then
+        abs_path=$(realpath -- "$path" 2>/dev/null)
+    fi
+    if [[ -z "$abs_path" ]]; then
+        if [[ -d "$path" ]]; then
+            abs_path=$(cd -- "$path" 2>/dev/null && pwd -P)
+        elif [[ -e "$path" ]]; then
+            abs_path="$(cd -- "$(dirname -- "$path")" 2>/dev/null && pwd -P)/$(basename -- "$path")"
+        elif [[ "$path" == /* ]]; then
+            abs_path="$path"
+        else
+            abs_path="$PWD/$path"
+        fi
+    fi
+    echo "$abs_path"
+}
+_acode_open() {
+    local path=$(_acode_get_abs_path "$1")
+    local type="file"
+    [[ -d "$path" ]] && type="folder"
+    printf '\e]7777;open;%s;%s\a' "$type" "$path"
+}
+acode() {
+    if [[ $# -eq 0 ]]; then
+        _acode_open "."
+        return 0
+    fi
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help)
+                echo "Usage: acode [file/folder...]"
+                echo ""
+                echo "Open files or folders in Acode editor."
+                echo ""
+                echo "Examples:"
+                echo "  acode file.txt      # Open a file"
+                echo "  acode .             # Open current folder"
+                echo "  acode ~/project     # Open a folder"
+                echo "  acode -h, --help    # Show this help"
+                return 0
+                ;;
+            *)
+                if [[ -e "$arg" ]]; then
+                    _acode_open "$arg"
+                else
+                    echo "Error: '$arg' does not exist" >&2
+                    return 1
+                fi
+                ;;
+        esac
+    done
+}
 
 # Command-not-found handler
 command_not_found_handle() {
@@ -340,24 +266,17 @@ command_not_found_handle() {
 }
 
 EOF
-fi
 
 # Add PS1 only if not already present
 if ! grep -q 'PS1=' "$PREFIX/alpine/initrc"; then
     # Smart path shortening (fish-style: ~/p/s/components)
-    echo 'PS1="\[\033[1;32m\]\u\[\033[0m\]@localhost \[\033[1;34m\]\$_PS1_PATH\[\033[0m\] \[\$([ \$_PS1_EXIT -ne 0 ] && echo \"\033[31m\")\]\$\[\033[0m\] "' >> "$PREFIX/alpine/initrc"
-    # Simple prompt (uncomment below and comment above if you prefer full paths)
-    # echo 'PS1="\[\033[1;32m\]\u\[\033[0m\]@localhost \[\033[1;34m\]\w\[\033[0m\] \$ "' >> "$PREFIX/alpine/initrc"
+    echo 'PS1="\[\e[1;32m\]\u\[\e[0m\]@localhost \[\e[1;34m\]\$_PS1_PATH\[\e[0m\] \$ "' >> "$PREFIX/alpine/initrc"
 fi
 
 chmod +x "$PREFIX/alpine/initrc"
 
 # --setup-only: exit before starting AXS (caller will start it outside proot)
 if [ "$1" = "--setup-only" ]; then
-    echo "DEBUG-ALPINE: setup-only complete, AXS will start outside proot"
-    # Log available network interfaces for diagnostics
-    echo "DEBUG-ALPINE: ip addr inside proot:"
-    ip addr 2>/dev/null || echo "(ip command not available)"
     exit 0
 fi
 
