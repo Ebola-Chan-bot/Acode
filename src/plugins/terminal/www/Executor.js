@@ -192,6 +192,18 @@ class Executor {
       exec(resolve, reject, this.ExecutorType, "loadLibrary", [path]);
     });
   }
+
+  gunzip(src, dst) {
+    return new Promise((resolve, reject) => {
+      exec(resolve, reject, this.ExecutorType, "gunzip", [src, dst]);
+    });
+  }
+
+  download(url, dst) {
+    return new Promise((resolve, reject) => {
+      exec(resolve, reject, this.ExecutorType, "download", [url, dst]);
+    });
+  }
 }
 
 //backward compatibility

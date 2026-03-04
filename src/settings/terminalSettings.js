@@ -146,6 +146,12 @@ export default function terminalSettings() {
 			value: terminalValues.letterSpacing,
 			prompt: strings["letter spacing"],
 			promptType: "number",
+			promptOptions: {
+				test(value) {
+					value = Number.parseFloat(value);
+					return Number.isFinite(value) && value >= 0 && value <= 2;
+				},
+			},
 			info: strings["info-letterSpacing"],
 		},
 		{
@@ -245,6 +251,12 @@ export default function terminalSettings() {
 				return;
 
 			default:
+				if (key === "letterSpacing") {
+					value = Number.parseFloat(value);
+					if (!Number.isFinite(value)) value = DEFAULT_TERMINAL_SETTINGS.letterSpacing;
+					value = Math.max(0, Math.min(2, value));
+				}
+
 				appSettings.update({
 					terminalSettings: {
 						...values.terminalSettings,
@@ -354,11 +366,16 @@ async function updateActiveTerminals(key, value) {
 					} catch (error) {
 						console.warn(`Failed to load font ${value}:`, error);
 					}
-					tab.terminalComponent.terminal.options.fontFamily = value;
+					tab.terminalComponent.options.fontFamily = `"${value}", monospace`;
+					tab.terminalComponent.terminal.options.fontFamily = `"${value}", monospace`;
+					if (tab.terminalComponent.webglAddon) {
+						try { tab.terminalComponent.webglAddon.clearTextureAtlas(); } catch (e) {}
+					}
 					tab.terminalComponent.terminal.refresh(
 						0,
 						tab.terminalComponent.terminal.rows - 1,
 					);
+					setTimeout(() => tab.terminalComponent.fit(), 100);
 					break;
 				case "fontWeight":
 					tab.terminalComponent.terminal.options.fontWeight = value;
@@ -382,7 +399,12 @@ async function updateActiveTerminals(key, value) {
 					tab.terminalComponent.terminal.options.convertEol = value;
 					break;
 				case "letterSpacing":
-					tab.terminalComponent.terminal.options.letterSpacing = value;
+					{
+						let spacing = Number.parseFloat(value);
+						if (!Number.isFinite(spacing)) spacing = DEFAULT_TERMINAL_SETTINGS.letterSpacing;
+						spacing = Math.max(0, Math.min(2, spacing));
+						tab.terminalComponent.terminal.options.letterSpacing = spacing;
+					}
 					break;
 				case "theme":
 					tab.terminalComponent.terminal.options.theme =

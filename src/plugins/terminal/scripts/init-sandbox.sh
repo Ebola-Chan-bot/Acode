@@ -6,6 +6,10 @@ mkdir -p "$PREFIX/public"
 
 export PROOT_TMP_DIR=$PREFIX/tmp
 
+# Disable seccomp filter in proot to avoid SIGSEGV/SIGBUS on kernels
+# with strict seccomp policies
+export PROOT_NO_SECCOMP=1
+
 if [ "$FDROID" = "true" ]; then
 
     if [ -f "$PREFIX/libproot.so" ]; then
@@ -86,8 +90,23 @@ fi
 ARGS="$ARGS -r $PREFIX/alpine"
 ARGS="$ARGS -0"
 ARGS="$ARGS --link2symlink"
-ARGS="$ARGS --sysvipc"
+# --sysvipc removed: SysV IPC emulation causes Bus Error on some Android kernels
 ARGS="$ARGS -L"
 
+# --setup-only mode: run init-alpine.sh for setup, then RETURN to caller
+# (instead of exit) so the caller can start AXS outside proot.
+SETUP_ONLY=false
+for _arg in "$@"; do
+    [ "$_arg" = "--setup-only" ] && SETUP_ONLY=true
+done
 
 $PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
+PROOT_EXIT=$?
+
+if [ "$SETUP_ONLY" = "true" ]; then
+    # Return to caller shell — PROOT, ARGS, and all env vars remain set
+    # so the caller can use them to start AXS outside proot.
+    true
+else
+    exit $PROOT_EXIT
+fi

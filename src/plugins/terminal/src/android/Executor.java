@@ -284,6 +284,12 @@ public class Executor extends CordovaPlugin {
                 callbackContextMap.put(pidCheck, callbackContext);
                 isProcessRunning(pidCheck);
                 return true;
+            case "gunzip":
+                gunzip(args.getString(0), args.getString(1), callbackContext);
+                return true;
+            case "download":
+                download(args.getString(0), args.getString(1), callbackContext);
+                return true;
             default:
                 callbackContext.error("Unknown action: " + action);
                 return false;
@@ -407,6 +413,75 @@ public class Executor extends CordovaPlugin {
 
     private void cleanupCallback(String id) {
         callbackContextMap.remove(id);
+    }
+
+    private void gunzip(String src, String dst, CallbackContext callbackContext) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                java.io.File srcFile = new java.io.File(src);
+                java.io.File dstFile = new java.io.File(dst);
+                byte[] buf = new byte[65536];
+                long total = 0;
+                try (java.util.zip.GZIPInputStream gis = new java.util.zip.GZIPInputStream(
+                        new java.io.FileInputStream(srcFile));
+                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
+                    int len;
+                    while ((len = gis.read(buf)) > 0) {
+                        fos.write(buf, 0, len);
+                        total += len;
+                    }
+                }
+                callbackContext.success(dst);
+            } catch (Exception e) {
+                callbackContext.error("gunzip failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void download(String url, String dst, CallbackContext callbackContext) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                java.net.URL u = new java.net.URL(url);
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) u.openConnection();
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(30000);
+                conn.setReadTimeout(60000);
+                conn.connect();
+                int code = conn.getResponseCode();
+                // Follow redirects across protocols (HTTP→HTTPS)
+                if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                    String loc = conn.getHeaderField("Location");
+                    conn.disconnect();
+                    u = new java.net.URL(loc);
+                    conn = (java.net.HttpURLConnection) u.openConnection();
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setConnectTimeout(30000);
+                    conn.setReadTimeout(60000);
+                    conn.connect();
+                    code = conn.getResponseCode();
+                }
+                if (code != 200) {
+                    conn.disconnect();
+                    callbackContext.error("HTTP " + code);
+                    return;
+                }
+                java.io.File dstFile = new java.io.File(dst);
+                byte[] buf = new byte[65536];
+                long total = 0;
+                try (java.io.InputStream is = conn.getInputStream();
+                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
+                    int len;
+                    while ((len = is.read(buf)) > 0) {
+                        fos.write(buf, 0, len);
+                        total += len;
+                    }
+                }
+                conn.disconnect();
+                callbackContext.success(dst);
+            } catch (Exception e) {
+                callbackContext.error("download failed: " + e.getMessage());
+            }
+        });
     }
 
     @Override

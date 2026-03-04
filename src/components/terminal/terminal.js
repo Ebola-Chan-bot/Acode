@@ -34,7 +34,7 @@ export default class TerminalComponent {
 			port: options.port || 8767,
 			renderer: options.renderer || "auto", // 'auto' | 'canvas' | 'webgl'
 			fontSize: terminalSettings.fontSize,
-			fontFamily: terminalSettings.fontFamily,
+			fontFamily: `"${terminalSettings.fontFamily}", monospace`,
 			fontWeight: terminalSettings.fontWeight,
 			theme: TerminalThemeManager.getTheme(terminalSettings.theme),
 			cursorBlink: terminalSettings.cursorBlink,
@@ -181,17 +181,13 @@ export default class TerminalComponent {
 		let resizeTimeout = null;
 		let lastKnownScrollPosition = 0;
 		let isResizing = false;
-		let resizeCount = 0;
 		const RESIZE_DEBOUNCE = 100;
-		const MAX_RAPID_RESIZES = 3;
 
 		// Store original dimensions for comparison
 		let originalRows = this.terminal.rows;
 		let originalCols = this.terminal.cols;
 
 		this.terminal.onResize((size) => {
-			// Track resize events
-			resizeCount++;
 			isResizing = true;
 
 			// Store current scroll position before resize
@@ -207,19 +203,7 @@ export default class TerminalComponent {
 			// Debounced resize handling
 			resizeTimeout = setTimeout(async () => {
 				try {
-					// Only proceed with server resize if dimensions actually changed significantly
-					const rowDiff = Math.abs(size.rows - originalRows);
-					const colDiff = Math.abs(size.cols - originalCols);
-
-					// If this is a minor resize (likely intermediate state), skip server update
-					if (rowDiff < 2 && colDiff < 2 && resizeCount > 1) {
-						console.log("Skipping minor resize to prevent instability");
-						isResizing = false;
-						resizeCount = 0;
-						return;
-					}
-
-					// Handle server resize
+					// Handle server resize unconditionally to ensure PTY sync
 					if (this.serverMode) {
 						await this.resizeTerminal(size.cols, size.rows);
 					}
@@ -262,7 +246,6 @@ export default class TerminalComponent {
 
 					// Mark resize as complete
 					isResizing = false;
-					resizeCount = 0;
 
 					// Notify touch selection if it exists
 					if (this.touchSelection) {
@@ -271,7 +254,6 @@ export default class TerminalComponent {
 				} catch (error) {
 					console.error("Resize handling failed:", error);
 					isResizing = false;
-					resizeCount = 0;
 				}
 			}, RESIZE_DEBOUNCE);
 		});
@@ -581,31 +563,51 @@ export default class TerminalComponent {
 
 		try {
 			// Check if terminal is installed before starting AXS
-			if (!(await Terminal.isInstalled())) {
+			const installed = await Terminal.isInstalled();
+			if (!installed) {
 				throw new Error(
 					"Terminal not installed. Please install terminal first.",
 				);
 			}
 
 			// Start AXS if not running
-			if (!(await Terminal.isAxsRunning())) {
+			const axsRunning = await Terminal.isAxsRunning();
+
+			const pollAxs = async (maxRetries = 30, intervalMs = 1000) => {
+				for (let i = 0; i < maxRetries; i++) {
+					await new Promise((r) => setTimeout(r, intervalMs));
+					const running = await Terminal.isAxsRunning();
+					if (running) {
+						return true;
+					}
+				}
+				return false;
+			};
+
+			if (!axsRunning) {
 				await Terminal.startAxs(false, () => {}, console.error);
 
-				// Check if AXS started with interval polling
-				const maxRetries = 10;
-				let retries = 0;
-				while (retries < maxRetries) {
-					await new Promise((resolve) => setTimeout(resolve, 1000));
-					if (await Terminal.isAxsRunning()) {
-						break;
-					}
-					retries++;
-				}
+				// Two-phase startup: proot --setup-only takes ~5-8s, then AXS starts.
+				// Wait up to 30s before attempting repair.
+				const pollResult = await pollAxs(30);
+				if (!pollResult) {
+					// AXS failed to start — attempt auto-repair
+					toast("Repairing terminal environment...");
 
-				// If AXS still not running after retries, throw error
-				if (!(await Terminal.isAxsRunning())) {
-					toast("Failed to start AXS server after multiple attempts");
-					//throw new Error("Failed to start AXS server after multiple attempts");
+					try { await Terminal.stopAxs(); } catch (_) { /* ignore */ }
+
+					// Re-run installing flow to repair packages / config
+					const repairOk = await Terminal.startAxs(true, console.log, console.error);
+					if (repairOk) {
+						// Start AXS again after repair
+						await Terminal.startAxs(false, () => {}, console.error);
+					}
+
+					if (!(await pollAxs(30))) {
+						// Still broken — clear .configured so next open re-triggers install
+						try { await Terminal.resetConfigured(); } catch (_) { /* ignore */ }
+						throw new Error("Failed to start AXS server after repair attempt");
+					}
 				}
 			}
 
@@ -614,26 +616,94 @@ export default class TerminalComponent {
 				rows: this.terminal.rows,
 			};
 
-			const response = await fetch(
-				`http://localhost:${this.options.port}/terminals`,
-				{
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify(requestBody),
-				},
-			);
+			// Helper: try to create a session by fetching POST /terminals
+			// Returns { host, pid } on success, or null on complete failure.
+			// Throws on PTY error (AXS reachable but can't create terminal).
+			const tryCreateSession = async (hostList, sessionPort) => {
+				for (const host of hostList) {
+					try {
+						const testResp = await fetch(`http://${host}:${sessionPort}/terminals`, {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify(requestBody),
+						});
+						if (testResp.ok) {
+							const data = await testResp.text();
+							const trimmed = data.trim();
+							// Detect AXS error response (e.g. PTY failure)
+							if (trimmed.startsWith('{')) {
+								try {
+									const errObj = JSON.parse(trimmed);
+									if (errObj.error) {
+										// Return special marker for PTY/server error
+										return { host, pid: trimmed, axsError: errObj.error };
+									}
+								} catch (_) { /* not JSON, treat as PID */ }
+							}
+							return { host, pid: trimmed };
+						}
+					} catch (e) {}
+				}
+				return null;
+			};
 
-			if (!response.ok) {
-				throw new Error(`HTTP error! status: ${response.status}`);
+			// Build list of hosts to try, in priority order:
+			// 1. Terminal.axsHost — parsed from AXS "listening on X:Y" output (most reliable)
+			// 2. localhost — works on normal devices where loopback is shared
+			// 3. getDeviceIp() — LAN IP fallback for network-isolated environments
+			const buildHostList = async () => {
+				const hosts = [];
+				if (Terminal.axsHost && Terminal.axsHost !== "127.0.0.1") {
+					hosts.push(Terminal.axsHost);
+				}
+				hosts.push("localhost");
+				const deviceIp = await Terminal.getDeviceIp();
+				if (deviceIp && deviceIp !== "localhost" && !hosts.includes(deviceIp)) {
+					hosts.push(deviceIp);
+				}
+				return hosts;
+			};
+
+			const port = Terminal.axsPort || this.options.port;
+			const hosts = await buildHostList();
+			let result = await tryCreateSession(hosts, port);
+
+			// === Fallback: If inside-proot AXS is unreachable, switch to outside-proot ===
+			if (!result && !Terminal._outsideProot) {
+				try { await Terminal.stopAxs(); } catch (_) { /* ignore */ }
+				Terminal._outsideProot = true;
+
+				// Start AXS outside proot (fire-and-forget — pollAxs will wait)
+				Terminal.startAxs(false, () => {}, console.error);
+
+				// Wait for outside-proot AXS to start
+				const outsidePoll = await pollAxs(20);
+				if (outsidePoll) {
+					const retryPort = Terminal.axsPort || this.options.port;
+					const retryHosts = await buildHostList();
+					result = await tryCreateSession(retryHosts, retryPort);
+				}
 			}
 
-			const data = await response.text();
-			this.pid = data.trim();
+			if (!result) {
+				const modes = Terminal._outsideProot ? "inside-proot + outside-proot" : "inside-proot";
+				throw new Error(`Cannot reach AXS on any host (tried ${modes} modes)`);
+			}
+
+			// Check for AXS-level error (e.g. PTY Permission Denied)
+			if (result.axsError) {
+				// Still set the host for potential diagnostics, but the session is broken
+				this._axsHost = result.host;
+				this.pid = result.pid;
+				// Don't throw — let the WebSocket attempt show the actual failure,
+				// so user sees "Connection lost" rather than a cryptic error
+				return this.pid;
+			}
+
+			this._axsHost = result.host;
+			this.pid = result.pid;
 			return this.pid;
 		} catch (error) {
-			console.error("Failed to create terminal session:", error);
 			throw error;
 		}
 	}
@@ -655,13 +725,21 @@ export default class TerminalComponent {
 
 		this.pid = pid;
 
-		const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
+		const wsHost = this._axsHost || "localhost";
+		const wsPort = Terminal.axsPort || this.options.port;
+		const wsUrl = `ws://${wsHost}:${wsPort}/terminals/${pid}`;
 
 		this.websocket = new WebSocket(wsUrl);
 
 		this.websocket.onopen = () => {
 			this.isConnected = true;
 			this.onConnect?.();
+
+			// Dispose old attach addon before loading a new one (supports reconnection)
+			if (this.attachAddon) {
+				try { this.attachAddon.dispose(); } catch (_) {}
+				this.attachAddon = null;
+			}
 
 			// Load attach addon after connection
 			this.attachAddon = new AttachAddon(this.websocket);
@@ -689,13 +767,31 @@ export default class TerminalComponent {
 			// For binary data or non-exit text messages, let attachAddon handle them
 		};
 
+		// Also sniff the data to detect critical Alpine container corruption (e.g. bash/readline broken)
+		this.websocket.addEventListener("message", async (event) => {
+			try {
+				let text = "";
+				if (typeof event.data === "string") {
+					text = event.data;
+				} else if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+					text = await new Response(event.data).text();
+				}
+				
+				if (text.includes("Error relocating") && text.includes("symbol not found")) {
+					console.error("Detected critical Alpine libc corruption! Terminating and triggering reinstall.");
+					if (this.onCrashData) {
+						this.onCrashData("relocation_error");
+					}
+				}
+			} catch (err) {}
+		});
+
 		this.websocket.onclose = (event) => {
 			this.isConnected = false;
 			this.onDisconnect?.();
 		};
 
 		this.websocket.onerror = (error) => {
-			console.error("WebSocket error:", error);
 			this.onError?.(error);
 		};
 	}
@@ -709,8 +805,10 @@ export default class TerminalComponent {
 		if (!this.pid || !this.serverMode) return;
 
 		try {
+			const host = this._axsHost || "localhost";
+			const port = Terminal.axsPort || this.options.port;
 			await fetch(
-				`http://localhost:${this.options.port}/terminals/${this.pid}/resize`,
+				`http://${host}:${port}/terminals/${this.pid}/resize`,
 				{
 					method: "POST",
 					headers: {
@@ -922,10 +1020,21 @@ export default class TerminalComponent {
 	 * Load terminal font if it's not already loaded
 	 */
 	async loadTerminalFont() {
-		const fontFamily = this.options.fontFamily;
+		// Use original name without quotes for Acode fonts.get
+		const fontFamily = this.options.fontFamily.replace(/^"|"$/g, '').replace(/",\s*monospace$/, '');
 		if (fontFamily && fonts.get(fontFamily)) {
 			try {
 				await fonts.loadFont(fontFamily);
+				// Make Xterm.js aware that the font is fully loaded
+				// Setting options.fontFamily triggers a re-eval of character dimensions
+				if (this.terminal) {
+					this.terminal.options.fontFamily = `"${fontFamily}", monospace`;
+					if (this.webglAddon) {
+						try { this.webglAddon.clearTextureAtlas(); } catch (e) {}
+					}
+					// Ensure terminal dimensions are updated after font load changes char size
+					setTimeout(() => this.fit(), 100);
+				}
 			} catch (error) {
 				console.warn(`Failed to load terminal font ${fontFamily}:`, error);
 			}
