@@ -226,19 +226,38 @@ public class BackgroundExecutor extends CordovaPlugin {
                     callbackContext.error("HTTP " + code);
                     return;
                 }
+                long contentLength = conn.getContentLength();
                 java.io.File dstFile = new java.io.File(dst);
                 byte[] buf = new byte[65536];
-                long total = 0;
+                long downloaded = 0;
+                long startTime = System.currentTimeMillis();
+                long lastReportTime = 0;
                 try (java.io.InputStream is = conn.getInputStream();
                      java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
                     int len;
                     while ((len = is.read(buf)) > 0) {
                         fos.write(buf, 0, len);
-                        total += len;
+                        downloaded += len;
+                        long now = System.currentTimeMillis();
+                        if (now - lastReportTime >= 500) {
+                            lastReportTime = now;
+                            long elapsed = now - startTime;
+                            long speed = elapsed > 0 ? downloaded * 1000 / elapsed : 0;
+                            long eta = (speed > 0 && contentLength > 0) ? (contentLength - downloaded) / speed : -1;
+                            JSONObject progress = new JSONObject();
+                            progress.put("type", "progress");
+                            progress.put("downloaded", downloaded);
+                            progress.put("total", contentLength);
+                            progress.put("speed", speed);
+                            progress.put("eta", eta);
+                            PluginResult pr = new PluginResult(PluginResult.Status.OK, progress.toString());
+                            pr.setKeepCallback(true);
+                            callbackContext.sendPluginResult(pr);
+                        }
                     }
                 }
                 conn.disconnect();
-                Executor.nativeLog("log", "BG download done: " + dst + " (" + total + " bytes)");
+                Executor.nativeLog("log", "BG download done: " + dst + " (" + downloaded + " bytes)");
                 callbackContext.success(dst);
             } catch (Exception e) {
                 Executor.nativeLog("error", "BG download failed: " + e.getMessage());

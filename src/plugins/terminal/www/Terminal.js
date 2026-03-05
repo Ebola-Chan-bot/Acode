@@ -228,6 +228,18 @@ const Terminal = {
             system.fileExists(path, false, (result) => resolve(result == 1), () => resolve(false));
         });
 
+        const formatBytes = (bytes) => {
+            if (bytes < 1024) return bytes + " B";
+            if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+            return (bytes / 1048576).toFixed(1) + " MB";
+        };
+        const formatEta = (seconds) => {
+            if (seconds < 60) return seconds + "s";
+            const m = Math.floor(seconds / 60);
+            const s = seconds % 60;
+            return m + "m" + (s > 0 ? s + "s" : "");
+        };
+
         // Check which stages are already done
         const alreadyDownloaded = await fileExists(`${filesDir}/.downloaded`);
         const alreadyExtracted = await fileExists(`${filesDir}/.extracted`);
@@ -282,7 +294,13 @@ const Terminal = {
 
                 if (!hasAlpineTar) {
                     logger("⬇️  Downloading sandbox filesystem...");
-                    await Executor.download(alpineUrl, `${filesDir}/alpine.tar.gz`);
+                    await Executor.download(alpineUrl, `${filesDir}/alpine.tar.gz`, (p) => {
+                        const dl = formatBytes(p.downloaded);
+                        const total = p.total > 0 ? formatBytes(p.total) : "?";
+                        const speed = formatBytes(p.speed) + "/s";
+                        const eta = p.eta > 0 ? formatEta(p.eta) : "--";
+                        logger(`⬇️  ${dl} / ${total}  ${speed}  ETA ${eta}`);
+                    });
                 } else {
                     logger("✅  Sandbox filesystem already downloaded");
                 }
@@ -302,7 +320,13 @@ const Terminal = {
 
                     if (!copiedFromAsset) {
                         logger("⬇️  Downloading axs...");
-                        await Executor.download(axsUrl, `${filesDir}/axs`);
+                        await Executor.download(axsUrl, `${filesDir}/axs`, (p) => {
+                            const dl = formatBytes(p.downloaded);
+                            const total = p.total > 0 ? formatBytes(p.total) : "?";
+                            const speed = formatBytes(p.speed) + "/s";
+                            const eta = p.eta > 0 ? formatEta(p.eta) : "--";
+                            logger(`⬇️  ${dl} / ${total}  ${speed}  ETA ${eta}`);
+                        });
                     }
                 } else {
                     logger("✅  AXS binary already downloaded");

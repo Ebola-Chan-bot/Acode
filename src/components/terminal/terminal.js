@@ -564,7 +564,9 @@ export default class TerminalComponent {
 
 		try {
 			// Check if terminal is installed before starting AXS
+			console.log("[AXS-DEBUG] checking isInstalled...");
 			const installed = await Terminal.isInstalled();
+			console.log("[AXS-DEBUG] isInstalled =", installed);
 			if (!installed) {
 				throw new Error(
 					"Terminal not installed. Please install terminal first.",
@@ -572,7 +574,9 @@ export default class TerminalComponent {
 			}
 
 			// Start AXS if not running
+			console.log("[AXS-DEBUG] checking isAxsRunning...");
 			const axsRunning = await Terminal.isAxsRunning();
+			console.log("[AXS-DEBUG] isAxsRunning =", axsRunning);
 
 			const pollAxs = async (maxRetries = 30, intervalMs = 1000) => {
 				for (let i = 0; i < maxRetries; i++) {
@@ -586,11 +590,14 @@ export default class TerminalComponent {
 			};
 
 			if (!axsRunning) {
+				console.log("[AXS-DEBUG] starting AXS...");
 				await Terminal.startAxs(false, () => {}, console.error);
 
 				// Two-phase startup: proot --setup-only takes ~5-8s, then AXS starts.
 				// Wait up to 30s before attempting repair.
+				console.log("[AXS-DEBUG] polling AXS (30 retries)...");
 				const pollResult = await pollAxs(30);
+				console.log("[AXS-DEBUG] pollResult =", pollResult);
 				if (!pollResult) {
 					// AXS failed to start — attempt auto-repair
 					toast("Repairing terminal environment...");
@@ -623,11 +630,13 @@ export default class TerminalComponent {
 			const tryCreateSession = async (hostList, sessionPort) => {
 				for (const host of hostList) {
 					try {
+						console.log(`[AXS-DEBUG] fetch http://${host}:${sessionPort}/terminals ...`);
 						const testResp = await fetch(`http://${host}:${sessionPort}/terminals`, {
 							method: "POST",
 							headers: { "Content-Type": "application/json" },
 							body: JSON.stringify(requestBody),
 						});
+						console.log(`[AXS-DEBUG] fetch ${host} status=${testResp.status}`);
 						if (testResp.ok) {
 							const data = await testResp.text();
 							const trimmed = data.trim();
@@ -642,8 +651,12 @@ export default class TerminalComponent {
 								} catch (_) { /* not JSON, treat as PID */ }
 							}
 							return { host, pid: trimmed };
+						} else {
+							console.log(`[AXS-DEBUG] fetch ${host} not ok: ${testResp.status} ${await testResp.text()}`);
 						}
-					} catch (e) {}
+					} catch (e) {
+						console.log(`[AXS-DEBUG] fetch ${host} error: ${e.message}`);
+					}
 				}
 				return null;
 			};
@@ -667,10 +680,13 @@ export default class TerminalComponent {
 
 			const port = Terminal.axsPort || this.options.port;
 			const hosts = await buildHostList();
+			console.log("[AXS-DEBUG] tryCreateSession hosts=", hosts, "port=", port);
 			let result = await tryCreateSession(hosts, port);
+			console.log("[AXS-DEBUG] tryCreateSession result=", result);
 
 			// === Fallback: If inside-proot AXS is unreachable, switch to outside-proot ===
 			if (!result && !Terminal._outsideProot) {
+				console.log("[AXS-DEBUG] falling back to outside-proot");
 				try { await Terminal.stopAxs(); } catch (_) { /* ignore */ }
 				Terminal._outsideProot = true;
 
@@ -678,7 +694,9 @@ export default class TerminalComponent {
 				Terminal.startAxs(false, () => {}, console.error);
 
 				// Wait for outside-proot AXS to start
+				console.log("[AXS-DEBUG] polling outside-proot AXS...");
 				const outsidePoll = await pollAxs(20);
+				console.log("[AXS-DEBUG] outsidePoll =", outsidePoll);
 				if (outsidePoll) {
 					const retryPort = Terminal.axsPort || this.options.port;
 					const retryHosts = await buildHostList();
