@@ -145,13 +145,13 @@
 
   /* ── 前台恢复时立即重连 ── */
   document.addEventListener('visibilitychange',function(){
-    if(!document.hidden&&(!ws||ws.readyState!==1)){
+    if(!document.hidden&&(!ws||!ws.readyState||ws.readyState!==1)){
       diag('Visibility restored, reconnecting...');
       retryCount=0;urlIdx=0;connect();
     }
   });
   document.addEventListener('resume',function(){
-    if(!ws||ws.readyState!==1){
+    if(!ws||!ws.readyState||ws.readyState!==1){
       diag('App resumed, reconnecting...');
       retryCount=0;urlIdx=0;connect();
     }
