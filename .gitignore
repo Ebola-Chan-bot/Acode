@@ -13,4 +13,3 @@ pnpm-lock.yaml
 .idea
 ace-builds
 fdroid.bool
-scripts/hdc-debug/logs/

@@ -24,7 +24,6 @@ const { values: args } = parseArgs({
 	options: {
 		port: { type: "string", short: "p", default: "8092" },
 		watch: { type: "boolean", short: "w", default: false },
-		localhost: { type: "boolean", default: false },
 	},
 });
 
@@ -99,41 +98,10 @@ const httpServer = createServer((req, res) => {
 	const url = new URL(req.url, `http://localhost:${PORT}`);
 	let pathname = decodeURIComponent(url.pathname);
 
-	// Debug: log all non-static HTTP requests (helps diagnose 404 on /__log)
-	if (pathname.startsWith("/__") || req.method !== "GET") {
-		console.log(`${C.dim}[HTTP]${C.reset} ${req.method} ${pathname} (raw: ${req.url}) from ${req.socket.remoteAddress}`);
-	}
-
 	// Debug client script (injected into app)
 	if (pathname === "/__debug_client.js") {
 		res.writeHead(200, { "Content-Type": "application/javascript", "Access-Control-Allow-Origin": "*" });
 		res.end(generateDebugClientJS());
-		return;
-	}
-
-	// Native log endpoint (Java-side HTTP POST, survives background)
-	if (pathname === "/__log" && req.method === "POST") {
-		let body = "";
-		req.on("data", (chunk) => { body += chunk; });
-		req.on("end", () => {
-			res.writeHead(200, { "Access-Control-Allow-Origin": "*" });
-			res.end("ok");
-			try {
-				const msg = JSON.parse(body);
-				const ts = new Date().toLocaleTimeString("zh-CN");
-				const lvl = (msg.level || "log").toUpperCase();
-				const color = LEVEL_COLOR[msg.level] || C.white;
-				console.log(`${C.dim}${ts}${C.reset} ${color}[${lvl}]${C.reset} ${C.blue}[Native]${C.reset} ${msg.message || body}`);
-			} catch {
-				const ts = new Date().toLocaleTimeString("zh-CN");
-				console.log(`${C.dim}${ts}${C.reset} ${C.blue}[Native]${C.reset} ${body}`);
-			}
-		});
-		return;
-	}
-	if (pathname === "/__log" && req.method === "OPTIONS") {
-		res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST", "Access-Control-Allow-Headers": "Content-Type" });
-		res.end();
 		return;
 	}
 
@@ -181,10 +149,6 @@ wss.on("connection", (ws, req) => {
 	console.log(`${C.green}[连接]${C.reset} 客户端已连接 ${C.dim}${from}${C.reset}`);
 	clients.add(ws);
 
-	// Server-side ping every 10s to keep connection alive on 卓易通/HarmonyOS
-	ws.isAlive = true;
-	ws.on("pong", () => { ws.isAlive = true; });
-
 	ws.on("message", (raw) => {
 		try {
 			const msg = JSON.parse(raw.toString());
@@ -199,18 +163,6 @@ wss.on("connection", (ws, req) => {
 		console.log(`${C.yellow}[断开]${C.reset} 客户端已断开 ${C.dim}${from}${C.reset}`);
 	});
 });
-
-// Ping all clients every 10s; terminate dead connections
-const pingInterval = setInterval(() => {
-	for (const ws of wss.clients) {
-		if (ws.isAlive === false) {
-			ws.terminate();
-			continue;
-		}
-		ws.isAlive = false;
-		ws.ping();
-	}
-}, 10000);
 
 function broadcast(data) {
 	const payload = JSON.stringify(data);
@@ -272,23 +224,16 @@ if (args.watch) {
 // ─── Start ───────────────────────────────────────────────────────────
 httpServer.listen(PORT, "0.0.0.0", () => {
 	const lanIP = getLanIP();
-	const mode = args.localhost ? "HDC rport (USB 隧道)" : "局域网";
 	console.log("");
 	console.log(`${C.green}╔══════════════════════════════════════════════╗${C.reset}`);
 	console.log(`${C.green}║${C.reset}     HDC 远程调试服务器已启动                ${C.green}║${C.reset}`);
 	console.log(`${C.green}╠══════════════════════════════════════════════╣${C.reset}`);
-	console.log(`${C.green}║${C.reset} 模式:      ${C.cyan}${mode}${C.reset}`);
-	console.log(`${C.green}║${C.reset} 连接地址:  ${C.cyan}http://${lanIP}:${PORT}${C.reset}`);
-	console.log(`${C.green}║${C.reset} 日志面板:  ${C.cyan}http://localhost:${PORT}/__logs${C.reset}`);
-	console.log(`${C.green}║${C.reset} 监视模式:  ${args.watch ? `${C.green}已开启` : `${C.dim}未开启`}${C.reset}`);
+	console.log(`${C.green}║${C.reset} 局域网地址: ${C.cyan}http://${lanIP}:${PORT}${C.reset}          ${C.green}║${C.reset}`);
+	console.log(`${C.green}║${C.reset} 日志面板:   ${C.cyan}http://${lanIP}:${PORT}/__logs${C.reset}   ${C.green}║${C.reset}`);
+	console.log(`${C.green}║${C.reset} 监视模式:   ${args.watch ? `${C.green}已开启` : `${C.dim}未开启`}${C.reset}                        ${C.green}║${C.reset}`);
 	console.log(`${C.green}╚══════════════════════════════════════════════╝${C.reset}`);
 	console.log("");
-	if (args.localhost) {
-		console.log(`${C.dim}提示: 使用 HDC rport 隧道模式，设备通过 127.0.0.1:${PORT} 连接${C.reset}`);
-		console.log(`${C.dim}请确保已执行: hdc rport tcp:${PORT} tcp:${PORT}${C.reset}`);
-	} else {
-		console.log(`${C.dim}提示: 确保手机和电脑在同一局域网${C.reset}`);
-	}
+	console.log(`${C.dim}提示: 确保手机和电脑在同一局域网${C.reset}`);
 	console.log(`${C.dim}在 www/index.html 的 <head> 中加入:${C.reset}`);
 	console.log(`${C.cyan}<script src="http://${lanIP}:${PORT}/__debug_client.js"><\/script>${C.reset}`);
 	console.log("");
@@ -296,19 +241,7 @@ httpServer.listen(PORT, "0.0.0.0", () => {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 function getLanIP() {
-	if (args.localhost) return "127.0.0.1";
 	const nets = networkInterfaces();
-	const SKIP_RE = /loopback|vethernet|hyper-v|wsl|virtualbox|vmware|isatap|teredo|bluetooth/i;
-	// 先找私有网段的非虚拟接口
-	for (const name of Object.keys(nets)) {
-		if (SKIP_RE.test(name)) continue;
-		for (const net of nets[name]) {
-			if (net.family === "IPv4" && !net.internal) {
-				return net.address;
-			}
-		}
-	}
-	// 回退
 	for (const name of Object.keys(nets)) {
 		for (const net of nets[name]) {
 			if (net.family === "IPv4" && !net.internal) {
@@ -409,7 +342,7 @@ function generateDebugClientJS() {
   });
 
   // 心跳
-  setInterval(function() { send({ type: "ping" }); }, 10000);
+  setInterval(function() { send({ type: "ping" }); }, 30000);
 
   connect();
 })();
