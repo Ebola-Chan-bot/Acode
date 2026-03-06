@@ -193,12 +193,6 @@ class Executor {
     });
   }
 
-  gunzip(src, dst) {
-    return new Promise((resolve, reject) => {
-      exec(resolve, reject, this.ExecutorType, "gunzip", [src, dst]);
-    });
-  }
-
   download(url, dst, onProgress) {
     return new Promise((resolve, reject) => {
       exec(
@@ -219,12 +213,6 @@ class Executor {
         "download",
         [url, dst]
       );
-    });
-  }
-
-  setLogServer(url) {
-    return new Promise((resolve, reject) => {
-      exec(resolve, reject, this.ExecutorType, "setLogServer", [url]);
     });
   }
 }

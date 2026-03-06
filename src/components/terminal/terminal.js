@@ -203,8 +203,22 @@ export default class TerminalComponent {
 			// Debounced resize handling
 			resizeTimeout = setTimeout(async () => {
 				try {
-					console.log(`[Terminal Resize] cols=${size.cols}, rows=${size.rows}`);
-					// Handle server resize unconditionally to ensure PTY sync
+					// Always sync cols/rows to backend PTY on every client resize.
+					//
+					// The original code only synced when heightRatio < 0.75 (the "keyboard resize"
+					// heuristic below). That fails in several real scenarios on mobile:
+					//   1. Small keyboard height changes (e.g. switching input methods, suggestion
+					//      bar appearing/disappearing) shrink height by <25%, bypassing the threshold.
+					//   2. Width-only changes (screen rotation, split-screen toggle) leave height
+					//      unchanged so heightRatio ≈ 1.0, but cols change and PTY must know.
+					//   3. Animated keyboard open/close fires many incremental resize events; each
+					//      individual step is a tiny delta that never crosses 0.75, yet the
+					//      accumulated drift corrupts output.
+					//   4. Different ROMs / WebView versions report slightly different viewport sizes
+					//      for the same keyboard, making any fixed threshold unreliable.
+					//
+					// Unconditionally syncing is cheap (one small HTTP POST per debounced resize)
+					// and guarantees the PTY always matches the client grid.
 					if (this.serverMode) {
 						await this.resizeTerminal(size.cols, size.rows);
 					}
@@ -564,9 +578,7 @@ export default class TerminalComponent {
 
 		try {
 			// Check if terminal is installed before starting AXS
-			console.log("[AXS-DEBUG] checking isInstalled...");
 			const installed = await Terminal.isInstalled();
-			console.log("[AXS-DEBUG] isInstalled =", installed);
 			if (!installed) {
 				throw new Error(
 					"Terminal not installed. Please install terminal first.",
@@ -574,9 +586,7 @@ export default class TerminalComponent {
 			}
 
 			// Start AXS if not running
-			console.log("[AXS-DEBUG] checking isAxsRunning...");
 			const axsRunning = await Terminal.isAxsRunning();
-			console.log("[AXS-DEBUG] isAxsRunning =", axsRunning);
 
 			const pollAxs = async (maxRetries = 30, intervalMs = 1000) => {
 				for (let i = 0; i < maxRetries; i++) {
@@ -590,14 +600,11 @@ export default class TerminalComponent {
 			};
 
 			if (!axsRunning) {
-				console.log("[AXS-DEBUG] starting AXS...");
 				await Terminal.startAxs(false, () => {}, console.error);
 
 				// Two-phase startup: proot --setup-only takes ~5-8s, then AXS starts.
 				// Wait up to 30s before attempting repair.
-				console.log("[AXS-DEBUG] polling AXS (30 retries)...");
 				const pollResult = await pollAxs(30);
-				console.log("[AXS-DEBUG] pollResult =", pollResult);
 				if (!pollResult) {
 					// AXS failed to start — attempt auto-repair
 					toast("Repairing terminal environment...");
@@ -624,105 +631,26 @@ export default class TerminalComponent {
 				rows: this.terminal.rows,
 			};
 
-			// Helper: try to create a session by fetching POST /terminals
-			// Returns { host, pid } on success, or null on complete failure.
-			// Throws on PTY error (AXS reachable but can't create terminal).
-			const tryCreateSession = async (hostList, sessionPort) => {
-				for (const host of hostList) {
-					try {
-						console.log(`[AXS-DEBUG] fetch http://${host}:${sessionPort}/terminals ...`);
-						const testResp = await fetch(`http://${host}:${sessionPort}/terminals`, {
-							method: "POST",
-							headers: { "Content-Type": "application/json" },
-							body: JSON.stringify(requestBody),
-						});
-						console.log(`[AXS-DEBUG] fetch ${host} status=${testResp.status}`);
-						if (testResp.ok) {
-							const data = await testResp.text();
-							const trimmed = data.trim();
-							// Detect AXS error response (e.g. PTY failure)
-							if (trimmed.startsWith('{')) {
-								try {
-									const errObj = JSON.parse(trimmed);
-									if (errObj.error) {
-										// Return special marker for PTY/server error
-										return { host, pid: trimmed, axsError: errObj.error };
-									}
-								} catch (_) { /* not JSON, treat as PID */ }
-							}
-							return { host, pid: trimmed };
-						} else {
-							console.log(`[AXS-DEBUG] fetch ${host} not ok: ${testResp.status} ${await testResp.text()}`);
-						}
-					} catch (e) {
-						console.log(`[AXS-DEBUG] fetch ${host} error: ${e.message}`);
-					}
-				}
-				return null;
-			};
+			const response = await fetch(
+				`http://localhost:${this.options.port}/terminals`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(requestBody),
+				},
+			);
 
-			// Build list of hosts to try, in priority order:
-			// 1. Terminal.axsHost — parsed from AXS "listening on X:Y" output (most reliable)
-			// 2. localhost — works on normal devices where loopback is shared
-			// 3. getDeviceIp() — LAN IP fallback for 卓易通/HarmonyOS network isolation
-			const buildHostList = async () => {
-				const hosts = [];
-				if (Terminal.axsHost && Terminal.axsHost !== "127.0.0.1") {
-					hosts.push(Terminal.axsHost);
-				}
-				hosts.push("localhost");
-				const deviceIp = await Terminal.getDeviceIp();
-				if (deviceIp && deviceIp !== "localhost" && !hosts.includes(deviceIp)) {
-					hosts.push(deviceIp);
-				}
-				return hosts;
-			};
-
-			const port = Terminal.axsPort || this.options.port;
-			const hosts = await buildHostList();
-			console.log("[AXS-DEBUG] tryCreateSession hosts=", hosts, "port=", port);
-			let result = await tryCreateSession(hosts, port);
-			console.log("[AXS-DEBUG] tryCreateSession result=", result);
-
-			// === Fallback: If inside-proot AXS is unreachable, switch to outside-proot ===
-			if (!result && !Terminal._outsideProot) {
-				console.log("[AXS-DEBUG] falling back to outside-proot");
-				try { await Terminal.stopAxs(); } catch (_) { /* ignore */ }
-				Terminal._outsideProot = true;
-
-				// Start AXS outside proot (fire-and-forget — pollAxs will wait)
-				Terminal.startAxs(false, () => {}, console.error);
-
-				// Wait for outside-proot AXS to start
-				console.log("[AXS-DEBUG] polling outside-proot AXS...");
-				const outsidePoll = await pollAxs(20);
-				console.log("[AXS-DEBUG] outsidePoll =", outsidePoll);
-				if (outsidePoll) {
-					const retryPort = Terminal.axsPort || this.options.port;
-					const retryHosts = await buildHostList();
-					result = await tryCreateSession(retryHosts, retryPort);
-				}
+			if (!response.ok) {
+				throw new Error(`HTTP error! status: ${response.status}`);
 			}
 
-			if (!result) {
-				const modes = Terminal._outsideProot ? "inside-proot + outside-proot" : "inside-proot";
-				throw new Error(`Cannot reach AXS on any host (tried ${modes} modes)`);
-			}
-
-			// Check for AXS-level error (e.g. PTY Permission Denied)
-			if (result.axsError) {
-				// Still set the host for potential diagnostics, but the session is broken
-				this._axsHost = result.host;
-				this.pid = result.pid;
-				// Don't throw — let the WebSocket attempt show the actual failure,
-				// so user sees "Connection lost" rather than a cryptic error
-				return this.pid;
-			}
-
-			this._axsHost = result.host;
-			this.pid = result.pid;
+			const data = await response.text();
+			this.pid = data.trim();
 			return this.pid;
 		} catch (error) {
+			console.error("Failed to create terminal session:", error);
 			throw error;
 		}
 	}
@@ -744,9 +672,7 @@ export default class TerminalComponent {
 
 		this.pid = pid;
 
-		const wsHost = this._axsHost || "localhost";
-		const wsPort = Terminal.axsPort || this.options.port;
-		const wsUrl = `ws://${wsHost}:${wsPort}/terminals/${pid}`;
+		const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
 
 		this.websocket = new WebSocket(wsUrl);
 
@@ -754,7 +680,9 @@ export default class TerminalComponent {
 			this.isConnected = true;
 			this.onConnect?.();
 
-			// Dispose old attach addon before loading a new one (supports reconnection)
+			// Explicitly dispose old AttachAddon before replacing it.
+			// Reassigning this.attachAddon does NOT auto-clean listeners bound by the old instance,
+			// which can cause duplicate socket handlers and leaks after reconnects.
 			if (this.attachAddon) {
 				try { this.attachAddon.dispose(); } catch (_) {}
 				this.attachAddon = null;
@@ -824,10 +752,8 @@ export default class TerminalComponent {
 		if (!this.pid || !this.serverMode) return;
 
 		try {
-			const host = this._axsHost || "localhost";
-			const port = Terminal.axsPort || this.options.port;
 			await fetch(
-				`http://${host}:${port}/terminals/${this.pid}/resize`,
+				`http://localhost:${this.options.port}/terminals/${this.pid}/resize`,
 				{
 					method: "POST",
 					headers: {
@@ -1126,8 +1052,8 @@ export default class TerminalComponent {
 						method: "POST",
 					},
 				);
-			} catch (error) {
-				console.error("Failed to terminate terminal:", error);
+			} catch {
+				// Expected: terminal process may have already exited and acodex-server disconnected
 			}
 		}
 	}

@@ -376,26 +376,6 @@ public class System extends CordovaPlugin {
                 }
 
                 return true;
-            case "copyAsset":
-                {
-                    try {
-                        String assetName = args.getString(0);
-                        String destPath = args.getString(1);
-                        java.io.InputStream is = context.getAssets().open(assetName);
-                        java.io.OutputStream os = new java.io.FileOutputStream(destPath);
-                        byte[] buf = new byte[8192];
-                        int len;
-                        while ((len = is.read(buf)) > 0) {
-                            os.write(buf, 0, len);
-                        }
-                        os.close();
-                        is.close();
-                        callbackContext.success("Asset copied");
-                    } catch (Exception e) {
-                        callbackContext.error("copyAsset failed: " + e.getMessage());
-                    }
-                    return true;
-                }
             default:
                 return false;
         }

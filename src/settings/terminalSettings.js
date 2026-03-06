@@ -233,8 +233,12 @@ export default function terminalSettings() {
 					"Are you sure you want to uninstall the terminal?",
 				);
 				if (confirmation) {
+					const deleteCache = await confirm(
+						strings.confirm,
+						"Also delete download cache? Keeping it makes re-install faster.",
+					);
 					loader.showTitleLoader();
-					Terminal.uninstall()
+					(deleteCache ? Terminal.uninstallFull() : Terminal.uninstall())
 						.then(() => {
 							loader.removeTitleLoader();
 							alert(

@@ -23,11 +23,6 @@ public class BackgroundExecutor extends CordovaPlugin {
     @Override
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) throws JSONException {
         switch (action) {
-            case "setLogServer":
-                Executor.logServerUrl = args.optString(0, null);
-                Executor.nativeLog("log", "BackgroundExecutor: setLogServer to " + Executor.logServerUrl);
-                callbackContext.success("ok");
-                return true;
             case "start":
                 String pid = UUID.randomUUID().toString();
                 startProcess(pid, args.getString(0), args.getString(1).equals("true"), callbackContext);
@@ -46,9 +41,6 @@ public class BackgroundExecutor extends CordovaPlugin {
                 return true;
             case "loadLibrary":
                 loadLibrary(args.getString(0), callbackContext);
-                return true;
-            case "gunzip":
-                gunzip(args.getString(0), args.getString(1), callbackContext);
                 return true;
             case "download":
                 download(args.getString(0), args.getString(1), callbackContext);
@@ -90,13 +82,13 @@ public class BackgroundExecutor extends CordovaPlugin {
                 // Stream stdout
                 new Thread(() -> StreamHandler.streamOutput(
                     process.getInputStream(), 
-                    line -> { Executor.nativeLog("log", "[bgproc:" + pid + "] stdout:" + line); sendPluginMessage(pid, "stdout:" + line); }
+                    line -> sendPluginMessage(pid, "stdout:" + line)
                 )).start();
                 
                 // Stream stderr
                 new Thread(() -> StreamHandler.streamOutput(
                     process.getErrorStream(), 
-                    line -> { Executor.nativeLog("log", "[bgproc:" + pid + "] stderr:" + line); sendPluginMessage(pid, "stderr:" + line); }
+                    line -> sendPluginMessage(pid, "stderr:" + line)
                 )).start();
 
                 int exitCode = process.waitFor();
@@ -173,96 +165,7 @@ public class BackgroundExecutor extends CordovaPlugin {
         processCallbacks.remove(pid);
     }
 
-    private void gunzip(String src, String dst, CallbackContext callbackContext) {
-        cordova.getThreadPool().execute(() -> {
-            try {
-                Executor.nativeLog("log", "BG gunzip: " + src + " -> " + dst);
-                java.io.File srcFile = new java.io.File(src);
-                java.io.File dstFile = new java.io.File(dst);
-                byte[] buf = new byte[65536];
-                long total = 0;
-                try (java.util.zip.GZIPInputStream gis = new java.util.zip.GZIPInputStream(
-                        new java.io.FileInputStream(srcFile));
-                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
-                    int len;
-                    while ((len = gis.read(buf)) > 0) {
-                        fos.write(buf, 0, len);
-                        total += len;
-                    }
-                }
-                Executor.nativeLog("log", "BG gunzip done: " + total + " bytes");
-                callbackContext.success(dst);
-            } catch (Exception e) {
-                Executor.nativeLog("error", "BG gunzip failed: " + e.getMessage());
-                callbackContext.error("gunzip failed: " + e.getMessage());
-            }
-        });
-    }
-
     private void download(String url, String dst, CallbackContext callbackContext) {
-        cordova.getThreadPool().execute(() -> {
-            try {
-                Executor.nativeLog("log", "BG download: " + url);
-                java.net.URL u = new java.net.URL(url);
-                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) u.openConnection();
-                conn.setInstanceFollowRedirects(true);
-                conn.setConnectTimeout(30000);
-                conn.setReadTimeout(60000);
-                conn.connect();
-                int code = conn.getResponseCode();
-                if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
-                    String loc = conn.getHeaderField("Location");
-                    conn.disconnect();
-                    u = new java.net.URL(loc);
-                    conn = (java.net.HttpURLConnection) u.openConnection();
-                    conn.setInstanceFollowRedirects(true);
-                    conn.setConnectTimeout(30000);
-                    conn.setReadTimeout(60000);
-                    conn.connect();
-                    code = conn.getResponseCode();
-                }
-                if (code != 200) {
-                    conn.disconnect();
-                    callbackContext.error("HTTP " + code);
-                    return;
-                }
-                long contentLength = conn.getContentLength();
-                java.io.File dstFile = new java.io.File(dst);
-                byte[] buf = new byte[65536];
-                long downloaded = 0;
-                long startTime = System.currentTimeMillis();
-                long lastReportTime = 0;
-                try (java.io.InputStream is = conn.getInputStream();
-                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dstFile)) {
-                    int len;
-                    while ((len = is.read(buf)) > 0) {
-                        fos.write(buf, 0, len);
-                        downloaded += len;
-                        long now = System.currentTimeMillis();
-                        if (now - lastReportTime >= 500) {
-                            lastReportTime = now;
-                            long elapsed = now - startTime;
-                            long speed = elapsed > 0 ? downloaded * 1000 / elapsed : 0;
-                            long eta = (speed > 0 && contentLength > 0) ? (contentLength - downloaded) / speed : -1;
-                            JSONObject progress = new JSONObject();
-                            progress.put("type", "progress");
-                            progress.put("downloaded", downloaded);
-                            progress.put("total", contentLength);
-                            progress.put("speed", speed);
-                            progress.put("eta", eta);
-                            PluginResult pr = new PluginResult(PluginResult.Status.OK, progress.toString());
-                            pr.setKeepCallback(true);
-                            callbackContext.sendPluginResult(pr);
-                        }
-                    }
-                }
-                conn.disconnect();
-                Executor.nativeLog("log", "BG download done: " + dst + " (" + downloaded + " bytes)");
-                callbackContext.success(dst);
-            } catch (Exception e) {
-                Executor.nativeLog("error", "BG download failed: " + e.getMessage());
-                callbackContext.error("download failed: " + e.getMessage());
-            }
-        });
+        cordova.getThreadPool().execute(() -> DownloadHelper.download(url, dst, callbackContext));
     }
 }

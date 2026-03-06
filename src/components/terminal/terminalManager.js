@@ -237,6 +237,11 @@ class TerminalManager {
 						terminalComponent.mount(terminalContainer);
 
 						if (terminalComponent.serverMode) {
+							// Run install check after mount so install logs can stream into this
+							// exact terminal tab (via progressTerminal.component), instead of
+							// opening a separate "Terminal Installation" tab. Keeping it inside
+							// this init try/catch also reuses the same cleanup path on failure
+							// (dispose component + remove broken tab).
 							const installationResult = await this.checkAndInstallTerminal(false, {
 								component: terminalComponent,
 							});
@@ -324,7 +329,10 @@ class TerminalManager {
 
 	/**
 	 * Check if terminal is installed and install if needed
-	 * @param {boolean} [forceReinstall=false] - Whether to force reinstall even if already installed
+	 * @param {boolean} [forceReinstall=false] - Whether to force reinstall even if already installed.
+	 * Usually false for normal terminal creation. Set to true only for recovery flows
+	 * (currently relocation_error auto-repair) to bypass the "already installed"
+	 * early return and run a full reinstall.
 	 * @returns {Promise<{success: boolean, error?: string}>}
 	 */
 	async checkAndInstallTerminal(forceReinstall = false, progressTerminal = null) {
@@ -607,7 +615,7 @@ class TerminalManager {
 			console.log(`Terminal ${terminalId} disconnected`);
 		};
 
-		terminalComponent.onError = async (error) => {
+		terminalComponent.onError = (error) => {
 			console.error(`Terminal ${terminalId} error:`, error);
 
 			// Close the terminal and remove the tab
@@ -615,10 +623,7 @@ class TerminalManager {
 
 			// Show alert for connection error
 			const errorMessage = error?.message || "Connection lost";
-			alert(
-				strings["error"],
-				`Terminal connection error: ${errorMessage}`,
-			);
+			alert(strings["error"], `Terminal connection error: ${errorMessage}`);
 		};
 
 		terminalComponent.onTitleChange = async (title) => {
