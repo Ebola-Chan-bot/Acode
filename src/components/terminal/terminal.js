@@ -588,22 +588,28 @@ export default class TerminalComponent {
 			// Start AXS if not running
 			const axsRunning = await Terminal.isAxsRunning();
 
+			// Poll by hitting the actual HTTP endpoint, not just checking PID liveness.
+			// isAxsRunning() only does kill -0 on the PID file, which can return true
+			// while the HTTP server inside proot is still booting.
 			const pollAxs = async (maxRetries = 30, intervalMs = 1000) => {
 				for (let i = 0; i < maxRetries; i++) {
 					await new Promise((r) => setTimeout(r, intervalMs));
-					const running = await Terminal.isAxsRunning();
-					if (running) {
-						return true;
+					try {
+						const resp = await fetch(`http://localhost:${this.options.port}/`, { method: 'GET', signal: AbortSignal.timeout(2000) });
+						if (resp.ok || resp.status < 500) return true;
+					} catch (_) {
+						// HTTP not yet reachable
 					}
 				}
 				return false;
 			};
 
 			if (!axsRunning) {
+				// In debug builds, refresh axs binary from assets before starting
+				await Terminal.refreshAxsBinary();
 				await Terminal.startAxs(false, () => {}, console.error);
 
-				// Two-phase startup: proot --setup-only takes ~5-8s, then AXS starts.
-				// Wait up to 30s before attempting repair.
+				// Wait for axs HTTP server to become reachable
 				const pollResult = await pollAxs(30);
 				if (!pollResult) {
 					// AXS failed to start — attempt auto-repair
@@ -647,6 +653,32 @@ export default class TerminalComponent {
 			}
 
 			const data = await response.text();
+
+			// Detect PTY errors from axs server (e.g. incompatible binary)
+			if (data.includes('"error"') && data.includes('Failed to open PTY')) {
+				const refreshed = await Terminal.refreshAxsBinary();
+				if (refreshed) {
+					// Kill old axs, restart with fresh binary, and retry once
+					try { await Terminal.stopAxs(); } catch (_) {}
+					await Terminal.startAxs(false, () => {}, console.error);
+					const pollResult = await pollAxs(30);
+					if (pollResult) {
+						const retryResp = await fetch(
+							`http://localhost:${this.options.port}/terminals`,
+							{ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody) },
+						);
+						if (retryResp.ok) {
+							const retryData = await retryResp.text();
+							if (!retryData.includes('"error"')) {
+								this.pid = retryData.trim();
+								return this.pid;
+							}
+						}
+					}
+				}
+				throw new Error('Failed to open PTY even after refreshing AXS binary');
+			}
+
 			this.pid = data.trim();
 			return this.pid;
 		} catch (error) {

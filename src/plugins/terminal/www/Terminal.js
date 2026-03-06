@@ -2,6 +2,25 @@ const Executor = require("./Executor");
 
 const Terminal = {
     /**
+     * In debug builds, overwrite the axs binary from bundled assets to ensure
+     * the running version always matches the build. Returns true if replaced.
+     */
+    async refreshAxsBinary() {
+        if (typeof BuildInfo === 'undefined' || !BuildInfo.debug) return false;
+        const filesDir = await new Promise((resolve, reject) => {
+            system.getFilesDir(resolve, reject);
+        });
+        try {
+            await new Promise((resolve, reject) => {
+                system.copyAsset("axs", `${filesDir}/axs`, resolve, reject);
+            });
+            return true;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    /**
      * Starts the AXS environment by writing init scripts and executing the sandbox.
      * @param {boolean} [installing=false] - Whether AXS is being started during installation.
      * @param {Function} [logger=console.log] - Function to log standard output.
@@ -224,15 +243,18 @@ const Terminal = {
 
                 if (!hasAxs) {
                     let copiedFromAsset = false;
-                    try {
-                        logger("📦  Copying bundled axs from assets...");
-                        await new Promise((resolve, reject) => {
-                            system.copyAsset("axs", `${filesDir}/axs`, resolve, reject);
-                        });
-                        copiedFromAsset = true;
-                        logger("✅  Bundled AXS copied from assets");
-                    } catch (assetError) {
-                        
+                    // Only use bundled axs in debug builds; release builds always download latest
+                    if (typeof BuildInfo !== 'undefined' && BuildInfo.debug) {
+                        try {
+                            logger("📦  Copying bundled axs from assets...");
+                            await new Promise((resolve, reject) => {
+                                system.copyAsset("axs", `${filesDir}/axs`, resolve, reject);
+                            });
+                            copiedFromAsset = true;
+                            logger("✅  Bundled AXS copied from assets");
+                        } catch (assetError) {
+                            logger("⚠️  Asset copy failed, will download instead");
+                        }
                     }
 
                     if (!copiedFromAsset) {
