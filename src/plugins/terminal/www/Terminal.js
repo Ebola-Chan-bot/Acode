@@ -100,6 +100,8 @@ const Terminal = {
                     // Normal startup path: do not pass --installing.
                     // This avoids entering install-time setup when just launching AXS.
                     await Executor.write(uuid, `source ${filesDir}/init-sandbox.sh; exit`);
+                }).catch((error) => {
+                    err_logger("Failed to start AXS:", error);
                 });
             });
         }
