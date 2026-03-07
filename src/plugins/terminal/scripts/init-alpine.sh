@@ -166,6 +166,21 @@ if [ -s /etc/acode_motd ]; then
     cat /etc/acode_motd
 fi
 
+# Work around proot shebang execution failures for Bash's missing-command hook.
+# Bash normally auto-executes /usr/libexec/command-not-found when a command is
+# missing, but direct shebang execution can fail in proot with
+# "bad interpreter: Bad address". Run the original script explicitly through
+# /bin/sh so the script keeps working without relying on the broken shebang path.
+command_not_found_handle() {
+    if [ -x /usr/libexec/command-not-found ]; then
+        /bin/sh /usr/libexec/command-not-found "$@"
+        return $?
+    fi
+
+    printf '%s: command not found\n' "$1" >&2
+    return 127
+}
+
 # acode CLI: defined as a bash function instead of a standalone script.
 # In proot, a script with #!/bin/bash triggers execve("/bin/bash"), which the
 # kernel handles in kernel-space. proot relies on ptrace to intercept execve and
