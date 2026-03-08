@@ -344,9 +344,32 @@ export default {
 			func(...args, resolve, reject);
 		});
 	},
+	async requestJson(url, headers = {}) {
+		const nativeHttp = window.cordova?.plugin?.http;
+
+		if (/^https?:/i.test(url) && typeof nativeHttp?.get === "function") {
+			const response = await new Promise((resolve, reject) => {
+				nativeHttp.get(url, {}, headers, resolve, reject);
+			});
+
+			if (typeof response?.data === "string") {
+				return JSON.parse(response.data);
+			}
+
+			return response?.data;
+		}
+
+		const response = await fetch(url, { headers, cache: "no-store" });
+		if (!response.ok) {
+			throw new Error(`Request failed with status ${response.status}`);
+		}
+
+		return response.json();
+	},
 	async checkAPIStatus() {
+		const statusUrl = Url.join(constants.API_BASE, "status");
 		try {
-			const { status } = await ajax.get(Url.join(constants.API_BASE, "status"));
+			const { status } = await this.requestJson(statusUrl);
 			return status === "ok";
 		} catch (error) {
 			window.log("error", error);
