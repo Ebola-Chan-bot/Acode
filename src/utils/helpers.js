@@ -344,27 +344,26 @@ export default {
 			func(...args, resolve, reject);
 		});
 	},
+	// Plugin API requests are all remote HTTPS calls. For this workload, the
+	// JS-to-native bridge cost is negligible compared to network latency, so we
+	// use native HTTP unconditionally instead of keeping a fetch fast path.
+	// This also avoids the WebView CORS mismatch that caused false
+	// "API unavailable" failures against the plugin API.
 	async requestJson(url, headers = {}) {
 		const nativeHttp = window.cordova?.plugin?.http;
-
-		if (/^https?:/i.test(url) && typeof nativeHttp?.get === "function") {
-			const response = await new Promise((resolve, reject) => {
-				nativeHttp.get(url, {}, headers, resolve, reject);
-			});
-
-			if (typeof response?.data === "string") {
-				return JSON.parse(response.data);
-			}
-
-			return response?.data;
+		if (typeof nativeHttp?.get !== "function") {
+			throw new Error("Native HTTP plugin is unavailable");
 		}
 
-		const response = await fetch(url, { headers, cache: "no-store" });
-		if (!response.ok) {
-			throw new Error(`Request failed with status ${response.status}`);
+		const response = await new Promise((resolve, reject) => {
+			nativeHttp.get(url, {}, headers, resolve, reject);
+		});
+
+		if (typeof response?.data === "string") {
+			return JSON.parse(response.data);
 		}
 
-		return response.json();
+		return response?.data;
 	},
 	async checkAPIStatus() {
 		const statusUrl = Url.join(constants.API_BASE, "status");
