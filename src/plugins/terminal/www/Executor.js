@@ -197,11 +197,13 @@ class Executor {
     return new Promise((resolve, reject) => {
       exec(
         (msg) => {
-          if (onProgress && typeof msg === "string") {
+          if (typeof msg === "string") {
             try {
               const data = JSON.parse(msg);
               if (data.type === "progress") {
-                onProgress(data);
+                if (typeof onProgress === "function") {
+                  onProgress(data);
+                }
                 return;
               }
             } catch (_) {}

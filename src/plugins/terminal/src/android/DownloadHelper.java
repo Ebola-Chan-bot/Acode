@@ -5,11 +5,17 @@ import org.json.*;
 
 class DownloadHelper {
 
+    private static String formatDownloadContext(String url, String dst, java.net.URI currentUri) {
+        String resolved = currentUri != null ? currentUri.toString() : url;
+        return "url=" + url + ", resolved=" + resolved + ", dst=" + dst;
+    }
+
     static void download(String url, String dst, CallbackContext callbackContext) {
         java.net.HttpURLConnection conn = null;
+        java.net.URI currentUri = null;
         try {
             java.net.URI originalUri = java.net.URI.create(url);
-            java.net.URI currentUri = originalUri;
+            currentUri = originalUri;
             boolean originalHttps = "https".equalsIgnoreCase(originalUri.getScheme());
             int redirectCount = 0;
             final int maxRedirects = 5;
@@ -30,13 +36,13 @@ class DownloadHelper {
 
                 if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
                     if (redirectCount >= maxRedirects) {
-                        callbackContext.error("Too many redirects");
+                        callbackContext.error("Too many redirects: " + formatDownloadContext(url, dst, currentUri));
                         return;
                     }
 
                     String loc = conn.getHeaderField("Location");
                     if (loc == null || loc.isEmpty()) {
-                        callbackContext.error("Redirect with no Location header (HTTP " + code + ")");
+                        callbackContext.error("Redirect with no Location header (HTTP " + code + "): " + formatDownloadContext(url, dst, currentUri));
                         return;
                     }
 
@@ -48,12 +54,12 @@ class DownloadHelper {
                     String scheme = redirectUri.getScheme();
                     if (scheme == null ||
                         (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
-                        callbackContext.error("Unsupported redirect scheme: " + scheme);
+                        callbackContext.error("Unsupported redirect scheme: " + scheme + ": " + formatDownloadContext(url, dst, currentUri));
                         return;
                     }
 
                     if (originalHttps && "http".equalsIgnoreCase(scheme)) {
-                        callbackContext.error("Refusing to follow HTTPS to HTTP redirect");
+                        callbackContext.error("Refusing to follow HTTPS to HTTP redirect: " + formatDownloadContext(url, dst, currentUri));
                         return;
                     }
 
@@ -69,7 +75,7 @@ class DownloadHelper {
             }
 
             if (code != 200) {
-                callbackContext.error("HTTP " + code);
+                callbackContext.error("HTTP " + code + ": " + formatDownloadContext(url, dst, currentUri));
                 return;
             }
 
@@ -105,7 +111,7 @@ class DownloadHelper {
             }
             callbackContext.success(dst);
         } catch (Exception e) {
-            callbackContext.error("download failed: " + e.getMessage());
+            callbackContext.error("download failed: " + e.getClass().getSimpleName() + ": " + e.getMessage() + "; " + formatDownloadContext(url, dst, currentUri));
         } finally {
             if (conn != null) {
                 conn.disconnect();

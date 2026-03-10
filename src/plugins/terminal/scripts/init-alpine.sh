@@ -2,6 +2,50 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/share/bin:/usr/share/sbin:/usr/lo
 export HOME=/home
 export TERM=xterm-256color
 
+APK_MAIN_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
+APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
+APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
+APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
+
+diag_log() {
+    echo "[diag] $*"
+}
+
+dump_apk_lock_state() {
+    diag_log "apk-lock shell-pid=$$ ppid=$PPID uid=$(id -u 2>/dev/null)"
+    ls -ld /lib/apk/db 2>/dev/null || true
+    ls -l /lib/apk/db/lock 2>/dev/null || echo "[diag] /lib/apk/db/lock missing"
+    ps 2>/dev/null | grep -E 'apk|proot|axs|sh' | grep -v grep || true
+}
+
+run_apk_step() {
+    local step_name="$1"
+    shift
+
+    diag_log "running ${step_name}"
+    "$@"
+    local exit_code=$?
+    diag_log "${step_name} exit=${exit_code}"
+    if [ $exit_code -ne 0 ]; then
+        dump_apk_lock_state
+    fi
+    return $exit_code
+}
+
+configure_apk_repositories() {
+    local repo_mode="$1"
+
+    if [ "$repo_mode" = "mirror" ]; then
+        printf '%s\n%s\n' "$APK_MIRROR_MAIN_REPO" "$APK_MIRROR_COMMUNITY_REPO" > /etc/apk/repositories
+        diag_log "apk repositories configured source=mirror"
+    else
+        printf '%s\n%s\n' "$APK_MAIN_REPO" "$APK_COMMUNITY_REPO" > /etc/apk/repositories
+        diag_log "apk repositories configured source=official"
+    fi
+
+    cat /etc/apk/repositories 2>/dev/null || true
+}
+
 
 # ── Package check (runs every startup, file-stat only — negligible cost) ──
 # Check by file existence rather than apk info (which is unreliable in proot)
@@ -22,20 +66,34 @@ missing_packages=""
 
 if [ -n "$missing_packages" ]; then
     echo -e "\e[34;1m[*] \e[0mInstalling packages:$missing_packages\e[0m"
+    diag_log "installing shell-pid=$$ ppid=$PPID missing_packages=$missing_packages"
+    dump_apk_lock_state
 
-    # In proot, post-install scripts may fail with error 127;
-    # manual fixup below compensates if needed.
-    apk update 2>/dev/null
+    install_succeeded="false"
+    for repo_mode in official mirror; do
+        configure_apk_repositories "$repo_mode"
 
-    apk add $missing_packages 2>/dev/null
-    if [ $? -ne 0 ]; then
-        echo -e "\e[33;1m[!] \e[0mRetrying with mirror...\e[0m"
-        cp /etc/apk/repositories /etc/apk/repositories.bak
-        echo "https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main" > /etc/apk/repositories
-        echo "https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community" >> /etc/apk/repositories
-        apk update 2>/dev/null
-        apk add $missing_packages 2>/dev/null
-        mv /etc/apk/repositories.bak /etc/apk/repositories 2>/dev/null
+        # In proot, post-install scripts may fail with error 127;
+        # manual fixup below compensates if needed.
+        run_apk_step "apk update package-index source=${repo_mode}" apk update
+        if [ $? -ne 0 ]; then
+            echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
+            continue
+        fi
+
+        run_apk_step "apk add required-packages source=${repo_mode}" apk add $missing_packages
+        if [ $? -ne 0 ]; then
+            echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
+            continue
+        fi
+
+        install_succeeded="true"
+        break
+    done
+
+    if [ "$install_succeeded" != "true" ]; then
+        echo -e "\e[31;1m[!] \e[0mapk package installation failed with both official and mirror repositories\e[0m"
+        exit 1
     fi
 
     bash_path="$(find_bash_path)"
@@ -51,8 +109,14 @@ if [ -n "$missing_packages" ]; then
     fi
 
     # Verify
+    dump_apk_lock_state
     [ -z "$bash_path" ] && echo -e "\e[31;1m[!] \e[0mbash still missing\e[0m"
     [ ! -f /usr/bin/wget ] && echo -e "\e[31;1m[!] \e[0mwget still missing\e[0m"
+
+    if [ -z "$bash_path" ] || [ ! -f /usr/bin/wget ] || [ ! -f /usr/share/zoneinfo/UTC ]; then
+        echo -e "\e[31;1m[!] \e[0mRequired packages are still missing after installation\e[0m"
+        exit 1
+    fi
 fi
 
 
