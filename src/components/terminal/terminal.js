@@ -21,6 +21,33 @@ import { getTerminalSettings } from "./terminalDefaults";
 import TerminalThemeManager from "./terminalThemeManager";
 import TerminalTouchSelection from "./terminalTouchSelection";
 
+function pushDebugPayload(payload) {
+	if (typeof window.__HDC_DEBUG_PUSH !== "function") {
+		return;
+	}
+
+	window.__HDC_DEBUG_PUSH(payload);
+}
+
+async function decodeSocketMessageData(data, maxLength = 4096) {
+	if (typeof data === "string") {
+		return data.slice(0, maxLength);
+	}
+
+	if (data instanceof ArrayBuffer) {
+		const byteLength = Math.min(data.byteLength, maxLength);
+		const view = new Uint8Array(data, 0, byteLength);
+		return new TextDecoder("utf-8", { fatal: false }).decode(view);
+	}
+
+	if (data instanceof Blob) {
+		const slice = data.size > maxLength ? data.slice(0, maxLength) : data;
+		return new Response(slice).text();
+	}
+
+	return "";
+}
+
 export default class TerminalComponent {
 	constructor(options = {}) {
 		// Get terminal settings from shared defaults
@@ -636,8 +663,26 @@ export default class TerminalComponent {
 				return false;
 			};
 
+			const writeLifecycleLog = (message, isError = false) => {
+				const cleanMessage = String(message ?? "").replace(/^(stdout|stderr)\s+/, "");
+				if (cleanMessage) {
+					this.terminal.write(
+						`${isError ? "\x1b[31m" : ""}${cleanMessage}\x1b[0m\r\n`,
+					);
+				}
+				if (isError) {
+					console.error(message);
+				} else {
+					console.log(message);
+				}
+			};
+
 			if (!axsRunning) {
-				await Terminal.startAxs(false, () => {}, console.error);
+				await Terminal.startAxs(
+					false,
+					(message) => writeLifecycleLog(message, false),
+					(message) => writeLifecycleLog(message, true),
+				);
 			}
 
 			// Always wait for the HTTP endpoint, even if the PID is already alive.
@@ -657,12 +702,23 @@ export default class TerminalComponent {
 				// Re-run installing flow to repair packages / config
 				const repairOk = await Terminal.startAxs(
 					true,
-					console.log,
-					console.error,
+					(message) => writeLifecycleLog(message, false),
+					(message) => writeLifecycleLog(message, true),
 				);
 				if (repairOk) {
 					// Start AXS again after repair
-					await Terminal.startAxs(false, () => {}, console.error);
+					await Terminal.startAxs(
+						false,
+						(message) => writeLifecycleLog(message, false),
+						(message) => writeLifecycleLog(message, true),
+					);
+				} else {
+					try {
+						await Terminal.resetConfigured();
+					} catch (_) {
+						/* ignore */
+					}
+					throw new Error("AXS repair failed");
 				}
 
 				if (!(await pollAxs(30))) {
@@ -793,6 +849,19 @@ export default class TerminalComponent {
 				}
 			}
 			// For binary data or non-exit text messages, let attachAddon handle them
+			decodeSocketMessageData(event.data)
+				.then((text) => {
+					const cleanText = String(text ?? "").replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "").replace(/\r/g, "");
+					if (!cleanText.trim()) {
+						return;
+					}
+					pushDebugPayload({
+						type: "console",
+						level: "debug",
+						args: ["[terminal-stream]", `pid=${pid}`, cleanText.slice(0, 2048)],
+					});
+				})
+				.catch(() => {});
 		};
 
 		// Also sniff the data to detect critical Alpine container corruption (e.g. bash/readline broken)

@@ -78,18 +78,6 @@ if [ -e "/proc/self/fd" ]; then
   ARGS="$ARGS -b /proc/self/fd:/dev/fd"
 fi
 
-if [ -e "/proc/self/fd/0" ]; then
-  ARGS="$ARGS -b /proc/self/fd/0:/dev/stdin"
-fi
-
-if [ -e "/proc/self/fd/1" ]; then
-  ARGS="$ARGS -b /proc/self/fd/1:/dev/stdout"
-fi
-
-if [ -e "/proc/self/fd/2" ]; then
-  ARGS="$ARGS -b /proc/self/fd/2:/dev/stderr"
-fi
-
 
 ARGS="$ARGS -r $PREFIX/alpine"
 ARGS="$ARGS -0"
@@ -102,4 +90,9 @@ ARGS="$ARGS --link2symlink"
 # context, whereas the crash affects all users on vulnerable kernels.
 ARGS="$ARGS -L"
 
+echo "[sandbox] proot=$PROOT"
+echo "[sandbox] args=$ARGS"
 $PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
+PROOT_EXIT=$?
+echo "[sandbox] proot exit=$PROOT_EXIT"
+exit $PROOT_EXIT

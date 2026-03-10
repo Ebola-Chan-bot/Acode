@@ -545,7 +545,6 @@ Additional Info:
 		try {
 			await TerminalManager.createServerTerminal();
 		} catch (error) {
-			console.error("Failed to create terminal:", error);
 			window.toast("Failed to create terminal");
 		}
 	},
