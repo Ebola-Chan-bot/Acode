@@ -22,24 +22,6 @@ class TerminalManager {
 	constructor() {
 		this.terminals = new Map();
 		this.terminalCounter = 0;
-		this.diagnosticCounter = 0;
-	}
-
-	pushDebugLog(level, args) {
-		if (typeof window.__HDC_DEBUG_PUSH !== "function") {
-			return;
-		}
-
-		window.__HDC_DEBUG_PUSH({
-			type: "console",
-			level,
-			args: args.map((item) => String(item ?? "")),
-		});
-	}
-
-	nextDiagnosticId(prefix) {
-		this.diagnosticCounter += 1;
-		return `${prefix}-${Date.now().toString(36)}-${this.diagnosticCounter.toString(36)}`;
 	}
 
 	extractTerminalNumber(name) {
@@ -203,13 +185,9 @@ class TerminalManager {
 	async createTerminal(options = {}) {
 		try {
 			const { render, serverMode, ...terminalOptions } = options;
-			const createRequestId = this.nextDiagnosticId("create-terminal");
 			const shouldRender = render !== false;
 			const isServerMode = serverMode !== false;
 			const isReconnecting = terminalOptions.reconnecting === true;
-			console.log(
-				`[terminal-diag ${createRequestId}] createTerminal begin serverMode=${isServerMode} reconnecting=${isReconnecting} pid=${terminalOptions.pid || ""}`,
-			);
 
 			const terminalId = `terminal_${++this.terminalCounter}`;
 			const providedName =
@@ -260,9 +238,6 @@ class TerminalManager {
 						terminalComponent.mount(terminalContainer);
 
 						if (terminalComponent.serverMode) {
-							console.log(
-								`[terminal-diag ${createRequestId}] checking installation before connect`,
-							);
 							// Run install check after mount so install logs can stream into this
 							// exact terminal tab (via progressTerminal.component), instead of
 							// opening a separate "Terminal Installation" tab. Keeping it inside
@@ -277,16 +252,10 @@ class TerminalManager {
 							if (!installationResult.success) {
 								throw new Error(installationResult.error);
 							}
-							console.log(
-								`[terminal-diag ${createRequestId}] installation check passed`,
-							);
 						}
 
 						// Connect to session if in server mode
 						if (terminalComponent.serverMode) {
-							console.log(
-								`[terminal-diag ${createRequestId}] connecting to terminal session`,
-							);
 							await terminalComponent.connectToSession(terminalOptions.pid);
 							if (isReconnecting) {
 								terminalComponent.write(
@@ -328,15 +297,9 @@ class TerminalManager {
 								terminalName,
 							);
 						}
-						console.log(
-							`[terminal-diag ${createRequestId}] createTerminal success uniqueId=${uniqueId}`,
-						);
 						resolve(instance);
 					} catch (error) {
-						console.error(
-							`[terminal-diag ${createRequestId}] Failed to initialize terminal:`,
-							error,
-						);
+						console.error("Failed to initialize terminal:", error);
 
 						// Cleanup on failure - dispose component and remove broken tab
 						try {
@@ -385,24 +348,14 @@ class TerminalManager {
 		progressTerminal = null,
 	) {
 		try {
-			const installCheckId = this.nextDiagnosticId("install-check");
-			console.log(
-				`[terminal-diag ${installCheckId}] checkAndInstall begin forceReinstall=${forceReinstall} reuseTerminal=${Boolean(progressTerminal?.component)}`,
-			);
 			// Check if terminal is already installed
 			const isInstalled = await Terminal.isInstalled();
-			console.log(
-				`[terminal-diag ${installCheckId}] isInstalled=${isInstalled}`,
-			);
 			if (isInstalled && !forceReinstall) {
 				return { success: true };
 			}
 
 			// Check if terminal is supported on this device
 			const isSupported = await Terminal.isSupported();
-			console.log(
-				`[terminal-diag ${installCheckId}] isSupported=${isSupported}`,
-			);
 			if (!isSupported) {
 				return {
 					success: false,
@@ -425,7 +378,6 @@ class TerminalManager {
 					// Remove stdout/stderr prefix for
 					const cleanMessage = message.replace(/^(stdout|stderr)\s+/, "");
 					installTerminal.component.write(`${cleanMessage}\r\n`);
-					this.pushDebugLog("log", ["[install-terminal]", cleanMessage]);
 				},
 				(error) => {
 					// Remove stdout/stderr prefix
@@ -433,11 +385,7 @@ class TerminalManager {
 					installTerminal.component.write(
 						`\x1b[31mError: ${cleanError}\x1b[0m\r\n`,
 					);
-					this.pushDebugLog("error", ["[install-terminal]", cleanError]);
 				},
-			);
-			console.log(
-				`[terminal-diag ${installCheckId}] installResult=${installResult}`,
 			);
 
 			// Only return success if Terminal.install() indicates success (exit code 0)

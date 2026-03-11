@@ -90,9 +90,4 @@ ARGS="$ARGS --link2symlink"
 # context, whereas the crash affects all users on vulnerable kernels.
 ARGS="$ARGS -L"
 
-echo "[sandbox] proot=$PROOT"
-echo "[sandbox] args=$ARGS"
 $PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
-PROOT_EXIT=$?
-echo "[sandbox] proot exit=$PROOT_EXIT"
-exit $PROOT_EXIT

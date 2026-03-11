@@ -1,42 +1,5 @@
 const Executor = require("./Executor");
 
-function formatAxsAssetError(error) {
-    if (!error) return "unknown error";
-    if (typeof error === "string") return error;
-    if (error instanceof Error) {
-        return error.stack || error.message || String(error);
-    }
-    try {
-        return JSON.stringify(error);
-    } catch (_) {
-        return String(error);
-    }
-}
-
-let terminalDiagSequence = 0;
-
-const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g;
-const INSTALL_OUTPUT_IGNORE_PATTERNS = [
-    /^\[diag /i,
-    /^\[diag\]/i,
-    /^\[sandbox\]/i,
-    /^fetch\s+/i,
-    /^drwx/i,
-    /^-rw/i,
-    /^\d+\s+root\b/i,
-    /^configuring timezone\.?$/i,
-    /^timezone set to:/i,
-    /^failed to detect timezone$/i,
-    /^installation completed\.?$/i,
-    /^exit\s+\d+$/i,
-];
-const INSTALL_OUTPUT_ERROR_PATTERN = /(error:|failed|missing|unable|not supported|unsupported|temporary error|no such package|unusable|permission denied|not found)/i;
-
-const nextTerminalDiagId = (prefix) => {
-    terminalDiagSequence += 1;
-    return `${prefix}-${Date.now().toString(36)}-${terminalDiagSequence.toString(36)}`;
-};
-
 const formatFailureMessage = (value) => {
     if (!value) return "Unknown error";
     if (typeof value === "string") return value;
@@ -48,55 +11,7 @@ const formatFailureMessage = (value) => {
     }
 };
 
-const extractInstallFailureDetails = (value) => {
-    const text = typeof value === "string" ? value : formatFailureMessage(value);
-    const lines = String(text)
-        .replace(/\r/g, "\n")
-        .split("\n")
-        .map((line) => line.replace(ANSI_ESCAPE_PATTERN, "").trim())
-        .map((line) => line.replace(/^\[(?:\*|!)]\s*/, "").trim())
-        .filter(Boolean);
-
-    let fallbackLine = "";
-    let preferredLine = "";
-
-    for (const line of lines) {
-        if (INSTALL_OUTPUT_IGNORE_PATTERNS.some((pattern) => pattern.test(line))) {
-            continue;
-        }
-        fallbackLine = line;
-        if (INSTALL_OUTPUT_ERROR_PATTERN.test(line)) {
-            preferredLine = line;
-        }
-    }
-
-    return {
-        preferredLine,
-        fallbackLine,
-    };
-};
-
 const Terminal = {
-    /**
-     * In debug builds, overwrite the axs binary from bundled assets to ensure
-     * the running version always matches the build. Returns true if replaced.
-     */
-    async refreshAxsBinary() {
-        if (typeof BuildInfo === 'undefined' || !BuildInfo.debug) return false;
-        const filesDir = await new Promise((resolve, reject) => {
-            system.getFilesDir(resolve, reject);
-        });
-        try {
-            await new Promise((resolve, reject) => {
-                system.copyAsset("axs", `${filesDir}/axs`, resolve, reject);
-            });
-            return true;
-        } catch (e) {
-            console.warn("Failed to refresh bundled AXS from assets:", formatAxsAssetError(e));
-            return false;
-        }
-    },
-
     /**
      * Starts the AXS environment by writing init scripts and executing the sandbox.
      * @param {boolean} [installing=false] - Whether AXS is being started during installation.
@@ -111,44 +26,14 @@ const Terminal = {
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
         });
-        const opId = nextTerminalDiagId(installing ? "axs-install" : "axs-start");
-        const fileExists = (path) => new Promise((resolve) => {
-            system.fileExists(path, false, (result) => resolve(result == 1), () => resolve(false));
-        });
-        const [downloadedMarker, extractedMarker, configuredMarker, pidFile] = await Promise.all([
-            fileExists(`${filesDir}/.downloaded`),
-            fileExists(`${filesDir}/.extracted`),
-            fileExists(`${filesDir}/.configured`),
-            fileExists(`${filesDir}/pid`),
-        ]);
-        logger(`[diag ${opId}] startAxs begin installing=${installing} filesDir=${filesDir}`);
-        logger(`[diag ${opId}] markers downloaded=${downloadedMarker} extracted=${extractedMarker} configured=${configuredMarker} pid=${pidFile}`);
 
         const initAlpineContent = await readAsset("init-alpine.sh");
         const initSandboxContent = await readAsset("init-sandbox.sh");
         const rmWrapperContent = await readAsset("rm-wrapper.sh");
 
         if (installing) {
-            return new Promise((resolve, reject) => {
+            return new Promise((resolve) => {
                 (async () => {
-                    let lastFailureLine = "";
-                    let lastOutputLine = "";
-                    const rememberProcessMessage = (message, isError = false) => {
-                        const { preferredLine, fallbackLine } = extractInstallFailureDetails(message);
-                        if (fallbackLine) {
-                            lastOutputLine = fallbackLine;
-                        }
-                        if (isError) {
-                            if (preferredLine || fallbackLine) {
-                                lastFailureLine = preferredLine || fallbackLine;
-                            }
-                            return;
-                        }
-                        if (preferredLine) {
-                            lastFailureLine = preferredLine;
-                        }
-                    };
-
                     await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
                     await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
                     await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
@@ -156,21 +41,15 @@ const Terminal = {
                     await writeTextFile(`${filesDir}/init-sandbox.sh`, initSandboxContent);
 
                     Executor.start("sh", (type, data) => {
-                        if (type === "stdout" || type === "stderr") {
-                            rememberProcessMessage(data, type === "stderr");
-                        }
                         logger(`${type} ${data}`);
 
                         if (type === "exit") {
-                            logger(`[diag ${opId}] install process exit=${data}`);
                             const success = data === "0";
                             if (success) {
                                 const writeMarker = () => {
                                     system.writeText(`${filesDir}/.configured`, "1", () => {
-                                        logger(`[diag ${opId}] configured marker refreshed`);
                                         resolve(true);
                                     }, () => {
-                                        logger(`[diag ${opId}] configured marker refresh fallback-success`);
                                         resolve(true);
                                     });
                                 };
@@ -178,24 +57,22 @@ const Terminal = {
                             } else {
                                 resolve({
                                     success: false,
-                                    error: lastFailureLine || lastOutputLine || `Terminal installation failed with exit code ${data}`,
+                                    error: `Terminal installation failed with exit code ${data}`,
                                     exitCode: data,
                                 });
                             }
                         }
                     }).then(async (uuid) => {
-                        logger(`[diag ${opId}] executor uuid=${uuid}`);
                         await Executor.write(uuid, `. "${filesDir}/init-sandbox.sh" --installing; exit`);
-                        logger(`[diag ${opId}] bootstrap command sent installing=true`);
                     }).catch((error) => {
-                        err_logger(`[diag ${opId}] Failed to start AXS:`, error);
+                        err_logger("Failed to start AXS:", error);
                         resolve({
                             success: false,
                             error: formatFailureMessage(error),
                         });
                     });
                 })().catch((error) => {
-                    err_logger(`[diag ${opId}] Failed to prepare AXS installation:`, error);
+                    err_logger("Failed to prepare AXS installation:", error);
                     resolve({
                         success: false,
                         error: formatFailureMessage(error),
@@ -212,11 +89,9 @@ const Terminal = {
             Executor.start("sh", (type, data) => {
                 logger(`${type} ${data}`);
             }).then(async (uuid) => {
-                logger(`[diag ${opId}] executor uuid=${uuid}`);
                 await Executor.write(uuid, `. "${filesDir}/init-sandbox.sh"; exit`);
-                logger(`[diag ${opId}] bootstrap command sent installing=false`);
             }).catch((error) => {
-                err_logger(`[diag ${opId}] Failed to start AXS:`, error);
+                err_logger("Failed to start AXS:", error);
             });
         }
     },
@@ -274,8 +149,6 @@ const Terminal = {
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
         });
-        const opId = nextTerminalDiagId(_retried ? "install-retry" : "install");
-
         const arch = await new Promise((resolve, reject) => {
             system.getArch(resolve, reject);
         });
@@ -326,9 +199,6 @@ const Terminal = {
         const alreadyExtracted = await fileExists(`${filesDir}/.extracted`);
         const alreadyConfigured = await fileExists(`${filesDir}/.configured`);
         const hasPidFile = await fileExists(`${filesDir}/pid`);
-        logger(`[diag ${opId}] install begin retried=${_retried} filesDir=${filesDir} arch=${arch}`);
-        logger(`[diag ${opId}] markers downloaded=${alreadyDownloaded} extracted=${alreadyExtracted} configured=${alreadyConfigured} pid=${hasPidFile}`);
-
         try {
             let alpineUrl;
             let axsUrl;
@@ -361,10 +231,6 @@ const Terminal = {
                 throw new Error(`Unsupported architecture: ${arch}`);
             }
 
-            logger(`🧭  Terminal install arch: ${arch}`);
-            logger(`🧭  Download cache state: downloaded=${alreadyDownloaded} extracted=${alreadyExtracted}`);
-            logger(`[diag ${opId}] configure phase will invoke startAxs installing=true`);
-
             // Invalidate download cache if URLs changed (e.g. version bump)
             if (alreadyDownloaded) {
                 const currentManifest = [alpineUrl, axsUrl].join("\n");
@@ -396,31 +262,14 @@ const Terminal = {
                 }
 
                 if (!hasAxs) {
-                    let copiedFromAsset = false;
-                    // Only use bundled axs in debug builds; release builds always download latest
-                    if (typeof BuildInfo !== 'undefined' && BuildInfo.debug) {
-                        try {
-                            logger("📦  Copying bundled axs from assets...");
-                            await new Promise((resolve, reject) => {
-                                system.copyAsset("axs", `${filesDir}/axs`, resolve, reject);
-                            });
-                            copiedFromAsset = true;
-                            logger("✅  Bundled AXS copied from assets");
-                        } catch (assetError) {
-                            logger(`⚠️  Asset copy failed, will download instead: ${formatAxsAssetError(assetError)}`);
-                        }
-                    }
-
-                    if (!copiedFromAsset) {
-                        logger("⬇️  Downloading axs...");
-						await downloadWithLogging("axs", axsUrl, `${filesDir}/axs`, (p) => {
-                            const dl = formatBytes(p.downloaded);
-                            const total = p.total > 0 ? formatBytes(p.total) : "?";
-                            const speed = formatBytes(p.speed) + "/s";
-                            const eta = p.eta > 0 ? formatEta(p.eta) : "--";
-                            logger(`⬇️  ${dl} / ${total}  ${speed}  ETA ${eta}`);
-                        });
-                    }
+                    logger("⬇️  Downloading axs...");
+					await downloadWithLogging("axs", axsUrl, `${filesDir}/axs`, (p) => {
+                        const dl = formatBytes(p.downloaded);
+                        const total = p.total > 0 ? formatBytes(p.total) : "?";
+                        const speed = formatBytes(p.speed) + "/s";
+                        const eta = p.eta > 0 ? formatEta(p.eta) : "--";
+                        logger(`⬇️  ${dl} / ${total}  ${speed}  ETA ${eta}`);
+                    });
                 } else {
                     logger("✅  AXS binary already downloaded");
                 }
@@ -494,13 +343,10 @@ const Terminal = {
 
             // ── Phase 3: Configure (always run — installs packages, creates configs) ──
             logger("⚙️  Updating sandbox enviroment...");
-            const installResult = await this.startAxs(true, logger, err_logger);
-            logger(`[diag ${opId}] startAxs installing=true completed result=${installResult}`);
-            // .configured marker is now created inside startAxs(true) via system.writeText
-            return installResult;
+            return this.startAxs(true, logger, err_logger);
 
         } catch (e) {
-            err_logger(`[diag ${opId}] Installation failed:`, e);
+            err_logger("Installation failed:", e);
             // Clean up everything so retry starts fresh (including potentially corrupted downloads)
             await Executor.execute(`rm -rf "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/.download-manifest"`).catch(() => {});
             if (!_retried) {

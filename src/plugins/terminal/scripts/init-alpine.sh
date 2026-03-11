@@ -7,29 +7,10 @@ APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
 APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
 APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
 
-diag_log() {
-    echo "[diag] $*"
-}
-
-dump_apk_lock_state() {
-    diag_log "apk-lock shell-pid=$$ ppid=$PPID uid=$(id -u 2>/dev/null)"
-    ls -ld /lib/apk/db 2>/dev/null || true
-    ls -l /lib/apk/db/lock 2>/dev/null || echo "[diag] /lib/apk/db/lock missing"
-    ps 2>/dev/null | grep -E 'apk|proot|axs|sh' | grep -v grep || true
-}
-
 run_apk_step() {
-    local step_name="$1"
     shift
-
-    diag_log "running ${step_name}"
     "$@"
-    local exit_code=$?
-    diag_log "${step_name} exit=${exit_code}"
-    if [ $exit_code -ne 0 ]; then
-        dump_apk_lock_state
-    fi
-    return $exit_code
+    return $?
 }
 
 configure_apk_repositories() {
@@ -37,13 +18,9 @@ configure_apk_repositories() {
 
     if [ "$repo_mode" = "mirror" ]; then
         printf '%s\n%s\n' "$APK_MIRROR_MAIN_REPO" "$APK_MIRROR_COMMUNITY_REPO" > /etc/apk/repositories
-        diag_log "apk repositories configured source=mirror"
     else
         printf '%s\n%s\n' "$APK_MAIN_REPO" "$APK_COMMUNITY_REPO" > /etc/apk/repositories
-        diag_log "apk repositories configured source=official"
     fi
-
-    cat /etc/apk/repositories 2>/dev/null || true
 }
 
 
@@ -66,8 +43,6 @@ missing_packages=""
 
 if [ -n "$missing_packages" ]; then
     echo -e "\e[34;1m[*] \e[0mInstalling packages:$missing_packages\e[0m"
-    diag_log "installing shell-pid=$$ ppid=$PPID missing_packages=$missing_packages"
-    dump_apk_lock_state
 
     install_succeeded="false"
     for repo_mode in official mirror; do
@@ -75,13 +50,13 @@ if [ -n "$missing_packages" ]; then
 
         # In proot, post-install scripts may fail with error 127;
         # manual fixup below compensates if needed.
-        run_apk_step "apk update package-index source=${repo_mode}" apk update
+        run_apk_step "apk update package-index" "$repo_mode" apk update
         if [ $? -ne 0 ]; then
             echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
             continue
         fi
 
-        run_apk_step "apk add required-packages source=${repo_mode}" apk add $missing_packages
+        run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
         if [ $? -ne 0 ]; then
             echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
             continue
@@ -109,7 +84,6 @@ if [ -n "$missing_packages" ]; then
     fi
 
     # Verify
-    dump_apk_lock_state
     [ -z "$bash_path" ] && echo -e "\e[31;1m[!] \e[0mbash still missing\e[0m"
     [ ! -f /usr/bin/wget ] && echo -e "\e[31;1m[!] \e[0mwget still missing\e[0m"
 
@@ -149,7 +123,7 @@ if [ "$#" -eq 0 ]; then
     echo "$$" > "$PREFIX/pid"
     chmod +x "$PREFIX/axs"
 
-    if [ ! -e "$PREFIX/alpine/etc/acode_motd" ]; then
+    if [ ! -s "$PREFIX/alpine/etc/acode_motd" ]; then
         cat <<EOF > "$PREFIX/alpine/etc/acode_motd"
 Welcome to Alpine Linux in Acode!
 

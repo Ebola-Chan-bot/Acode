@@ -21,33 +21,6 @@ import { getTerminalSettings } from "./terminalDefaults";
 import TerminalThemeManager from "./terminalThemeManager";
 import TerminalTouchSelection from "./terminalTouchSelection";
 
-function pushDebugPayload(payload) {
-	if (typeof window.__HDC_DEBUG_PUSH !== "function") {
-		return;
-	}
-
-	window.__HDC_DEBUG_PUSH(payload);
-}
-
-async function decodeSocketMessageData(data, maxLength = 4096) {
-	if (typeof data === "string") {
-		return data.slice(0, maxLength);
-	}
-
-	if (data instanceof ArrayBuffer) {
-		const byteLength = Math.min(data.byteLength, maxLength);
-		const view = new Uint8Array(data, 0, byteLength);
-		return new TextDecoder("utf-8", { fatal: false }).decode(view);
-	}
-
-	if (data instanceof Blob) {
-		const slice = data.size > maxLength ? data.slice(0, maxLength) : data;
-		return new Response(slice).text();
-	}
-
-	return "";
-}
-
 export default class TerminalComponent {
 	constructor(options = {}) {
 		// Get terminal settings from shared defaults
@@ -678,8 +651,6 @@ export default class TerminalComponent {
 			};
 
 			if (!axsRunning) {
-				// In debug builds, refresh axs binary from assets before starting.
-				await Terminal.refreshAxsBinary();
 				await Terminal.startAxs(
 					false,
 					(message) => writeLifecycleLog(message, false),
@@ -777,33 +748,7 @@ export default class TerminalComponent {
 
 			// Detect PTY errors from axs server (e.g. incompatible binary)
 			if (ptyOpenError?.includes("Failed to open PTY")) {
-				const refreshed = await Terminal.refreshAxsBinary();
-				if (refreshed) {
-					// Kill old axs, restart with fresh binary, and retry once
-					try {
-						await Terminal.stopAxs();
-					} catch (_) {}
-					await Terminal.startAxs(false, () => {}, console.error);
-					const pollResult = await pollAxs(30);
-					if (pollResult) {
-						const retryResp = await fetch(
-							`http://localhost:${this.options.port}/terminals`,
-							{
-								method: "POST",
-								headers: { "Content-Type": "application/json" },
-								body: JSON.stringify(requestBody),
-							},
-						);
-						if (retryResp.ok) {
-							const retryData = await retryResp.text();
-							if (!parsePtyOpenError(retryData)) {
-								this.pid = retryData.trim();
-								return this.pid;
-							}
-						}
-					}
-				}
-				throw new Error("Failed to open PTY even after refreshing AXS binary");
+				throw new Error("Failed to open PTY");
 			}
 
 			this.pid = data.trim();
@@ -877,20 +822,6 @@ export default class TerminalComponent {
 					// Not a JSON message, let attachAddon handle it
 				}
 			}
-			// For binary data or non-exit text messages, let attachAddon handle them
-			decodeSocketMessageData(event.data)
-				.then((text) => {
-					const cleanText = String(text ?? "").replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "").replace(/\r/g, "");
-					if (!cleanText.trim()) {
-						return;
-					}
-					pushDebugPayload({
-						type: "console",
-						level: "debug",
-						args: ["[terminal-stream]", `pid=${pid}`, cleanText.slice(0, 2048)],
-					});
-				})
-				.catch(() => {});
 		};
 
 		// Also sniff the data to detect critical Alpine container corruption (e.g. bash/readline broken)
