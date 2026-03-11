@@ -11,7 +11,93 @@ const formatFailureMessage = (value) => {
     }
 };
 
+const resolveInstallTargets = (arch) => {
+    if (arch === "arm64-v8a") {
+        return {
+            arch,
+            libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot.so",
+            libproot32: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot32.so",
+            libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libtalloc.so",
+            prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot-xed.so",
+            axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-arm64",
+            alpineUrl: "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz",
+        };
+    }
+
+    if (arch === "armeabi-v7a") {
+        return {
+            arch,
+            libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot.so",
+            libproot32: null,
+            libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libtalloc.so",
+            prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot-xed.so",
+            axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-armv7",
+            alpineUrl: "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/armhf/alpine-minirootfs-3.21.0-armhf.tar.gz",
+        };
+    }
+
+    if (arch === "x86_64") {
+        return {
+            arch,
+            libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot.so",
+            libproot32: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot32.so",
+            libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libtalloc.so",
+            prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot-xed.so",
+            axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-x86_64",
+            alpineUrl: "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz",
+        };
+    }
+
+    throw new Error(`Unsupported architecture: ${arch}`);
+};
+
 const Terminal = {
+    async getDownloadTargets() {
+        const arch = await new Promise((resolve, reject) => {
+            system.getArch(resolve, reject);
+        });
+
+        const { alpineUrl, axsUrl } = resolveInstallTargets(arch);
+        return { arch, alpineUrl, axsUrl };
+    },
+
+    async refreshAxs(logger = console.log, err_logger = console.error, force = false) {
+        const filesDir = await new Promise((resolve, reject) => {
+            system.getFilesDir(resolve, reject);
+        });
+
+        const { alpineUrl, axsUrl } = await this.getDownloadTargets();
+        const manifestPath = `${filesDir}/.download-manifest`;
+        const currentManifest = [alpineUrl, axsUrl].join("\n");
+        const savedManifest = await Executor.execute(`cat "${manifestPath}" 2>/dev/null || echo ""`).catch(() => "");
+        const hasAxs = await new Promise((resolve) => {
+            system.fileExists(`${filesDir}/axs`, false, (result) => resolve(result == 1), () => resolve(false));
+        });
+
+        if (!force && hasAxs && savedManifest === currentManifest) {
+            return false;
+        }
+
+        logger(force ? "♻️  Refreshing axs binary..." : "🔄  AXS source changed, refreshing binary...");
+        logger(`🌐  axs source: ${axsUrl}`);
+        logger(`📁  axs destination: ${filesDir}/axs`);
+
+        await Executor.execute(`rm -rf "${filesDir}/axs"`).catch(() => {});
+
+        try {
+            await Executor.download(axsUrl, `${filesDir}/axs`, (progress) => {
+                const total = progress.total > 0 ? progress.total : 0;
+                logger(`⬇️  axs ${progress.downloaded}/${total}`);
+            });
+            await writeTextFile(manifestPath, currentManifest);
+            logger("✅  AXS binary ready");
+            return true;
+        } catch (error) {
+            err_logger("Failed to refresh axs:", error);
+            throw error;
+        }
+    },
+
     /**
      * Starts the AXS environment by writing init scripts and executing the sandbox.
      * @param {boolean} [installing=false] - Whether AXS is being started during installation.
@@ -26,6 +112,8 @@ const Terminal = {
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
         });
+
+        await this.refreshAxs(logger, err_logger);
 
         const initAlpineContent = await readAsset("init-alpine.sh");
         const initSandboxContent = await readAsset("init-sandbox.sh");
@@ -200,36 +288,14 @@ const Terminal = {
         const alreadyConfigured = await fileExists(`${filesDir}/.configured`);
         const hasPidFile = await fileExists(`${filesDir}/pid`);
         try {
-            let alpineUrl;
-            let axsUrl;
-            let prootUrl;
-            let libTalloc;
-            let libproot = null;
-            let libproot32 = null;
-
-            if (arch === "arm64-v8a") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot.so";
-                libproot32 = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot32.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-arm64`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz";
-            } else if (arch === "armeabi-v7a") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-armv7`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/armhf/alpine-minirootfs-3.21.0-armhf.tar.gz";
-            } else if (arch === "x86_64") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot.so";
-                libproot32 = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot32.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-x86_64`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz";
-            } else {
-                throw new Error(`Unsupported architecture: ${arch}`);
-            }
+            const {
+                alpineUrl,
+                axsUrl,
+                prootUrl,
+                libTalloc,
+                libproot,
+                libproot32,
+            } = resolveInstallTargets(arch);
 
             // Invalidate download cache if URLs changed (e.g. version bump)
             if (alreadyDownloaded) {

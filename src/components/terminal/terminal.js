@@ -728,30 +728,64 @@ export default class TerminalComponent {
 				}
 			};
 
-			const response = await fetch(
-				`http://localhost:${this.options.port}/terminals`,
-				{
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
+			const openTerminalSession = async () => {
+				const response = await fetch(
+					`http://localhost:${this.options.port}/terminals`,
+					{
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify(requestBody),
 					},
-					body: JSON.stringify(requestBody),
-				},
-			);
+				);
 
-			if (!response.ok) {
-				throw new Error(`HTTP error! status: ${response.status}`);
-			}
+				if (!response.ok) {
+					throw new Error(`HTTP error! status: ${response.status}`);
+				}
 
-			const data = await response.text();
-			const ptyOpenError = parsePtyOpenError(data);
+				const data = await response.text();
+				return {
+					data,
+					ptyOpenError: parsePtyOpenError(data),
+				};
+			};
+
+			let sessionResult = await openTerminalSession();
 
 			// Detect PTY errors from axs server (e.g. incompatible binary)
-			if (ptyOpenError?.includes("Failed to open PTY")) {
-				throw new Error("Failed to open PTY");
+			if (sessionResult.ptyOpenError?.includes("Failed to open PTY")) {
+				writeLifecycleLog("AXS PTY creation failed, refreshing axs binary and retrying...", true);
+
+				try {
+					await Terminal.stopAxs();
+				} catch (_) {
+					/* ignore */
+				}
+
+				await Terminal.refreshAxs(
+					(message) => writeLifecycleLog(message, false),
+					(message) => writeLifecycleLog(message, true),
+					true,
+				);
+
+				await Terminal.startAxs(
+					false,
+					(message) => writeLifecycleLog(message, false),
+					(message) => writeLifecycleLog(message, true),
+				);
+
+				if (!(await pollAxs(30))) {
+					throw new Error("Failed to restart AXS after refreshing binary");
+				}
+
+				sessionResult = await openTerminalSession();
+				if (sessionResult.ptyOpenError?.includes("Failed to open PTY")) {
+					throw new Error("Failed to open PTY");
+				}
 			}
 
-			this.pid = data.trim();
+			this.pid = sessionResult.data.trim();
 			return this.pid;
 		} catch (error) {
 			console.error("Failed to create terminal session:", error);

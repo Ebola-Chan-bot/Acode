@@ -7,7 +7,78 @@ APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
 APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
 APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
 
+extract_shebang_interpreter() {
+    local shebang_line="$1"
+    local shebang_body=""
+
+    case "$shebang_line" in
+        '#!'*) shebang_body=${shebang_line#\#!} ;;
+        *) return 1 ;;
+    esac
+
+    set -- $shebang_body
+    [ $# -eq 0 ] && return 1
+    printf '%s\n' "$1"
+}
+
+materialize_symlink_binary() {
+    local link_path="$1"
+    local link_dir=""
+    local link_target=""
+    local source_path=""
+    local temp_path=""
+
+    [ -L "$link_path" ] || return 1
+
+    link_target="$(readlink "$link_path" 2>/dev/null || true)"
+    [ -n "$link_target" ] || return 1
+
+    if [[ "$link_target" == /* ]]; then
+        source_path="$link_target"
+    else
+        link_dir="$(dirname -- "$link_path")"
+        source_path="$link_dir/$link_target"
+    fi
+
+    [ -f "$source_path" ] || return 1
+    [ -x "$source_path" ] || return 1
+
+    temp_path="${link_path}.acode-real.$$"
+    cp "$source_path" "$temp_path" || return 1
+    chmod 755 "$temp_path" || return 1
+    mv -f "$temp_path" "$link_path" || return 1
+    return 0
+}
+
+repair_script_interpreters() {
+    local interpreter_list=""
+    local interpreter_path=""
+
+    [ -f /lib/apk/db/scripts.tar ] || return 1
+
+    interpreter_list="$({
+        tar -tf /lib/apk/db/scripts.tar 2>/dev/null | while IFS= read -r script_entry; do
+            local first_line=""
+            local interpreter=""
+
+            [ -z "$script_entry" ] && continue
+            first_line="$(tar -xOf /lib/apk/db/scripts.tar "$script_entry" 2>/dev/null | sed -n '1p')"
+            interpreter="$(extract_shebang_interpreter "$first_line" 2>/dev/null || true)"
+            [ -n "$interpreter" ] && printf '%s\n' "$interpreter"
+        done
+    } | sort -u)"
+
+    [ -n "$interpreter_list" ] || return 1
+
+    for interpreter_path in $interpreter_list; do
+        materialize_symlink_binary "$interpreter_path" && return 0
+    done
+
+    return 1
+}
+
 run_apk_step() {
+    shift
     shift
     "$@"
     return $?
@@ -57,6 +128,12 @@ if [ -n "$missing_packages" ]; then
         fi
 
         run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
+        if [ $? -ne 0 ]; then
+            if repair_script_interpreters; then
+                run_apk_step "apk add required-packages after interpreter repair" "$repo_mode" apk add $missing_packages
+            fi
+        fi
+
         if [ $? -ne 0 ]; then
             echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
             continue
