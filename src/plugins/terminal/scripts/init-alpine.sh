@@ -96,10 +96,22 @@ configure_apk_repositories() {
 
 
 # ── Package check (runs every startup, file-stat only — negligible cost) ──
-# Check by file existence rather than apk info (which is unreliable in proot)
-is_apk_installed() {
+query_apk_installed() {
     local package_name="$1"
-    [ -f /lib/apk/db/installed ] && grep -q "^P:${package_name}$" /lib/apk/db/installed
+
+    [ -f /lib/apk/db/installed ] || return 2
+    [ -e /lib/apk/db/lock ] && return 2
+    grep -q "^P:${package_name}$" /lib/apk/db/installed
+}
+
+should_install_command_not_found() {
+    query_apk_installed command-not-found
+
+    case $? in
+        0) return 1 ;;
+        1) return 0 ;;
+          *) [ ! -f /usr/libexec/command-not-found ] ;;
+    esac
 }
 
 find_bash_path() {
@@ -110,7 +122,7 @@ missing_packages=""
 [ -z "$(find_bash_path)" ] && missing_packages="$missing_packages bash"
 [ ! -f /usr/share/zoneinfo/UTC ] && missing_packages="$missing_packages tzdata"
 [ ! -f /usr/bin/wget ] && missing_packages="$missing_packages wget"
-! is_apk_installed command-not-found && missing_packages="$missing_packages command-not-found"
+should_install_command_not_found && missing_packages="$missing_packages command-not-found"
 
 if [ -n "$missing_packages" ]; then
     echo -e "\e[34;1m[*] \e[0mInstalling packages:$missing_packages\e[0m"
@@ -288,7 +300,7 @@ fi
 # "bad interpreter: Bad address". Run the original script explicitly through
 # /bin/sh so the script keeps working without relying on the broken shebang path.
 command_not_found_handle() {
-    if [ -x /usr/libexec/command-not-found ]; then
+    if [ -f /usr/libexec/command-not-found ]; then
         /bin/sh /usr/libexec/command-not-found "$@"
         return $?
     fi

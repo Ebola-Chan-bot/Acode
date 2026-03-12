@@ -334,8 +334,8 @@ const Terminal = {
 
         // Check which stages are already done
         let alreadyDownloaded = await fileExists(`${filesDir}/.downloaded`);
-        const alreadyExtracted = await fileExists(`${filesDir}/.extracted`);
-        const alreadyConfigured = await fileExists(`${filesDir}/.configured`);
+        let alreadyExtracted = await fileExists(`${filesDir}/.extracted`);
+        let alreadyConfigured = await fileExists(`${filesDir}/.configured`);
         const hasPidFile = await fileExists(`${filesDir}/pid`);
         try {
             const {
@@ -353,8 +353,10 @@ const Terminal = {
                 const savedManifest = await Executor.execute(`cat "${filesDir}/.download-manifest" 2>/dev/null || echo ""`);
                 if (savedManifest !== currentManifest) {
                     logger("🔄  Update detected, clearing download cache...");
-                    await Executor.execute(`rm -rf "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/alpine" "${filesDir}/alpine.tar.gz" "${filesDir}/axs" "${filesDir}/.download-manifest"`).catch(() => {});
+                    await Executor.execute(`rm -rf "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/axs" "${filesDir}/.download-manifest"`).catch(() => {});
                     alreadyDownloaded = false;
+                    alreadyExtracted = false;
+                    alreadyConfigured = false;
                 }
             }
 
