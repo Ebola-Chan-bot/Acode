@@ -1,5 +1,8 @@
 const Executor = require("./Executor");
 
+const ALPINE_RELEASES_BASE_URL = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases";
+const latestAlpineUrlCache = new Map();
+
 const formatFailureMessage = (value) => {
     if (!value) return "Unknown error";
     if (typeof value === "string") return value;
@@ -11,44 +14,92 @@ const formatFailureMessage = (value) => {
     }
 };
 
+const resolveLatestAlpineUrl = async (releaseArch) => {
+    const cachedUrl = latestAlpineUrlCache.get(releaseArch);
+    if (cachedUrl) {
+        return cachedUrl;
+    }
+
+    const filesDir = await new Promise((resolve, reject) => {
+        system.getFilesDir(resolve, reject);
+    });
+    const metadataUrl = `${ALPINE_RELEASES_BASE_URL}/${releaseArch}/latest-releases.yaml`;
+    const metadataPath = `${filesDir}/.alpine-latest-releases-${releaseArch}.yaml`;
+
+    await Executor.download(metadataUrl, metadataPath);
+
+    const metadata = await Executor.execute(`cat "${metadataPath}"`);
+    const matches = [...metadata.matchAll(/^\s*file:\s*(alpine-minirootfs-[^\s]+\.tar\.gz)\s*$/gm)];
+    const latestMatch = matches.at(-1);
+    if (!latestMatch) {
+        throw new Error(`Failed to resolve latest Alpine minirootfs for ${releaseArch}`);
+    }
+
+    const alpineUrl = `${ALPINE_RELEASES_BASE_URL}/${releaseArch}/${latestMatch[1]}`;
+    latestAlpineUrlCache.set(releaseArch, alpineUrl);
+    return alpineUrl;
+};
+
+const resolveAlpineBranch = (alpineUrl) => {
+    const match = /\/alpine-minirootfs-(\d+\.\d+)\.\d+-/.exec(alpineUrl);
+    if (!match) {
+        throw new Error(`Failed to resolve Alpine branch from URL: ${alpineUrl}`);
+    }
+    return `v${match[1]}`;
+};
+
 const resolveInstallTargets = (arch) => {
     if (arch === "arm64-v8a") {
         return {
             arch,
+            alpineReleaseArch: "aarch64",
             libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot.so",
             libproot32: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot32.so",
             libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libtalloc.so",
             prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot-xed.so",
             axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-arm64",
-            alpineUrl: "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz",
         };
     }
 
     if (arch === "armeabi-v7a") {
         return {
             arch,
+            alpineReleaseArch: "armhf",
             libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot.so",
             libproot32: null,
             libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libtalloc.so",
             prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot-xed.so",
             axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-armv7",
-            alpineUrl: "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/armhf/alpine-minirootfs-3.21.0-armhf.tar.gz",
         };
     }
 
     if (arch === "x86_64") {
         return {
             arch,
+            alpineReleaseArch: "x86_64",
             libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot.so",
             libproot32: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot32.so",
             libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libtalloc.so",
             prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot-xed.so",
             axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-x86_64",
-            alpineUrl: "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz",
         };
     }
 
     throw new Error(`Unsupported architecture: ${arch}`);
+};
+
+const getInstallTargets = async (arch) => {
+    const targets = resolveInstallTargets(arch);
+    const alpineUrl = await resolveLatestAlpineUrl(targets.alpineReleaseArch);
+    return {
+        ...targets,
+        alpineUrl,
+        alpineBranch: resolveAlpineBranch(alpineUrl),
+    };
+};
+
+const renderInitAlpineContent = (content, alpineBranch) => {
+    return content.replaceAll("__ALPINE_BRANCH__", alpineBranch);
 };
 
 const Terminal = {
@@ -57,7 +108,7 @@ const Terminal = {
             system.getArch(resolve, reject);
         });
 
-        const { alpineUrl, axsUrl } = resolveInstallTargets(arch);
+        const { alpineUrl, axsUrl } = await getInstallTargets(arch);
         return { arch, alpineUrl, axsUrl };
     },
 
@@ -80,7 +131,6 @@ const Terminal = {
 
         logger(force ? "♻️  Refreshing axs binary..." : "🔄  AXS source changed, refreshing binary...");
         logger(`🌐  axs source: ${axsUrl}`);
-        logger(`📁  axs destination: ${filesDir}/axs`);
 
         await Executor.execute(`rm -rf "${filesDir}/axs"`).catch(() => {});
 
@@ -115,7 +165,8 @@ const Terminal = {
 
         await this.refreshAxs(logger, err_logger);
 
-        const initAlpineContent = await readAsset("init-alpine.sh");
+        const { alpineBranch } = await this.getDownloadTargets().then(async ({ arch }) => getInstallTargets(arch));
+        const initAlpineContent = renderInitAlpineContent(await readAsset("init-alpine.sh"), alpineBranch);
         const initSandboxContent = await readAsset("init-sandbox.sh");
         const rmWrapperContent = await readAsset("rm-wrapper.sh");
 
@@ -272,7 +323,6 @@ const Terminal = {
         };
         const downloadWithLogging = async (label, url, dst, progressHandler) => {
             logger(`🌐  ${label} source: ${url}`);
-            logger(`📁  ${label} destination: ${dst}`);
             try {
                 await Executor.download(url, dst, progressHandler);
                 logger(`✅  ${label} download finished`);
@@ -295,7 +345,7 @@ const Terminal = {
                 libTalloc,
                 libproot,
                 libproot32,
-            } = resolveInstallTargets(arch);
+            } = await getInstallTargets(arch);
 
             // Invalidate download cache if URLs changed (e.g. version bump)
             if (alreadyDownloaded) {

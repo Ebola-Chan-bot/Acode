@@ -2,10 +2,10 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/share/bin:/usr/share/sbin:/usr/lo
 export HOME=/home
 export TERM=xterm-256color
 
-APK_MAIN_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
-APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
-APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
-APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
+APK_MAIN_REPO="http://dl-cdn.alpinelinux.org/alpine/__ALPINE_BRANCH__/main"
+APK_COMMUNITY_REPO="http://dl-cdn.alpinelinux.org/alpine/__ALPINE_BRANCH__/community"
+APK_MIRROR_MAIN_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/main"
+APK_MIRROR_COMMUNITY_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/community"
 
 extract_shebang_interpreter() {
     local shebang_line="$1"
@@ -119,18 +119,12 @@ if [ -n "$missing_packages" ]; then
     for repo_mode in official mirror; do
         configure_apk_repositories "$repo_mode"
 
-        # In proot, post-install scripts may fail with error 127;
-        # manual fixup below compensates if needed.
-        run_apk_step "apk update package-index" "$repo_mode" apk update
-        if [ $? -ne 0 ]; then
-            echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
-            continue
-        fi
-
-        run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
+        # In proot, persisting APKINDEX may fail with Operation not permitted;
+        # install directly without local index cache writes.
+        run_apk_step "apk add required-packages" "$repo_mode" apk add --no-cache $missing_packages
         if [ $? -ne 0 ]; then
             if repair_script_interpreters; then
-                run_apk_step "apk add required-packages after interpreter repair" "$repo_mode" apk add $missing_packages
+                run_apk_step "apk add required-packages after interpreter repair" "$repo_mode" apk add --no-cache $missing_packages
             fi
         fi
 
