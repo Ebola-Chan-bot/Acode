@@ -339,6 +339,15 @@ export default class TerminalTouchSelection {
 		this.scrollElement =
 			this.terminal.element.querySelector(".xterm-viewport") ||
 			this.terminal.element;
+		if (this.scrollElement) {
+			// Android WebView becomes much less willing to pan nested scroll containers
+			// once the IME is visible. Force the xterm viewport to advertise vertical
+			// touch scrolling explicitly so terminal history remains draggable while
+			// the keyboard is up and the shell is waiting for input.
+			this.scrollElement.style.touchAction = "pan-y pinch-zoom";
+			this.scrollElement.style.webkitOverflowScrolling = "touch";
+			this.scrollElement.style.overscrollBehaviorY = "contain";
+		}
 		this.scrollElement.addEventListener(
 			"scroll",
 			this.boundHandlers.terminalScroll,
@@ -1303,14 +1312,20 @@ export default class TerminalTouchSelection {
 	}
 
 	updateCellDimensions() {
-		if (this.terminal._core && this.terminal._core._renderService) {
-			const dimensions = this.terminal._core._renderService.dimensions;
-			if (dimensions && dimensions.css && dimensions.css.cell) {
-				this.cellDimensions = {
-					width: dimensions.css.cell.width,
-					height: dimensions.css.cell.height,
-				};
+		try {
+			if (this.terminal._core && this.terminal._core._renderService) {
+				const dimensions = this.terminal._core._renderService.dimensions;
+				if (dimensions && dimensions.css && dimensions.css.cell) {
+					this.cellDimensions = {
+						width: dimensions.css.cell.width,
+						height: dimensions.css.cell.height,
+					};
+				}
 			}
+		} catch {
+			// xterm can tear down its render service before delayed mobile-selection
+			// callbacks run; ignore that race instead of crashing terminal cleanup.
+			return;
 		}
 	}
 

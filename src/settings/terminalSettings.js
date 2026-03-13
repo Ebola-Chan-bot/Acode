@@ -2,6 +2,7 @@ import fsOperation from "fileSystem";
 import settingsPage from "components/settingsPage";
 import {
 	DEFAULT_TERMINAL_SETTINGS,
+	TerminalManager,
 	TerminalThemeManager,
 } from "components/terminal";
 import toast from "components/toast";
@@ -272,7 +273,7 @@ export default function terminalSettings() {
 						"Also delete download cache? Keeping it makes re-install faster.",
 					);
 					loader.showTitleLoader();
-					(deleteCache ? Terminal.uninstallFull() : Terminal.uninstall())
+					TerminalManager.uninstallTerminalEnvironment(deleteCache)
 						.then(() => {
 							loader.removeTitleLoader();
 							alert(

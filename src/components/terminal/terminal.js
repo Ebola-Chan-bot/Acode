@@ -21,6 +21,16 @@ import { getTerminalSettings } from "./terminalDefaults";
 import TerminalThemeManager from "./terminalThemeManager";
 import TerminalTouchSelection from "./terminalTouchSelection";
 
+let terminalEnvironmentGeneration = 0;
+const AXS_READY_MARKER = "__ACODE_AXS_READY__";
+
+class TerminalSessionStaleError extends Error {
+	constructor(message = "Terminal session attempt became stale") {
+		super(message);
+		this.name = "TerminalSessionStaleError";
+	}
+}
+
 export default class TerminalComponent {
 	constructor(options = {}) {
 		// Get terminal settings from shared defaults
@@ -61,6 +71,10 @@ export default class TerminalComponent {
 		this.isConnected = false;
 		this.serverMode = options.serverMode !== false; // Default true
 		this.touchSelection = null;
+		this._isDisposed = false;
+		this._sessionCreationPromise = null;
+		this._bootstrapOutputSeen = false;
+		this._pendingFocusAfterBootstrap = false;
 
 		this.init();
 	}
@@ -544,17 +558,18 @@ export default class TerminalComponent {
 				this.loadLigaturesAddon();
 			}
 
-			// First render pass: schedule a fit + focus once the frame is ready
+			// First render pass: schedule a fit once the frame is ready.
+			// Auto-focusing here opens the soft keyboard before MOTD/prompt arrives and
+			// can shrink the viewport while restored tabs are still computing their first
+			// PTY size, which is why Terminal 2/3 still hard-wrap on first paint.
 			if (typeof requestAnimationFrame === "function") {
 				requestAnimationFrame(() => {
 					this.fitAddon.fit();
-					this.terminal.focus();
 					this.setupTouchSelection();
 				});
 			} else {
 				setTimeout(() => {
 					this.fitAddon.fit();
-					this.terminal.focus();
 					this.setupTouchSelection();
 				}, 0);
 			}
@@ -576,9 +591,50 @@ export default class TerminalComponent {
 			);
 		}
 
+		if (this._sessionCreationPromise) {
+			return this._sessionCreationPromise;
+		}
+
+		// The same terminal tab can hit createSession twice while mount/reconnect work
+		// overlaps. Without a per-instance single-flight guard, one attempt can consume
+		// the ready marker while the other times out and tears down a healthy session.
+		const sessionCreationPromise = this.createSessionInternal();
+		this._sessionCreationPromise = sessionCreationPromise;
+
 		try {
+			return await sessionCreationPromise;
+		} finally {
+			if (this._sessionCreationPromise === sessionCreationPromise) {
+				this._sessionCreationPromise = null;
+			}
+		}
+	}
+
+	async createSessionInternal() {
+		try {
+			let observedEnvironmentGeneration = terminalEnvironmentGeneration;
+			const ensureAttemptIsStillValid = () => {
+				if (this._isDisposed) {
+					throw new TerminalSessionStaleError();
+				}
+
+				// Terminal startup mutates a single shared AXS/rootfs environment.
+				// If another terminal has already created a newer healthy session,
+				// this older async flow must fail fast instead of repairing and
+				// tearing down the newer instance underneath it.
+				if (terminalEnvironmentGeneration !== observedEnvironmentGeneration) {
+					throw new TerminalSessionStaleError();
+				}
+			};
+
+			const markSharedEnvironmentChanged = () => {
+				terminalEnvironmentGeneration += 1;
+				observedEnvironmentGeneration = terminalEnvironmentGeneration;
+			};
+
 			// Check if terminal is installed before starting AXS
 			const installed = await Terminal.isInstalled();
+			ensureAttemptIsStillValid();
 			if (!installed) {
 				throw new Error(
 					"Terminal not installed. Please install terminal first.",
@@ -587,6 +643,7 @@ export default class TerminalComponent {
 
 			// Start AXS if not running
 			const axsRunning = await Terminal.isAxsRunning();
+			ensureAttemptIsStillValid();
 
 			// Poll by hitting the actual HTTP endpoint, not just checking PID liveness.
 			// isAxsRunning() only does kill -0 on the PID file, which can return true
@@ -650,60 +707,209 @@ export default class TerminalComponent {
 				}
 			};
 
-			if (!axsRunning) {
-				await Terminal.startAxs(
-					false,
-					(message) => writeLifecycleLog(message, false),
-					(message) => writeLifecycleLog(message, true),
+			const runSharedEnvironmentOperation = async (type, run) => {
+				if (this.environmentCoordinator?.runExclusive) {
+					return this.environmentCoordinator.runExclusive({ type, run });
+				}
+
+				return run();
+			};
+
+			const syncTerminalLayout = async () => {
+				const hasRenderableLayout = () => {
+					if (!this.container) {
+						return false;
+					}
+
+					const rect = this.container.getBoundingClientRect();
+					return rect.width >= 10 && rect.height >= 10;
+				};
+
+				const runFit = () => {
+					// Shared startup waiters can resume after their tab has already moved to the
+					// background. Fitting xterm while the container is hidden collapses cols to a
+					// bogus tiny value, and the subsequent POST /terminals creates a PTY that
+					// hard-wraps root@localhost on Terminal 2/3 before any later resize can fix it.
+					// Only pre-fit when the terminal currently has a real renderable layout.
+					if (!hasRenderableLayout()) {
+						return;
+					}
+
+					this.fit();
+				};
+
+				if (typeof requestAnimationFrame === "function") {
+					await new Promise((resolve) => {
+						requestAnimationFrame(() => {
+							runFit();
+							resolve();
+						});
+					});
+					return;
+				}
+
+				runFit();
+			};
+
+			const startAxsAndWaitForReady = async (installing = false) => {
+				let readyResolve;
+				let readyReject;
+				let readySettled = false;
+				let readyTimeoutId = null;
+
+				const readyPromise = new Promise((resolve, reject) => {
+					readyResolve = resolve;
+					readyReject = reject;
+				});
+
+				const settleReady = (resolver, value) => {
+					if (readySettled) {
+						return;
+					}
+
+					readySettled = true;
+					if (readyTimeoutId) {
+						clearTimeout(readyTimeoutId);
+						readyTimeoutId = null;
+					}
+					resolver(value);
+				};
+
+				const handleLifecycleMessage = (message, isError = false) => {
+					const cleanMessage = String(message ?? "").replace(/^(stdout|stderr)\s+/, "");
+
+					if (cleanMessage.includes(AXS_READY_MARKER)) {
+						settleReady(readyResolve, true);
+						return;
+					}
+
+					writeLifecycleLog(message, isError);
+
+					if (cleanMessage.startsWith("exit ")) {
+						settleReady(
+							readyReject,
+							new Error(`AXS exited before becoming ready: ${cleanMessage}`),
+						);
+					}
+				};
+
+				const startResult = await Terminal.startAxs(
+					installing,
+					(message) => handleLifecycleMessage(message, false),
+					(message) => handleLifecycleMessage(message, true),
 				);
+
+				if (installing) {
+					return startResult;
+				}
+
+				await Promise.race([
+					readyPromise,
+					new Promise((_, reject) => {
+						readyTimeoutId = setTimeout(() => {
+							reject(new Error("AXS did not emit a ready event"));
+						}, 15000);
+					}),
+				]);
+			};
+
+			let axsStartupFailed = false;
+			if (!axsRunning) {
+				try {
+					await runSharedEnvironmentOperation("startup", async () => {
+						ensureAttemptIsStillValid();
+						const sharedAxsRunning = await Terminal.isAxsRunning();
+						ensureAttemptIsStillValid();
+						if (!sharedAxsRunning) {
+							// Starting/stopping AXS changes the single shared terminal runtime.
+							// Bump the shared-environment generation here so older attempts
+							// fail fast, while this owner continues on the new generation.
+							markSharedEnvironmentChanged();
+							await startAxsAndWaitForReady(false);
+						}
+					});
+					ensureAttemptIsStillValid();
+				} catch (startupError) {
+					if (
+						startupError?.name === "TerminalSessionStaleError" ||
+						startupError?.sharedEnvironmentInterrupted
+					) {
+						throw startupError;
+					}
+					// AXS process exited before becoming ready (e.g. exit 182 on a fresh
+					// install where the Alpine environment is in a degraded state). Fall
+					// through to the repair path which reinstalls the environment.
+					writeLifecycleLog(
+						`AXS startup failed: ${startupError.message}`,
+						true,
+					);
+					axsStartupFailed = true;
+					ensureAttemptIsStillValid();
+				}
 			}
 
 			// Always wait for the HTTP endpoint, even if the PID is already alive.
 			// kill -0 only tells us the outer process exists; the embedded server may
 			// still be starting, especially after crash recovery on slower devices.
-			const initialPollRetries = axsRunning ? 10 : 30;
-			if (!(await pollAxs(initialPollRetries))) {
-				// AXS failed to become reachable — attempt auto-repair
-				toast("Repairing terminal environment...");
+			// Cold starts can spend tens of seconds finishing apk work inside proot.
+			// If we repair too early, we kill the first AXS instance just as it becomes
+			// reachable and force an unnecessary reinstall loop.
+			const initialPollRetries = axsRunning && !axsStartupFailed ? 10 : 1;
+			if (axsStartupFailed || !(await pollAxs(initialPollRetries))) {
+				ensureAttemptIsStillValid();
+				await runSharedEnvironmentOperation("repair", async () => {
+					// AXS failed to become reachable — attempt auto-repair
+					toast("Repairing terminal environment...");
 
-				try {
-					await Terminal.stopAxs();
-				} catch (_) {
-					/* ignore */
-				}
+					// Repair tears down and rebuilds the shared runtime. Once repair starts,
+					// any older concurrent createSession flow must become stale instead of
+					// continuing with assumptions from the pre-repair environment.
+					markSharedEnvironmentChanged();
 
-				// Re-run installing flow to repair packages / config
-				const repairOk = await Terminal.startAxs(
-					true,
-					(message) => writeLifecycleLog(message, false),
-					(message) => writeLifecycleLog(message, true),
-				);
-				if (repairOk) {
-					// Start AXS again after repair
-					await Terminal.startAxs(
-						false,
+					try {
+						ensureAttemptIsStillValid();
+						await Terminal.stopAxs();
+					} catch (_) {
+						/* ignore */
+					}
+
+					const repairOk = await Terminal.startAxs(
+						true,
 						(message) => writeLifecycleLog(message, false),
 						(message) => writeLifecycleLog(message, true),
 					);
-				} else {
-					try {
-						await Terminal.resetConfigured();
-					} catch (_) {
-						/* ignore */
+					ensureAttemptIsStillValid();
+					if (!repairOk) {
+						try {
+							ensureAttemptIsStillValid();
+							await Terminal.resetConfigured();
+						} catch (_) {
+							/* ignore */
+						}
+						throw new Error("AXS repair failed");
 					}
-					throw new Error("AXS repair failed");
-				}
 
-				if (!(await pollAxs(30))) {
-					// Still broken — clear .configured so next open re-triggers install
-					try {
-						await Terminal.resetConfigured();
-					} catch (_) {
-						/* ignore */
+					await startAxsAndWaitForReady(false);
+					ensureAttemptIsStillValid();
+
+					if (!(await pollAxs(1))) {
+						ensureAttemptIsStillValid();
+						try {
+							ensureAttemptIsStillValid();
+							await Terminal.resetConfigured();
+						} catch (_) {
+							/* ignore */
+						}
+						throw new Error("Failed to start AXS server after repair attempt");
 					}
-					throw new Error("Failed to start AXS server after repair attempt");
-				}
+				});
+				ensureAttemptIsStillValid();
 			}
+
+			// Session size must be measured after the mounted terminal has had a frame to lay
+			// out. If PTY creation runs with the pre-fit grid, the first prompt is wrapped using
+			// a bogus narrow width and later resize cannot un-break the already rendered line.
+			await syncTerminalLayout();
 
 			const requestBody = {
 				cols: this.terminal.cols,
@@ -752,34 +958,43 @@ export default class TerminalComponent {
 			};
 
 			let sessionResult = await openTerminalSession();
+			ensureAttemptIsStillValid();
 
 			// Detect PTY errors from axs server (e.g. incompatible binary)
 			if (sessionResult.ptyOpenError?.includes("Failed to open PTY")) {
 				writeLifecycleLog("AXS PTY creation failed, refreshing axs binary and retrying...", true);
 
-				try {
-					await Terminal.stopAxs();
-				} catch (_) {
-					/* ignore */
-				}
+				await runSharedEnvironmentOperation("refresh", async () => {
+					// Refresh replaces the shared axs binary/process. Older in-flight
+					// session attempts must stop before they can attach to the old state.
+					markSharedEnvironmentChanged();
 
-				await Terminal.refreshAxs(
-					(message) => writeLifecycleLog(message, false),
-					(message) => writeLifecycleLog(message, true),
-					true,
-				);
+					try {
+						ensureAttemptIsStillValid();
+						await Terminal.stopAxs();
+					} catch (_) {
+						/* ignore */
+					}
 
-				await Terminal.startAxs(
-					false,
-					(message) => writeLifecycleLog(message, false),
-					(message) => writeLifecycleLog(message, true),
-				);
+					await Terminal.refreshAxs(
+						(message) => writeLifecycleLog(message, false),
+						(message) => writeLifecycleLog(message, true),
+						true,
+					);
+					ensureAttemptIsStillValid();
 
-				if (!(await pollAxs(30))) {
-					throw new Error("Failed to restart AXS after refreshing binary");
-				}
+					await startAxsAndWaitForReady(false);
+					ensureAttemptIsStillValid();
+
+					if (!(await pollAxs(1))) {
+						ensureAttemptIsStillValid();
+						throw new Error("Failed to restart AXS after refreshing binary");
+					}
+				});
+				ensureAttemptIsStillValid();
 
 				sessionResult = await openTerminalSession();
+				ensureAttemptIsStillValid();
 				if (sessionResult.ptyOpenError?.includes("Failed to open PTY")) {
 					throw new Error("Failed to open PTY");
 				}
@@ -788,6 +1003,9 @@ export default class TerminalComponent {
 			this.pid = sessionResult.data.trim();
 			return this.pid;
 		} catch (error) {
+			if (error?.name === "TerminalSessionStaleError") {
+				throw error;
+			}
 			console.error("Failed to create terminal session:", error);
 			throw error;
 		}
@@ -804,8 +1022,17 @@ export default class TerminalComponent {
 			);
 		}
 
-		if (!pid) {
-			pid = await this.createSession();
+		const isReconnecting = !!pid;
+
+		try {
+			if (!pid) {
+				pid = await this.createSession();
+			}
+		} catch (error) {
+			if (error?.name === "TerminalSessionStaleError") {
+				return;
+			}
+			throw error;
 		}
 
 		this.pid = pid;
@@ -815,32 +1042,37 @@ export default class TerminalComponent {
 			this._relocationSniffDisabled = true;
 		}, 15000);
 
+		if (isReconnecting) {
+			await this.syncExistingSessionLayoutBeforeReconnect();
+		}
+
 		const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
+		this._bootstrapOutputSeen = false;
+		this._pendingFocusAfterBootstrap = false;
 
 		this.websocket = new WebSocket(wsUrl);
+
+		// The backend replays scrollback immediately after the WebSocket upgrade.
+		// If AttachAddon is only installed in onopen, those first binary frames can
+		// arrive before xterm is listening and the initial MOTD/prompt is lost.
+		if (this.attachAddon) {
+			try {
+				this.attachAddon.dispose();
+			} catch (_) {}
+			this.attachAddon = null;
+		}
+		this.attachAddon = new AttachAddon(this.websocket);
+		this.terminal.loadAddon(this.attachAddon);
+		this.terminal.unicode.activeVersion = "11";
 
 		this.websocket.onopen = () => {
 			this.isConnected = true;
 			this.onConnect?.();
 
-			// Explicitly dispose old AttachAddon before replacing it.
-			// Reassigning this.attachAddon does NOT auto-clean listeners bound by the old instance,
-			// which can cause duplicate socket handlers and leaks after reconnects.
-			if (this.attachAddon) {
-				try {
-					this.attachAddon.dispose();
-				} catch (_) {}
-				this.attachAddon = null;
-			}
-
-			// Load attach addon after connection
-			this.attachAddon = new AttachAddon(this.websocket);
-			this.terminal.loadAddon(this.attachAddon);
-			this.terminal.unicode.activeVersion = "11";
-
-			// Focus terminal and ensure it's ready
-			this.terminal.focus();
-			this.fit();
+			// Keep the initial PTY size from the session-create POST. Re-focusing here
+			// opens the soft keyboard before the first shell output arrives, and that
+			// viewport change can still corrupt the initial prompt layout on restored tabs.
+			// Focus is deferred until bootstrap output is actually visible.
 		};
 
 		this.websocket.onmessage = (event) => {
@@ -860,6 +1092,8 @@ export default class TerminalComponent {
 
 		// Also sniff the data to detect critical Alpine container corruption (e.g. bash/readline broken)
 		this.websocket.addEventListener("message", async (event) => {
+			this.markBootstrapOutputReady();
+
 			if (this._relocationSniffDisabled) {
 				return;
 			}
@@ -910,6 +1144,28 @@ export default class TerminalComponent {
 		this.websocket.onerror = (error) => {
 			this.onError?.(error);
 		};
+	}
+
+	async syncExistingSessionLayoutBeforeReconnect() {
+		if (!this.serverMode || !this.pid || !this.container) {
+			return;
+		}
+
+		const rect = this.container.getBoundingClientRect();
+		if (rect.width < 10 || rect.height < 10) {
+			return;
+		}
+
+		// Restored sessions replay scrollback immediately after the WebSocket upgrade.
+		// Waiting only for ResizeObserver proves the tab has dimensions, but it does not
+		// guarantee the corresponding POST /resize has already reached the backend. When
+		// reconnect races ahead of that resize, the restored prompt can replay with the
+		// previous narrow grid, which is why Terminal 2/3 still showed split prompt text
+		// and Terminal 1 could render a blank first frame after the keyboard resized it.
+		this.fit();
+		if (this.terminal.cols > 0 && this.terminal.rows > 0) {
+			await this.resizeTerminal(this.terminal.cols, this.terminal.rows);
+		}
 	}
 
 	/**
@@ -979,11 +1235,45 @@ export default class TerminalComponent {
 		this.terminal.clear();
 	}
 
+	markBootstrapOutputReady() {
+		if (this._bootstrapOutputSeen) {
+			return;
+		}
+
+		this._bootstrapOutputSeen = true;
+		if (this._pendingFocusAfterBootstrap) {
+			this._pendingFocusAfterBootstrap = false;
+			this.focus();
+		}
+	}
+
+	focusTerminalTextareaWithoutScroll() {
+		// When reactivating a terminal while the IME is already open, WebView may
+		// auto-scroll the focused xterm textarea using stale hidden-tab geometry.
+		// That shifts the whole xterm layer above the visible container, which is
+		// exactly what the runtime diagnostics captured with a negative top value.
+		// Focusing the textarea without viewport scrolling keeps input active while
+		// leaving layout ownership to the existing fit/resize path.
+		this.terminal.textarea.focus({ preventScroll: true });
+	}
+
+	/**
+	 * Focus terminal
+	 */
+	focusWhenReady() {
+		if (this.serverMode && !this._bootstrapOutputSeen) {
+			this._pendingFocusAfterBootstrap = true;
+			return;
+		}
+
+		this.focus();
+	}
+
 	/**
 	 * Focus terminal
 	 */
 	focus() {
-		this.terminal.focus();
+		this.focusTerminalTextareaWithoutScroll();
 	}
 
 	/**
@@ -1238,6 +1528,7 @@ export default class TerminalComponent {
 	 * Dispose terminal
 	 */
 	dispose() {
+		this._isDisposed = true;
 		this.terminate();
 
 		// Dispose touch selection

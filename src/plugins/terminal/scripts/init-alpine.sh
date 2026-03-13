@@ -384,9 +384,34 @@ fi
 
 chmod +x "$PREFIX/alpine/initrc"
 
+wait_for_axs_ready() {
+    local axs_pid="$1"
+    local attempt=""
+
+    # The frontend now waits for this explicit ready marker instead of blind
+    # HTTP polling. Keep the readiness check here, next to the process launch,
+    # so stale UI tasks cannot race and kill a newer healthy shared AXS instance.
+    for attempt in $(seq 1 100); do
+        if wget -q -T 1 -O /dev/null "http://127.0.0.1:8767/status"; then
+            echo "__ACODE_AXS_READY__"
+            return 0
+        fi
+
+        kill -0 "$axs_pid" 2>/dev/null || return 1
+        sleep 0.1
+    done
+
+    return 1
+}
+
 #actual source
 #everytime a terminal is started initrc will run
-"$PREFIX/axs" -c "bash --rcfile /initrc -i"
+cp -f "$PREFIX/axs" /usr/local/bin/axs
+chmod 755 /usr/local/bin/axs
+"/usr/local/bin/axs" -c "bash --rcfile /initrc -i" &
+axs_pid=$!
+wait_for_axs_ready "$axs_pid"
+wait "$axs_pid"
 
 else
     exec "$@"
