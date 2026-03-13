@@ -2,6 +2,7 @@ const Executor = require("./Executor");
 
 const ALPINE_RELEASES_BASE_URL = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases";
 const latestAlpineUrlCache = new Map();
+let sharedInstallState = null;
 
 const formatFailureMessage = (value) => {
     if (!value) return "Unknown error";
@@ -12,6 +13,68 @@ const formatFailureMessage = (value) => {
     } catch (_) {
         return String(value);
     }
+};
+
+const formatLogMessage = (parts) => parts.map((part) => formatFailureMessage(part)).join(" ");
+
+const addSharedInstallListener = (logger, err_logger) => {
+    if (!sharedInstallState) {
+        return () => {};
+    }
+
+    const listener = { logger, err_logger };
+    sharedInstallState.listeners.add(listener);
+    return () => {
+        sharedInstallState?.listeners.delete(listener);
+    };
+};
+
+const emitSharedInstallMessage = (channel, message) => {
+    if (!sharedInstallState) {
+        return;
+    }
+
+    for (const listener of sharedInstallState.listeners) {
+        if (channel === "error") {
+            listener.err_logger?.(message);
+        } else {
+            listener.logger?.(message);
+        }
+    }
+};
+
+const withSharedInstall = async (logger, err_logger, run) => {
+    if (sharedInstallState) {
+        const detachListener = addSharedInstallListener(logger, err_logger);
+        try {
+            return await sharedInstallState.promise;
+        } finally {
+            detachListener();
+        }
+    }
+
+    const installState = {
+        listeners: new Set(),
+        promise: null,
+    };
+    sharedInstallState = installState;
+
+    const detachListener = addSharedInstallListener(logger, err_logger);
+    const sharedLogger = (...parts) => {
+        emitSharedInstallMessage("log", formatLogMessage(parts));
+    };
+    const sharedErrLogger = (...parts) => {
+        emitSharedInstallMessage("error", formatLogMessage(parts));
+    };
+
+    installState.promise = Promise.resolve(run(sharedLogger, sharedErrLogger)).finally(() => {
+        detachListener();
+        if (sharedInstallState === installState) {
+            sharedInstallState = null;
+        }
+    });
+
+    return installState.promise;
 };
 
 const resolveLatestAlpineUrl = async (releaseArch) => {
@@ -274,6 +337,7 @@ const Terminal = {
      * @returns {Promise<boolean|{success: boolean, error?: string, exitCode?: string}>} - Returns true on success or failure details when installation fails
      */
     async install(logger = console.log, err_logger = console.error, _retried = false) {
+        return withSharedInstall(logger, err_logger, async (logger, err_logger) => {
         if (!(await this.isSupported())) {
             return {
                 success: false,
@@ -476,6 +540,7 @@ const Terminal = {
                 error: formatInstallError(e),
             };
         }
+        });
     },
 
     /**

@@ -105,12 +105,13 @@ class TerminalManager {
 
 			try {
 				await activeOperation.promise;
-				if (progressComponent) {
-					this.writeSharedEnvironmentNotice(
-						progressComponent,
-						`Shared terminal ${activeTitle} finished. Rechecking local state...`,
-						"32",
-					);
+				if (progressComponent && !progressComponent.isConnected) {
+					// Waiter terminals are still empty at this point: they only contain the shared
+					// "Waiting..." / "Rechecking..." notices. Keeping those lines makes the tab look
+					// stuck even after the local re-check creates and connects a fresh PTY, because
+					// the user lands on stale status text instead of the new MOTD/prompt. Clear the
+					// transient wait buffer before resuming the waiter's normal startup path.
+					progressComponent.clear();
 				}
 
 				// Waiters must resume via their own normal path after the owner finishes.
@@ -347,6 +348,7 @@ class TerminalManager {
 
 	async restorePersistedSessions() {
 		const sessions = await this.getPersistedSessions();
+
 		if (!sessions.length) return;
 
 		const manager = window.editorManager;
@@ -464,6 +466,16 @@ class TerminalManager {
 				tabIcon: "licons terminal",
 				render: shouldRender,
 			});
+			terminalFile.onfocus = () => {
+				terminalFile._resolveActivationReady?.();
+				terminalFile._resolveActivationReady = null;
+				terminalFile._activationReadyPromise = null;
+
+				requestAnimationFrame(() => {
+					terminalComponent.syncVisibleLayout?.();
+					terminalComponent.focusWhenReady();
+				});
+			};
 			terminalFile.onclose = () => {
 				this.interruptSharedEnvironmentOperationForTerminal(
 					terminalId,
@@ -902,6 +914,8 @@ class TerminalManager {
 		}
 
 		terminalFile._initialLayoutReady = false;
+		terminalFile._activationReadyPromise = null;
+		terminalFile._resolveActivationReady = null;
 		terminalFile._initialLayoutReadyPromise = new Promise((resolve) => {
 			terminalFile._resolveInitialLayoutReady = resolve;
 		});
@@ -978,6 +992,22 @@ class TerminalManager {
 			return;
 		}
 
+		const isActiveTerminalTab =
+			window.editorManager?.activeFile?.id === terminalFile.id;
+		if (!isActiveTerminalTab) {
+			if (!terminalFile._activationReadyPromise) {
+				terminalFile._activationReadyPromise = new Promise((resolve) => {
+					terminalFile._resolveActivationReady = resolve;
+				});
+			}
+
+			await terminalFile._activationReadyPromise;
+
+			if (terminalFile._initialLayoutReady) {
+				return;
+			}
+		}
+
 		const waitForObserver = terminalFile._initialLayoutReadyPromise;
 		if (!waitForObserver) {
 			throw new Error(
@@ -1047,23 +1077,14 @@ class TerminalManager {
 
 		// Handle tab focus/blur
 		terminalFile.onfocus = () => {
-			// Do NOT forcefully call fit() here, as the DOM might still be animating
-			// or transitioning from display:none.
-			// terminalFile._resizeObserver (ResizeObserver) already handles fitting
-			// securely when the container's true dimensions are realized.
-			//
-			// After switching back to a terminal tab, the xterm WebGL canvas may be
-			// stale and render as a solid black rectangle. Scheduling a full repaint
-			// on the next animation frame (after the container is visible in the DOM)
-			// forces the WebGL renderer to re-draw all rows.
+			terminalFile._resolveActivationReady?.();
+			terminalFile._resolveActivationReady = null;
+			terminalFile._activationReadyPromise = null;
+
 			requestAnimationFrame(() => {
-				const xterm = terminalComponent.terminal;
-				if (xterm?.rows > 0) {
-					xterm.clearTextureAtlas?.();
-					xterm.refresh(0, xterm.rows - 1);
-				}
+				terminalComponent.syncVisibleLayout?.();
+				terminalComponent.focusWhenReady();
 			});
-			terminalComponent.focusWhenReady();
 		};
 
 		// Handle tab close

@@ -118,6 +118,17 @@ find_bash_path() {
     command -v bash 2>/dev/null || true
 }
 
+required_packages_ready() {
+    local bash_path=""
+
+    bash_path="$(find_bash_path)"
+    [ -z "$bash_path" ] && return 1
+    [ ! -f /usr/share/zoneinfo/UTC ] && return 1
+    [ ! -f /usr/bin/wget ] && return 1
+    should_install_command_not_found && return 1
+    return 0
+}
+
 missing_packages=""
 [ -z "$(find_bash_path)" ] && missing_packages="$missing_packages bash"
 [ ! -f /usr/share/zoneinfo/UTC ] && missing_packages="$missing_packages tzdata"
@@ -138,6 +149,28 @@ if [ -n "$missing_packages" ]; then
             if repair_script_interpreters; then
                 run_apk_step "apk add required-packages after interpreter repair" "$repo_mode" apk add --no-cache $missing_packages
             fi
+        fi
+
+        if [ $? -ne 0 ] && ! required_packages_ready; then
+            # The first apk add after a fresh reinstall can transiently die before the
+            # payload is fully visible inside proot, then succeed immediately on the
+            # next identical invocation against the same repositories. Retry exactly
+            # once here so that this short-lived install race does not surface to the
+            # UI as a fatal "installation failed with exit code 1/182" crash.
+            echo -e "\e[33;1m[!] \e[0mapk add failed before required packages became visible; retrying once with ${repo_mode} repositories\e[0m"
+            run_apk_step "apk add required-packages retry" "$repo_mode" apk add --no-cache $missing_packages
+        fi
+
+        if [ $? -ne 0 ] && required_packages_ready; then
+            # Under proot, apk may unpack the required payload successfully and then
+            # fail only while finalizing its database/trigger scripts because kernel
+            # shebang execution is unreliable in this environment after reinstall.
+            # The terminal only depends on the installed binaries/files, so once the
+            # required package payload is verifiably present we must continue instead
+            # of retrying another concurrent install against the same rootfs.
+            echo -e "\e[33;1m[!] \e[0mapk reported a finalization error after package payload was installed; continuing with the verified runtime files\e[0m"
+            install_succeeded="true"
+            break
         fi
 
         if [ $? -ne 0 ]; then
@@ -170,15 +203,14 @@ if [ -n "$missing_packages" ]; then
     [ -z "$bash_path" ] && echo -e "\e[31;1m[!] \e[0mbash still missing\e[0m"
     [ ! -f /usr/bin/wget ] && echo -e "\e[31;1m[!] \e[0mwget still missing\e[0m"
 
-    if [ -z "$bash_path" ] || [ ! -f /usr/bin/wget ] || [ ! -f /usr/share/zoneinfo/UTC ]; then
+    if ! required_packages_ready; then
         echo -e "\e[31;1m[!] \e[0mRequired packages are still missing after installation\e[0m"
         exit 1
     fi
 fi
 
 
-if [ ! -f /linkerconfig/ld.config.txt ]; then
-    mkdir -p /linkerconfig
+if [ -d /linkerconfig ] && [ -w /linkerconfig ] && [ ! -f /linkerconfig/ld.config.txt ]; then
     touch /linkerconfig/ld.config.txt
 fi
 

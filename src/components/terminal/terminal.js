@@ -75,6 +75,7 @@ export default class TerminalComponent {
 		this._sessionCreationPromise = null;
 		this._bootstrapOutputSeen = false;
 		this._pendingFocusAfterBootstrap = false;
+		this._visibleLayoutSyncFrame = null;
 
 		this.init();
 	}
@@ -194,6 +195,7 @@ export default class TerminalComponent {
 	setupResizeHandling() {
 		let resizeTimeout = null;
 		let lastKnownScrollPosition = 0;
+		let wasNearBottomBeforeResize = true;
 		let isResizing = false;
 		const RESIZE_DEBOUNCE = 100;
 
@@ -206,7 +208,10 @@ export default class TerminalComponent {
 
 			// Store current scroll position before resize
 			if (this.terminal.buffer && this.terminal.buffer.active) {
-				lastKnownScrollPosition = this.terminal.buffer.active.viewportY;
+				const buffer = this.terminal.buffer.active;
+				const maxScroll = Math.max(0, buffer.length - this.terminal.rows);
+				lastKnownScrollPosition = buffer.viewportY;
+				wasNearBottomBeforeResize = buffer.viewportY >= maxScroll - 1;
 			}
 
 			// Clear any existing timeout
@@ -264,8 +269,16 @@ export default class TerminalComponent {
 							);
 							this.terminal.scrollToLine(targetScroll);
 						}
+					} else if (wasNearBottomBeforeResize) {
+						// Terminal 1's black block came from restoring a stale viewportY after a
+						// hidden-tab/IME height change while the prompt was already at the bottom.
+						// Preserving the old line index in that state replays a scroll offset that no
+						// longer matches the new viewport height, so xterm keeps the DOM layer shifted
+						// above its container. If we were already at the live bottom, re-anchor to the
+						// live bottom instead of replaying the stale viewportY.
+						this.terminal.scrollToBottom();
 					} else {
-						// Regular resize - preserve scroll position
+						// Regular resize away from the prompt - preserve the user-visible viewport.
 						this.preserveViewportPosition(lastKnownScrollPosition);
 					}
 
@@ -275,6 +288,15 @@ export default class TerminalComponent {
 
 					// Mark resize as complete
 					isResizing = false;
+
+					// The remaining Terminal 1 black block happens after the tab is already visible:
+					// IME animation shrinks the viewport, xterm recomputes rows, and only then does
+					// WebView reapply a stale focused-textarea scroll offset that pushes the entire
+					// .xterm layer above the container again. Running the visible-layout correction
+					// once more after the debounced resize settles fixes that late relocation, and
+					// also makes hidden terminals that received MOTD while inactive repaint correctly
+					// when they become the active tab.
+					this.scheduleVisibleLayoutSync();
 
 					// Notify touch selection if it exists
 					if (this.touchSelection) {
@@ -825,7 +847,27 @@ export default class TerminalComponent {
 							// Bump the shared-environment generation here so older attempts
 							// fail fast, while this owner continues on the new generation.
 							markSharedEnvironmentChanged();
-							await startAxsAndWaitForReady(false);
+							try {
+								await startAxsAndWaitForReady(false);
+							} catch (startupError) {
+								const startupMessage = String(startupError?.message || "");
+
+								// Freshly bootstrapped proot can occasionally die with exit 182
+								// before init-alpine.sh even starts, then succeed immediately on
+								// the next identical launch. Retry exactly once here so that this
+								// transient cold-start failure is not misreported as installation
+								// failure or escalated into an unnecessary full repair.
+								if (!startupMessage.includes("exit 182")) {
+									throw startupError;
+								}
+
+								writeLifecycleLog(
+									"AXS cold start exited with 182 before readiness; retrying launch once.",
+									true,
+								);
+								ensureAttemptIsStillValid();
+								await startAxsAndWaitForReady(false);
+							}
 						}
 					});
 					ensureAttemptIsStillValid();
@@ -1241,9 +1283,67 @@ export default class TerminalComponent {
 		}
 
 		this._bootstrapOutputSeen = true;
+		this.scheduleVisibleLayoutSync();
 		if (this._pendingFocusAfterBootstrap) {
 			this._pendingFocusAfterBootstrap = false;
-			this.focus();
+			this.focusWhenReady();
+		}
+	}
+
+	scheduleVisibleLayoutSync() {
+		if (this._visibleLayoutSyncFrame !== null) {
+			cancelAnimationFrame?.(this._visibleLayoutSyncFrame);
+			this._visibleLayoutSyncFrame = null;
+		}
+
+		const runSync = () => {
+			this._visibleLayoutSyncFrame = null;
+			this.syncVisibleLayout();
+		};
+
+		if (typeof requestAnimationFrame === "function") {
+			this._visibleLayoutSyncFrame = requestAnimationFrame(runSync);
+			return;
+		}
+
+		setTimeout(runSync, 0);
+	}
+
+	syncVisibleLayout() {
+		if (!this.container || !this.terminal) {
+			return;
+		}
+
+		const rect = this.container.getBoundingClientRect();
+		if (rect.width < 10 || rect.height < 10) {
+			return;
+		}
+
+		const xtermElement = this.container.querySelector(".xterm");
+		const viewportElement = this.container.querySelector(".xterm-viewport");
+		const isViewportRelocated =
+			xtermElement &&
+			Math.abs(xtermElement.getBoundingClientRect().top - rect.top) > 4;
+
+		this.fit();
+
+		if (isViewportRelocated) {
+			// When a previously hidden terminal is reactivated with the IME already affecting
+			// layout, WebView/xterm can restore the old internal viewport scroll offset before
+			// the new visible height is applied. The runtime trace captured that as xterm.top < 0
+			// while the terminal container itself stayed in place, which is exactly the large
+			// black non-scrollable area the user still sees on Terminal 1. Re-anchor both xterm's
+			// logical viewport and the DOM scroller to the live bottom row as soon as the tab is
+			// visible so the rendered layer snaps back into the container immediately.
+			this.terminal.scrollToBottom();
+			if (viewportElement) {
+				viewportElement.scrollTop = viewportElement.scrollHeight;
+			}
+		}
+
+		if (this.terminal.rows > 0) {
+			this.terminal.clearTextureAtlas?.();
+			this.terminal.refresh(0, this.terminal.rows - 1);
 		}
 	}
 
@@ -1266,7 +1366,18 @@ export default class TerminalComponent {
 			return;
 		}
 
-		this.focus();
+		if (typeof requestAnimationFrame === "function") {
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					this.focus();
+				});
+			});
+			return;
+		}
+
+		setTimeout(() => {
+			this.focus();
+		}, 0);
 	}
 
 	/**
@@ -1505,6 +1616,10 @@ export default class TerminalComponent {
 	async terminate() {
 		clearTimeout(this._relocationSniffTimer);
 		this._relocationSniffDisabled = true;
+		if (this._visibleLayoutSyncFrame !== null) {
+			cancelAnimationFrame?.(this._visibleLayoutSyncFrame);
+			this._visibleLayoutSyncFrame = null;
+		}
 
 		if (this.websocket) {
 			this.websocket.close();
