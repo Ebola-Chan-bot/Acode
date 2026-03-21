@@ -336,8 +336,13 @@ const Terminal = {
      * @param {Function} [err_logger=console.error] - Function to log errors.
      * @returns {Promise<boolean|{success: boolean, error?: string, exitCode?: string}>} - Returns true on success or failure details when installation fails
      */
-    async install(logger = console.log, err_logger = console.error, _retried = false) {
+    async install(logger = console.log, err_logger = console.error) {
         return withSharedInstall(logger, err_logger, async (logger, err_logger) => {
+            return this.installInternal(logger, err_logger, false);
+        });
+    },
+
+    async installInternal(logger, err_logger, _retried) {
         if (!(await this.isSupported())) {
             return {
                 success: false,
@@ -525,22 +530,43 @@ const Terminal = {
 
             // ── Phase 3: Configure (always run — installs packages, creates configs) ──
             logger("⚙️  Updating sandbox enviroment...");
-            return this.startAxs(true, logger, err_logger);
+            const configureResult = await this.startAxs(true, logger, err_logger);
+
+            // A fresh install can occasionally fail its first configuring boot with a non-zero
+            // exit (for example exit 182) and then succeed immediately on the next configure run
+            // against the same extracted rootfs. Treating that first result as terminal death
+            // makes the owner tab disappear even though the environment is recoverable.
+            if (configureResult === true || configureResult?.success === true) {
+                return configureResult;
+            }
+
+            if (!_retried) {
+                logger("🔄  Retrying terminal configuration...");
+                await Executor.execute(`rm -rf "${filesDir}/.configured"`).catch(() => {});
+                return this.installInternal(logger, err_logger, true);
+            }
+
+            return configureResult || {
+                success: false,
+                error: "Terminal configuration failed",
+            };
 
         } catch (e) {
             err_logger("Installation failed:", e);
             // Clean up everything so retry starts fresh (including potentially corrupted downloads)
             await Executor.execute(`rm -rf "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/.download-manifest"`).catch(() => {});
             if (!_retried) {
+                // Retry inside the same shared install run. Calling install() here would re-enter
+                // withSharedInstall() and await the current shared promise, which deadlocks the UI
+                // right after "Retrying installation from scratch..." when extraction/download fails.
                 logger("🔄  Retrying installation from scratch...");
-                return this.install(logger, err_logger, true);
+                return this.installInternal(logger, err_logger, true);
             }
             return {
                 success: false,
                 error: formatInstallError(e),
             };
         }
-        });
     },
 
     /**

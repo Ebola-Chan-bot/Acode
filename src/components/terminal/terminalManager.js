@@ -17,6 +17,21 @@ import appSettings from "lib/settings";
 import helpers from "utils/helpers";
 
 const TERMINAL_SESSION_STORAGE_KEY = "acodeTerminalSessions";
+const pushTerminalRestoreDebugLog = (event, payload = {}, level = "info") => { // 仅调试用
+	if (typeof window === "undefined" || typeof window.__HDC_DEBUG_PUSH !== "function") return; // 仅调试用
+	window.__HDC_DEBUG_PUSH({ // 仅调试用
+		type: "console", // 仅调试用
+		level, // 仅调试用
+		args: ["[terminal-restore]", event, payload], // 仅调试用
+		timestamp: Date.now(), // 仅调试用
+	}); // 仅调试用
+}; // 仅调试用
+
+const consumeTerminalCloseTrigger = (terminalFile) => { // 仅调试用
+	const trigger = terminalFile?._terminalCloseTrigger || null; // 仅调试用
+	if (terminalFile) terminalFile._terminalCloseTrigger = null; // 仅调试用
+	return trigger; // 仅调试用
+}; // 仅调试用
 
 class TerminalManager {
 	constructor() {
@@ -201,6 +216,14 @@ class TerminalManager {
 
 	closeAllTerminals(noticeMessage = null) {
 		const terminals = Array.from(this.terminals.entries());
+		pushTerminalRestoreDebugLog( // 仅调试用
+			"close-all-terminals", // 仅调试用
+			{ // 仅调试用
+				noticeMessage: noticeMessage || null, // 仅调试用
+				terminalIds: terminals.map(([terminalId]) => terminalId), // 仅调试用
+			}, // 仅调试用
+			"warn", // 仅调试用
+		); // 仅调试用
 
 		for (const [terminalId, terminal] of terminals) {
 			if (noticeMessage) {
@@ -366,6 +389,7 @@ class TerminalManager {
 					name: session.name,
 					reconnecting: true,
 					render: false,
+					deferInitialRestoreActivation: true,
 				});
 				if (instance) restoredTerminals.push(instance);
 			} catch (error) {
@@ -387,10 +411,21 @@ class TerminalManager {
 			alert(strings["error"], message);
 		}
 
-		if (activeFileId && manager?.getFile) {
-			const fileToRestore = manager.getFile(activeFileId, "id");
-			fileToRestore?.makeActive();
-		} else if (!manager?.activeFile && restoredTerminals.length) {
+		// Restored terminal tabs transiently steal editor focus while openFile creates
+		// them. If we trust manager.activeFile here, the last created terminal becomes
+		// the implicit "active" tab and its hidden onfocus reconnect runs immediately,
+		// which is exactly how Terminal 1/2 were restored against a 0x0 container and
+		// how Terminal 3 kept winning focus after restore.
+		for (const restoredTerminal of restoredTerminals) {
+			restoredTerminal.armDeferredInitialization?.();
+		}
+
+		const fileToRestore = activeFileId && manager?.getFile
+			? manager.getFile(activeFileId, "id")
+			: null;
+		if (fileToRestore) {
+			fileToRestore.makeActive();
+		} else if (restoredTerminals.length) {
 			restoredTerminals[0]?.file?.makeActive();
 		}
 	}
@@ -408,6 +443,9 @@ class TerminalManager {
 			const isReconnecting = terminalOptions.reconnecting === true;
 			const shouldDeferHiddenReconnect =
 				!shouldRender && isServerMode && isReconnecting && !!terminalOptions.pid;
+			const shouldArmDeferredRestoreInitialization =
+				shouldDeferHiddenReconnect &&
+				terminalOptions.deferInitialRestoreActivation === true;
 
 			const terminalId = `terminal_${++this.terminalCounter}`;
 			const providedName =
@@ -431,6 +469,8 @@ class TerminalManager {
 			if (shouldDeferHiddenReconnect) {
 				terminalComponent.pid = String(terminalOptions.pid).trim();
 			}
+			terminalComponent._restoreInitializationArmed =
+				!shouldArmDeferredRestoreInitialization;
 			terminalComponent.terminalDisplayName = terminalName;
 			terminalComponent.environmentCoordinator = {
 				runExclusive: ({ type, run }) =>
@@ -477,6 +517,15 @@ class TerminalManager {
 				});
 			};
 			terminalFile.onclose = () => {
+				pushTerminalRestoreDebugLog( // 仅调试用
+					"tab-onclose", // 仅调试用
+					{ // 仅调试用
+						terminalId, // 仅调试用
+						terminalName, // 仅调试用
+						trigger: consumeTerminalCloseTrigger(terminalFile), // 仅调试用
+					}, // 仅调试用
+					"warn", // 仅调试用
+				); // 仅调试用
 				this.interruptSharedEnvironmentOperationForTerminal(
 					terminalId,
 					terminalName,
@@ -486,6 +535,27 @@ class TerminalManager {
 					terminalComponent.dispose();
 				} catch {}
 			};
+			terminalFile._skipTerminalCloseConfirm = false; // 仅调试用
+			const originalRemove = terminalFile.remove.bind(terminalFile); // 仅调试用
+			terminalFile.remove = async (force = false) => { // 仅调试用
+				terminalFile._terminalCloseTrigger = { // 仅调试用
+					type: "remove", // 仅调试用
+					force, // 仅调试用
+					skipConfirm: !!terminalFile._skipTerminalCloseConfirm, // 仅调试用
+					activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
+				}; // 仅调试用
+				pushTerminalRestoreDebugLog( // 仅调试用
+					"tab-remove-request", // 仅调试用
+					{ // 仅调试用
+						terminalId, // 仅调试用
+						terminalName, // 仅调试用
+						trigger: terminalFile._terminalCloseTrigger, // 仅调试用
+					}, // 仅调试用
+					"warn", // 仅调试用
+				); // 仅调试用
+				terminalFile._skipTerminalCloseConfirm = false; // 仅调试用
+				return originalRemove(force); // 仅调试用
+			}; // 仅调试用
 
 			// Wait for tab creation and setup
 			return await new Promise((resolve, reject) => {
@@ -494,6 +564,18 @@ class TerminalManager {
 						const initializeTerminalSession = async () => {
 							const activeFile = window.editorManager?.activeFile;
 							const isActiveTerminalTab = activeFile?.id === terminalFile.id;
+							pushTerminalRestoreDebugLog( // 仅调试用
+								"initialize-entry", // 仅调试用
+								{ // 仅调试用
+									terminalId, // 仅调试用
+									terminalName, // 仅调试用
+									pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
+									activeFileId: activeFile?.id || null, // 仅调试用
+									terminalFileId: terminalFile.id, // 仅调试用
+									isActiveTerminalTab, // 仅调试用
+									hasDeferredPromise: !!terminalComponent._deferredInitializationPromise, // 仅调试用
+								}, // 仅调试用
+							); // 仅调试用
 
 							// Hidden restored terminals must never mount or reconnect until their tab is
 							// actually active. Runtime logs proved that startup could still initialize
@@ -508,6 +590,16 @@ class TerminalManager {
 								!terminalComponent._deferredInitializationPromise &&
 								!isActiveTerminalTab
 							) {
+								pushTerminalRestoreDebugLog( // 仅调试用
+									"defer-hidden-reconnect", // 仅调试用
+									{ // 仅调试用
+										terminalId, // 仅调试用
+										terminalName, // 仅调试用
+										pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
+										activeFileId: activeFile?.id || null, // 仅调试用
+										terminalFileId: terminalFile.id, // 仅调试用
+									}, // 仅调试用
+								); // 仅调试用
 								return null;
 							}
 
@@ -517,6 +609,14 @@ class TerminalManager {
 							// initial "root@localhost" prompt is hard-wrapped before the tab is
 							// ever shown. Hidden restored sessions must wait until first focus.
 							if (terminalComponent._deferredInitializationPromise) {
+								pushTerminalRestoreDebugLog( // 仅调试用
+									"reuse-deferred-promise", // 仅调试用
+									{ // 仅调试用
+										terminalId, // 仅调试用
+										terminalName, // 仅调试用
+										pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
+									}, // 仅调试用
+								); // 仅调试用
 								return terminalComponent._deferredInitializationPromise;
 							}
 
@@ -555,7 +655,27 @@ class TerminalManager {
 							terminalComponent,
 							terminalId,
 						);
+						pushTerminalRestoreDebugLog( // 仅调试用
+							"layout-ready", // 仅调试用
+							{ // 仅调试用
+								terminalId, // 仅调试用
+								terminalName, // 仅调试用
+								pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
+								cols: terminalComponent.terminal?.cols ?? null, // 仅调试用
+								rows: terminalComponent.terminal?.rows ?? null, // 仅调试用
+							}, // 仅调试用
+						); // 仅调试用
 							await terminalComponent.connectToSession(terminalOptions.pid);
+						pushTerminalRestoreDebugLog( // 仅调试用
+							"connect-resolved", // 仅调试用
+							{ // 仅调试用
+								terminalId, // 仅调试用
+								terminalName, // 仅调试用
+								pid: terminalComponent.pid || null, // 仅调试用
+								isConnected: !!terminalComponent.isConnected, // 仅调试用
+								isReconnecting, // 仅调试用
+							}, // 仅调试用
+						); // 仅调试用
 							// Track whether this is a restored (reconnected) session so onProcessExit
 							// can distinguish unexpected exits from a stale previous session vs.
 							// the user intentionally running `exit` in a fresh shell.
@@ -598,11 +718,45 @@ class TerminalManager {
 								component: terminalComponent,
 								file: terminalFile,
 								container: terminalContainer,
+								armDeferredInitialization: () => {
+									terminalComponent._restoreInitializationArmed = true;
+								},
 							};
 
 							terminalFile.onfocus = async () => {
 								try {
+									if (!terminalComponent._restoreInitializationArmed) {
+										pushTerminalRestoreDebugLog( // 仅调试用
+											"onfocus-blocked-until-restore-settled", // 仅调试用
+											{ // 仅调试用
+												terminalId, // 仅调试用
+												terminalName, // 仅调试用
+												pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
+											}, // 仅调试用
+										); // 仅调试用
+										return;
+									}
+									pushTerminalRestoreDebugLog( // 仅调试用
+										"onfocus-begin", // 仅调试用
+										{ // 仅调试用
+											terminalId, // 仅调试用
+											terminalName, // 仅调试用
+											pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
+											hasDeferredPromise: !!terminalComponent._deferredInitializationPromise, // 仅调试用
+										}, // 仅调试用
+									); // 仅调试用
 									const initializedId = await initializeTerminalSession();
+									pushTerminalRestoreDebugLog( // 仅调试用
+										"onfocus-result", // 仅调试用
+										{ // 仅调试用
+											terminalId, // 仅调试用
+											terminalName, // 仅调试用
+											initializedId: initializedId || null, // 仅调试用
+											pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
+											isConnected: !!terminalComponent.isConnected, // 仅调试用
+										}, // 仅调试用
+										initializedId ? "info" : "warn", // 仅调试用
+									); // 仅调试用
 									if (!initializedId) {
 										return;
 									}
@@ -988,7 +1142,57 @@ class TerminalManager {
 			);
 		}
 
-		if (terminalFile._initialLayoutReady) {
+		const hasRenderableTerminalLayout = () => {
+			const outerRect = containerElement.getBoundingClientRect();
+			const innerRect = terminalComponent.container?.getBoundingClientRect();
+
+			return (
+				outerRect.width >= 10 &&
+				outerRect.height >= 10 &&
+				innerRect?.width >= 10 &&
+				innerRect?.height >= 10
+			);
+		};
+
+		const waitForRenderableTerminalLayout = async () => {
+			if (hasRenderableTerminalLayout()) {
+				return;
+			}
+
+			await new Promise((resolve, reject) => {
+				const startTime = Date.now();
+				const pollLayout = () => {
+					if (hasRenderableTerminalLayout()) {
+						resolve();
+						return;
+					}
+
+					// Active tab selection fires before WebView finishes applying the new
+					// tab CSS and xterm's own container catches up. Waiting for the actual
+					// mounted xterm box prevents connectToSession from still seeing 0x0 and
+					// opening Terminal 2/3 on an invisible grid that later paints as black.
+					if (Date.now() - startTime >= 4000) {
+						reject(
+							new Error(
+								`Terminal ${terminalId} xterm container did not become renderable before session connect`,
+							),
+						);
+						return;
+					}
+
+					if (typeof requestAnimationFrame === "function") {
+						requestAnimationFrame(pollLayout);
+						return;
+					}
+
+					setTimeout(pollLayout, 16);
+				};
+
+				pollLayout();
+			});
+		};
+
+		if (terminalFile._initialLayoutReady && hasRenderableTerminalLayout()) {
 			return;
 		}
 
@@ -1027,6 +1231,8 @@ class TerminalManager {
 				}, 4000);
 			}),
 		]);
+
+		await waitForRenderableTerminalLayout();
 	}
 
 	/**
@@ -1041,6 +1247,11 @@ class TerminalManager {
 		terminalId,
 		titlePrefix = terminalId,
 	) {
+		// Reuse a stable display name inside debug-only close logs. The previous
+		// instrumentation referenced an out-of-scope terminalName and crashed the
+		// remove path after uninstall had already started closing tabs.
+		const terminalDisplayName =
+			terminalComponent.terminalDisplayName || terminalFile.filename || titlePrefix;
 		this.setupTerminalResizeObserver(
 			terminalFile,
 			terminalComponent,
@@ -1089,12 +1300,36 @@ class TerminalManager {
 
 		// Handle tab close
 		terminalFile.onclose = () => {
+			pushTerminalRestoreDebugLog( // 仅调试用
+				"tab-onclose", // 仅调试用
+				{ // 仅调试用
+					terminalId, // 仅调试用
+					terminalName: terminalDisplayName, // 仅调试用
+					trigger: consumeTerminalCloseTrigger(terminalFile), // 仅调试用
+				}, // 仅调试用
+				"warn", // 仅调试用
+			); // 仅调试用
 			this.closeTerminal(terminalId);
 		};
 
 		terminalFile._skipTerminalCloseConfirm = false;
 		const originalRemove = terminalFile.remove.bind(terminalFile);
 		terminalFile.remove = async (force = false) => {
+			terminalFile._terminalCloseTrigger = { // 仅调试用
+				type: "remove", // 仅调试用
+				force, // 仅调试用
+				skipConfirm: !!terminalFile._skipTerminalCloseConfirm, // 仅调试用
+				activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
+			}; // 仅调试用
+			pushTerminalRestoreDebugLog( // 仅调试用
+				"tab-remove-request", // 仅调试用
+				{ // 仅调试用
+					terminalId, // 仅调试用
+					terminalName: terminalDisplayName, // 仅调试用
+					trigger: terminalFile._terminalCloseTrigger, // 仅调试用
+				}, // 仅调试用
+				"warn", // 仅调试用
+			); // 仅调试用
 			if (
 				!terminalFile._skipTerminalCloseConfirm &&
 				this.shouldConfirmTerminalClose()
@@ -1118,6 +1353,15 @@ class TerminalManager {
 		};
 
 		terminalComponent.onError = (error) => {
+			pushTerminalRestoreDebugLog( // 仅调试用
+				"component-error", // 仅调试用
+				{ // 仅调试用
+					terminalId, // 仅调试用
+					terminalName: terminalDisplayName, // 仅调试用
+					errorMessage: error?.message || String(error), // 仅调试用
+				}, // 仅调试用
+				"error", // 仅调试用
+			); // 仅调试用
 			console.error(`Terminal ${terminalId} error:`, error);
 
 			// Close the terminal and remove the tab
@@ -1305,6 +1549,18 @@ class TerminalManager {
 		if (!terminal) return;
 
 		try {
+			pushTerminalRestoreDebugLog( // 仅调试用
+				"close-terminal", // 仅调试用
+				{ // 仅调试用
+					terminalId, // 仅调试用
+					terminalName: terminal.name, // 仅调试用
+					removeTab, // 仅调试用
+					pid: terminal.component?.pid || null, // 仅调试用
+					trigger: consumeTerminalCloseTrigger(terminal.file), // 仅调试用
+					activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
+				}, // 仅调试用
+				"warn", // 仅调试用
+			); // 仅调试用
 			if (terminal.component.serverMode && terminal.component.pid) {
 				this.removePersistedSession(terminal.component.pid);
 			}

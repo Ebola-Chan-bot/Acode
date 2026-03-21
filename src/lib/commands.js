@@ -35,11 +35,30 @@ import saveState from "./saveState";
 import appSettings from "./settings";
 import showFileInfo from "./showFileInfo";
 
+const pushTerminalCommandDebugLog = (event, payload = {}, level = "info") => { // 仅调试用
+	if (typeof window === "undefined" || typeof window.__HDC_DEBUG_PUSH !== "function") return; // 仅调试用
+	window.__HDC_DEBUG_PUSH({ // 仅调试用
+		type: "console", // 仅调试用
+		level, // 仅调试用
+		args: ["[terminal-command]", event, payload], // 仅调试用
+		timestamp: Date.now(), // 仅调试用
+	}); // 仅调试用
+}; // 仅调试用
+
 export default {
 	async "run-tests"() {
 		await runAllTests();
 	},
 	async "close-all-tabs"() {
+		pushTerminalCommandDebugLog( // 仅调试用
+			"close-all-tabs", // 仅调试用
+			{ // 仅调试用
+				activeFileId: editorManager.activeFile?.id || null, // 仅调试用
+				fileNames: editorManager.files.map((file) => file.filename), // 仅调试用
+				fileTypes: editorManager.files.map((file) => file.type), // 仅调试用
+			}, // 仅调试用
+			"warn", // 仅调试用
+		); // 仅调试用
 		let save = false;
 		const unsavedFiles = editorManager.files.filter(
 			(file) => file.isUnsaved,
@@ -95,6 +114,15 @@ export default {
 		});
 	},
 	"close-current-tab"() {
+		pushTerminalCommandDebugLog( // 仅调试用
+			"close-current-tab", // 仅调试用
+			{ // 仅调试用
+				activeFileId: editorManager.activeFile?.id || null, // 仅调试用
+				activeFilename: editorManager.activeFile?.filename || null, // 仅调试用
+				activeType: editorManager.activeFile?.type || null, // 仅调试用
+			}, // 仅调试用
+			"warn", // 仅调试用
+		); // 仅调试用
 		editorManager.activeFile.remove();
 	},
 	console() {

@@ -23,6 +23,33 @@ import TerminalTouchSelection from "./terminalTouchSelection";
 
 let terminalEnvironmentGeneration = 0;
 const AXS_READY_MARKER = "__ACODE_AXS_READY__";
+const pushTerminalSessionDebugLog = (event, payload = {}, level = "info") => { // 仅调试用
+	if (typeof window === "undefined" || typeof window.__HDC_DEBUG_PUSH !== "function") return; // 仅调试用
+	window.__HDC_DEBUG_PUSH({ // 仅调试用
+		type: "console", // 仅调试用
+		level, // 仅调试用
+		args: ["[terminal-session]", event, payload], // 仅调试用
+		timestamp: Date.now(), // 仅调试用
+	}); // 仅调试用
+}; // 仅调试用
+
+const sanitizeTerminalDebugPreview = (value) => { // 仅调试用
+	if (typeof value !== "string" || value.length === 0) return ""; // 仅调试用
+	return value // 仅调试用
+		.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "<CSI>") // 仅调试用
+		.replace(/\r/g, "\\r") // 仅调试用
+		.replace(/\n/g, "\\n") // 仅调试用
+		.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, (char) => { // 仅调试用
+			const hex = char.charCodeAt(0).toString(16).padStart(2, "0"); // 仅调试用
+			return `\\x${hex}`; // 仅调试用
+		}); // 仅调试用
+}; // 仅调试用
+
+const summarizeTerminalDebugPreview = (value, limit = 240) => { // 仅调试用
+	const sanitized = sanitizeTerminalDebugPreview(value); // 仅调试用
+	if (sanitized.length <= limit) return sanitized; // 仅调试用
+	return `${sanitized.slice(0, limit)}...`; // 仅调试用
+}; // 仅调试用
 
 class TerminalSessionStaleError extends Error {
 	constructor(message = "Terminal session attempt became stale") {
@@ -76,6 +103,14 @@ export default class TerminalComponent {
 		this._bootstrapOutputSeen = false;
 		this._pendingFocusAfterBootstrap = false;
 		this._visibleLayoutSyncFrame = null;
+		this._visibleLayoutSyncTimeout = null;
+		this._focusLayoutSyncTimeout = null;
+		this._visualViewportSyncHandler = null;
+		this._bootstrapFrameLogCount = 0; // 仅调试用
+		this._bootstrapFrameBytesSeen = 0; // 仅调试用
+		this._sessionProcessSnapshotPromise = null; // 仅调试用
+		this._lastVisibleLayoutSyncReason = "init"; // 仅调试用
+		this._layoutSyncSequence = 0; // 仅调试用
 
 		this.init();
 	}
@@ -296,7 +331,7 @@ export default class TerminalComponent {
 					// once more after the debounced resize settles fixes that late relocation, and
 					// also makes hidden terminals that received MOTD while inactive repaint correctly
 					// when they become the active tab.
-					this.scheduleVisibleLayoutSync();
+					this.scheduleVisibleLayoutSync("resize-settled");
 
 					// Notify touch selection if it exists
 					if (this.touchSelection) {
@@ -553,6 +588,7 @@ export default class TerminalComponent {
 		try {
 			// Open first to ensure a stable renderer is attached
 			this.terminal.open(container);
+			this.bindVisualViewportLayoutSync();
 
 			// Renderer selection: 'canvas' (default core), 'webgl', or 'auto'
 			if (
@@ -1091,6 +1127,22 @@ export default class TerminalComponent {
 		const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
 		this._bootstrapOutputSeen = false;
 		this._pendingFocusAfterBootstrap = false;
+		this._bootstrapFrameLogCount = 0; // 仅调试用
+		this._bootstrapFrameBytesSeen = 0; // 仅调试用
+		this._sessionProcessSnapshotPromise = null; // 仅调试用
+		pushTerminalSessionDebugLog( // 仅调试用
+			"connect-begin", // 仅调试用
+			{ // 仅调试用
+				name: this.terminalDisplayName || null, // 仅调试用
+				pid: pid || null, // 仅调试用
+				isReconnecting, // 仅调试用
+				cols: this.terminal?.cols ?? null, // 仅调试用
+				rows: this.terminal?.rows ?? null, // 仅调试用
+				containerWidth: this.container ? Math.round(this.container.getBoundingClientRect().width) : null, // 仅调试用
+				containerHeight: this.container ? Math.round(this.container.getBoundingClientRect().height) : null, // 仅调试用
+			}, // 仅调试用
+		); // 仅调试用
+		void this.captureSessionProcessSnapshot(); // 仅调试用
 
 		this.websocket = new WebSocket(wsUrl);
 
@@ -1109,6 +1161,14 @@ export default class TerminalComponent {
 
 		this.websocket.onopen = () => {
 			this.isConnected = true;
+			pushTerminalSessionDebugLog( // 仅调试用
+				"websocket-open", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					readyState: this.websocket?.readyState ?? null, // 仅调试用
+				}, // 仅调试用
+			); // 仅调试用
 			this.onConnect?.();
 
 			// Keep the initial PTY size from the session-create POST. Re-focusing here
@@ -1136,10 +1196,6 @@ export default class TerminalComponent {
 		this.websocket.addEventListener("message", async (event) => {
 			this.markBootstrapOutputReady();
 
-			if (this._relocationSniffDisabled) {
-				return;
-			}
-
 			const MAX_SNIFF_BYTES = 4096;
 
 			try {
@@ -1159,6 +1215,31 @@ export default class TerminalComponent {
 				}
 
 				if (!text) {
+					return;
+				}
+
+				if ( // 仅调试用
+					this._bootstrapFrameLogCount < 3 && // 仅调试用
+					this._bootstrapFrameBytesSeen < 768 // 仅调试用
+				) { // 仅调试用
+					this._bootstrapFrameLogCount += 1; // 仅调试用
+					this._bootstrapFrameBytesSeen += text.length; // 仅调试用
+					pushTerminalSessionDebugLog( // 仅调试用
+						"bootstrap-frame", // 仅调试用
+						{ // 仅调试用
+							name: this.terminalDisplayName || null, // 仅调试用
+							pid: this.pid || null, // 仅调试用
+							frameIndex: this._bootstrapFrameLogCount, // 仅调试用
+							byteLength: text.length, // 仅调试用
+							preview: summarizeTerminalDebugPreview(text), // 仅调试用
+							containsPrompt: /root@localhost|[$#]\s*$/.test(text), // 仅调试用
+							containsMotdMarker: /motd|welcome|acode/i.test(text), // 仅调试用
+							dataType: typeof event.data === "string" ? "text" : event.data?.constructor?.name || typeof event.data, // 仅调试用
+						}, // 仅调试用
+					); // 仅调试用
+				} // 仅调试用
+
+				if (this._relocationSniffDisabled) {
 					return;
 				}
 
@@ -1187,6 +1268,62 @@ export default class TerminalComponent {
 			this.onError?.(error);
 		};
 	}
+
+	async captureSessionProcessSnapshot() { // 仅调试用
+		if (!this.serverMode || !this.pid || this._sessionProcessSnapshotPromise) { // 仅调试用
+			return this._sessionProcessSnapshotPromise; // 仅调试用
+		} // 仅调试用
+
+		const executor = window?.Executor?.BackgroundExecutor || window?.Executor; // 仅调试用
+		if (!executor || typeof executor.execute !== "function") { // 仅调试用
+			return null; // 仅调试用
+		} // 仅调试用
+
+		const targetPid = String(this.pid); // 仅调试用
+		const snapshotCommand = [ // 仅调试用
+			`target_pid="${targetPid}"`, // 仅调试用
+			`axs_pid="$(cat "$PREFIX/pid" 2>/dev/null)"`, // 仅调试用
+			`target_ppid="$(awk '{print $4}' "/proc/$target_pid/stat" 2>/dev/null)"`, // 仅调试用
+			`printf "target_pid=%s\\n" "$target_pid"`, // 仅调试用
+			`printf "target_cmd="`, // 仅调试用
+			`[ -r "/proc/$target_pid/cmdline" ] && tr '\\000' ' ' < "/proc/$target_pid/cmdline"`, // 仅调试用
+			`printf "\\ntarget_ppid=%s\\n" "$target_ppid"`, // 仅调试用
+			`printf "parent_cmd="`, // 仅调试用
+			`[ -n "$target_ppid" ] && [ -r "/proc/$target_ppid/cmdline" ] && tr '\\000' ' ' < "/proc/$target_ppid/cmdline"`, // 仅调试用
+			`printf "\\naxs_pid=%s\\n" "$axs_pid"`, // 仅调试用
+			`printf "axs_cmd="`, // 仅调试用
+			`[ -n "$axs_pid" ] && [ -r "/proc/$axs_pid/cmdline" ] && tr '\\000' ' ' < "/proc/$axs_pid/cmdline"`, // 仅调试用
+			`printf "\\n"`, // 仅调试用
+		].join('; '); // 仅调试用
+
+		this._sessionProcessSnapshotPromise = executor // 仅调试用
+			.execute(snapshotCommand, true) // 仅调试用
+			.then((snapshot) => { // 仅调试用
+				pushTerminalSessionDebugLog( // 仅调试用
+					"session-process-snapshot", // 仅调试用
+					{ // 仅调试用
+						name: this.terminalDisplayName || null, // 仅调试用
+						pid: this.pid || null, // 仅调试用
+						snapshot: summarizeTerminalDebugPreview(snapshot, 400), // 仅调试用
+					}, // 仅调试用
+				); // 仅调试用
+				return snapshot; // 仅调试用
+			}) // 仅调试用
+			.catch((error) => { // 仅调试用
+				pushTerminalSessionDebugLog( // 仅调试用
+					"session-process-snapshot-error", // 仅调试用
+					{ // 仅调试用
+						name: this.terminalDisplayName || null, // 仅调试用
+						pid: this.pid || null, // 仅调试用
+						errorMessage: error?.message || String(error), // 仅调试用
+					}, // 仅调试用
+					"warn", // 仅调试用
+				); // 仅调试用
+				return null; // 仅调试用
+			}); // 仅调试用
+
+		return this._sessionProcessSnapshotPromise; // 仅调试用
+	} // 仅调试用
 
 	async syncExistingSessionLayoutBeforeReconnect() {
 		if (!this.serverMode || !this.pid || !this.container) {
@@ -1274,6 +1411,17 @@ export default class TerminalComponent {
 	 * Clear terminal
 	 */
 	clear() {
+		pushTerminalSessionDebugLog( // 仅调试用
+			"terminal-clear", // 仅调试用
+			{ // 仅调试用
+				name: this.terminalDisplayName || null, // 仅调试用
+				pid: this.pid || null, // 仅调试用
+				bootstrapOutputSeen: this._bootstrapOutputSeen, // 仅调试用
+				bufferLength: this.terminal?.buffer?.active?.length ?? null, // 仅调试用
+				viewportY: this.terminal?.buffer?.active?.viewportY ?? null, // 仅调试用
+			}, // 仅调试用
+			"warn", // 仅调试用
+		); // 仅调试用
 		this.terminal.clear();
 	}
 
@@ -1283,17 +1431,22 @@ export default class TerminalComponent {
 		}
 
 		this._bootstrapOutputSeen = true;
-		this.scheduleVisibleLayoutSync();
+		this.scheduleVisibleLayoutSync("bootstrap-output");
 		if (this._pendingFocusAfterBootstrap) {
 			this._pendingFocusAfterBootstrap = false;
 			this.focusWhenReady();
 		}
 	}
 
-	scheduleVisibleLayoutSync() {
+	scheduleVisibleLayoutSync(reason = "unspecified") {
+		this._lastVisibleLayoutSyncReason = reason; // 仅调试用
 		if (this._visibleLayoutSyncFrame !== null) {
 			cancelAnimationFrame?.(this._visibleLayoutSyncFrame);
 			this._visibleLayoutSyncFrame = null;
+		}
+		if (this._visibleLayoutSyncTimeout !== null) {
+			clearTimeout(this._visibleLayoutSyncTimeout);
+			this._visibleLayoutSyncTimeout = null;
 		}
 
 		const runSync = () => {
@@ -1303,10 +1456,62 @@ export default class TerminalComponent {
 
 		if (typeof requestAnimationFrame === "function") {
 			this._visibleLayoutSyncFrame = requestAnimationFrame(runSync);
+		} else {
+			setTimeout(runSync, 0);
+		}
+
+		// The black block can reappear one more frame later when WebView finishes the IME
+		// viewport scroll after xterm already fit to the new height. Run one delayed sync in
+		// the settled layout as well so the relocated xterm layer snaps back into place.
+		this._visibleLayoutSyncTimeout = setTimeout(() => {
+			this._visibleLayoutSyncTimeout = null;
+			this.syncVisibleLayout();
+		}, 180);
+	}
+
+	bindVisualViewportLayoutSync() {
+		if (this._visualViewportSyncHandler) {
 			return;
 		}
 
-		setTimeout(runSync, 0);
+		// ResizeObserver covers the terminal container itself, but Android WebView can apply
+		// an extra visualViewport scroll after the IME animation settles. That late shift is
+		// what leaves the small non-scrollable black block under Terminal 1, so visible-layout
+		// correction must also listen to visualViewport changes directly.
+		this._visualViewportSyncHandler = (event) => {
+			this.scheduleVisibleLayoutSync(`visual-viewport-${event?.type || "unknown"}`); // 仅调试用
+		};
+
+		window.addEventListener("resize", this._visualViewportSyncHandler, {
+			passive: true,
+		});
+		window.visualViewport?.addEventListener(
+			"resize",
+			this._visualViewportSyncHandler,
+			{ passive: true },
+		);
+		window.visualViewport?.addEventListener(
+			"scroll",
+			this._visualViewportSyncHandler,
+			{ passive: true },
+		);
+	}
+
+	unbindVisualViewportLayoutSync() {
+		if (!this._visualViewportSyncHandler) {
+			return;
+		}
+
+		window.removeEventListener("resize", this._visualViewportSyncHandler);
+		window.visualViewport?.removeEventListener(
+			"resize",
+			this._visualViewportSyncHandler,
+		);
+		window.visualViewport?.removeEventListener(
+			"scroll",
+			this._visualViewportSyncHandler,
+		);
+		this._visualViewportSyncHandler = null;
 	}
 
 	syncVisibleLayout() {
@@ -1321,11 +1526,43 @@ export default class TerminalComponent {
 
 		const xtermElement = this.container.querySelector(".xterm");
 		const viewportElement = this.container.querySelector(".xterm-viewport");
+		const xtermRectBefore = xtermElement?.getBoundingClientRect() || null; // 仅调试用
+		const viewportRectBefore = viewportElement?.getBoundingClientRect() || null; // 仅调试用
 		const isViewportRelocated =
 			xtermElement &&
 			Math.abs(xtermElement.getBoundingClientRect().top - rect.top) > 4;
+		const syncSequence = ++this._layoutSyncSequence; // 仅调试用
 
 		this.fit();
+
+		const xtermRectAfter = xtermElement?.getBoundingClientRect() || null; // 仅调试用
+		const viewportRectAfter = viewportElement?.getBoundingClientRect() || null; // 仅调试用
+		const isViewportStillRelocated = // 仅调试用
+			xtermRectAfter && Math.abs(xtermRectAfter.top - rect.top) > 4; // 仅调试用
+
+		if (isViewportRelocated || isViewportStillRelocated) { // 仅调试用
+			pushTerminalSessionDebugLog( // 仅调试用
+				"visible-layout-sync", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
+					syncSequence, // 仅调试用
+					containerTop: Math.round(rect.top), // 仅调试用
+					containerHeight: Math.round(rect.height), // 仅调试用
+					xtermTopBefore: xtermRectBefore ? Math.round(xtermRectBefore.top) : null, // 仅调试用
+					xtermTopAfter: xtermRectAfter ? Math.round(xtermRectAfter.top) : null, // 仅调试用
+					viewportTopBefore: viewportRectBefore ? Math.round(viewportRectBefore.top) : null, // 仅调试用
+					viewportTopAfter: viewportRectAfter ? Math.round(viewportRectAfter.top) : null, // 仅调试用
+					viewportScrollTop: viewportElement?.scrollTop ?? null, // 仅调试用
+					rows: this.terminal?.rows ?? null, // 仅调试用
+					cols: this.terminal?.cols ?? null, // 仅调试用
+					wasRelocated: !!isViewportRelocated, // 仅调试用
+					stillRelocated: !!isViewportStillRelocated, // 仅调试用
+				}, // 仅调试用
+				isViewportStillRelocated ? "warn" : "info", // 仅调试用
+			); // 仅调试用
+		} // 仅调试用
 
 		if (isViewportRelocated) {
 			// When a previously hidden terminal is reactivated with the IME already affecting
@@ -1385,6 +1622,18 @@ export default class TerminalComponent {
 	 */
 	focus() {
 		this.focusTerminalTextareaWithoutScroll();
+		this.scheduleVisibleLayoutSync("focus-immediate");
+		if (this._focusLayoutSyncTimeout !== null) {
+			clearTimeout(this._focusLayoutSyncTimeout);
+		}
+		// Android WebView can apply one more IME-driven viewport shift after the
+		// textarea is already focused. Re-running the visible-layout sync slightly
+		// later catches that final relocation and pulls Terminal 1 back from the
+		// negative top position that leaves the black block at the bottom.
+		this._focusLayoutSyncTimeout = setTimeout(() => {
+			this._focusLayoutSyncTimeout = null;
+			this.scheduleVisibleLayoutSync("focus-delayed");
+		}, 320);
 	}
 
 	/**
@@ -1616,10 +1865,19 @@ export default class TerminalComponent {
 	async terminate() {
 		clearTimeout(this._relocationSniffTimer);
 		this._relocationSniffDisabled = true;
+		if (this._focusLayoutSyncTimeout !== null) {
+			clearTimeout(this._focusLayoutSyncTimeout);
+			this._focusLayoutSyncTimeout = null;
+		}
 		if (this._visibleLayoutSyncFrame !== null) {
 			cancelAnimationFrame?.(this._visibleLayoutSyncFrame);
 			this._visibleLayoutSyncFrame = null;
 		}
+		if (this._visibleLayoutSyncTimeout !== null) {
+			clearTimeout(this._visibleLayoutSyncTimeout);
+			this._visibleLayoutSyncTimeout = null;
+		}
+		this.unbindVisualViewportLayoutSync();
 
 		if (this.websocket) {
 			this.websocket.close();
