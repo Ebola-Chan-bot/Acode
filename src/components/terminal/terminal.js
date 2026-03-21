@@ -51,6 +51,38 @@ const summarizeTerminalDebugPreview = (value, limit = 240) => { // 仅调试用
 	return `${sanitized.slice(0, limit)}...`; // 仅调试用
 }; // 仅调试用
 
+const summarizeTerminalBufferLines = (terminal, maxLines = 3) => { // 仅调试用
+	const buffer = terminal?.buffer?.active; // 仅调试用
+	if (!buffer || typeof buffer.length !== "number") return []; // 仅调试用
+	const start = Math.max(0, buffer.length - maxLines); // 仅调试用
+	const lines = []; // 仅调试用
+	for (let index = start; index < buffer.length; index += 1) { // 仅调试用
+		const line = buffer.getLine(index); // 仅调试用
+		const text = line?.translateToString?.(true) || ""; // 仅调试用
+		lines.push({ // 仅调试用
+			index, // 仅调试用
+			text: summarizeTerminalDebugPreview(text, 160), // 仅调试用
+		}); // 仅调试用
+	} // 仅调试用
+	return lines; // 仅调试用
+}; // 仅调试用
+
+const collectTerminalVisibilitySnapshot = (component) => { // 仅调试用
+	const container = component?.container; // 仅调试用
+	const terminal = component?.terminal; // 仅调试用
+	const rect = container?.getBoundingClientRect?.() || null; // 仅调试用
+	return { // 仅调试用
+		hasOffsetParent: !!container?.offsetParent, // 仅调试用
+		containerWidth: rect ? Math.round(rect.width) : null, // 仅调试用
+		containerHeight: rect ? Math.round(rect.height) : null, // 仅调试用
+		rows: terminal?.rows ?? null, // 仅调试用
+		cols: terminal?.cols ?? null, // 仅调试用
+		bufferLength: terminal?.buffer?.active?.length ?? null, // 仅调试用
+		bufferViewportY: terminal?.buffer?.active?.viewportY ?? null, // 仅调试用
+		bufferTail: summarizeTerminalBufferLines(terminal), // 仅调试用
+	}; // 仅调试用
+}; // 仅调试用
+
 class TerminalSessionStaleError extends Error {
 	constructor(message = "Terminal session attempt became stale") {
 		super(message);
@@ -673,6 +705,17 @@ export default class TerminalComponent {
 			let observedEnvironmentGeneration = terminalEnvironmentGeneration;
 			const ensureAttemptIsStillValid = () => {
 				if (this._isDisposed) {
+					pushTerminalSessionDebugLog( // 仅调试用
+						"session-stale", // 仅调试用
+						{ // 仅调试用
+							name: this.terminalDisplayName || null, // 仅调试用
+							pid: this.pid || null, // 仅调试用
+							reason: "disposed", // 仅调试用
+							observedEnvironmentGeneration, // 仅调试用
+							currentEnvironmentGeneration: terminalEnvironmentGeneration, // 仅调试用
+						}, // 仅调试用
+						"warn", // 仅调试用
+					); // 仅调试用
 					throw new TerminalSessionStaleError();
 				}
 
@@ -681,13 +724,33 @@ export default class TerminalComponent {
 				// this older async flow must fail fast instead of repairing and
 				// tearing down the newer instance underneath it.
 				if (terminalEnvironmentGeneration !== observedEnvironmentGeneration) {
+					pushTerminalSessionDebugLog( // 仅调试用
+						"session-stale", // 仅调试用
+						{ // 仅调试用
+							name: this.terminalDisplayName || null, // 仅调试用
+							pid: this.pid || null, // 仅调试用
+							reason: "environment-generation-changed", // 仅调试用
+							observedEnvironmentGeneration, // 仅调试用
+							currentEnvironmentGeneration: terminalEnvironmentGeneration, // 仅调试用
+						}, // 仅调试用
+						"warn", // 仅调试用
+					); // 仅调试用
 					throw new TerminalSessionStaleError();
 				}
 			};
 
-			const markSharedEnvironmentChanged = () => {
+			const markSharedEnvironmentChanged = (reason = "unspecified") => { // 仅调试用
 				terminalEnvironmentGeneration += 1;
 				observedEnvironmentGeneration = terminalEnvironmentGeneration;
+				pushTerminalSessionDebugLog( // 仅调试用
+					"shared-environment-generation-bump", // 仅调试用
+					{ // 仅调试用
+						name: this.terminalDisplayName || null, // 仅调试用
+						pid: this.pid || null, // 仅调试用
+						reason, // 仅调试用
+						newGeneration: terminalEnvironmentGeneration, // 仅调试用
+					}, // 仅调试用
+				); // 仅调试用
 			};
 
 			// Check if terminal is installed before starting AXS
@@ -882,7 +945,7 @@ export default class TerminalComponent {
 							// Starting/stopping AXS changes the single shared terminal runtime.
 							// Bump the shared-environment generation here so older attempts
 							// fail fast, while this owner continues on the new generation.
-							markSharedEnvironmentChanged();
+							markSharedEnvironmentChanged("startup"); // 仅调试用
 							try {
 								await startAxsAndWaitForReady(false);
 							} catch (startupError) {
@@ -942,7 +1005,7 @@ export default class TerminalComponent {
 					// Repair tears down and rebuilds the shared runtime. Once repair starts,
 					// any older concurrent createSession flow must become stale instead of
 					// continuing with assumptions from the pre-repair environment.
-					markSharedEnvironmentChanged();
+					markSharedEnvironmentChanged("repair"); // 仅调试用
 
 					try {
 						ensureAttemptIsStillValid();
@@ -1028,10 +1091,24 @@ export default class TerminalComponent {
 					throw new Error(`HTTP error! status: ${response.status}`);
 				}
 
-				const data = await response.text();
+				const rawData = await response.text();
+				// 仅调试用: parse JSON response to extract PID and launch_detail
+				// (axs now returns {"pid":N,"launch_detail":"..."} for PTY backend diagnostics)
+				let pid = rawData.trim();
+				let launchDetail = null;
+				if (pid.startsWith("{")) {
+					try {
+						const parsed = JSON.parse(pid);
+						if (parsed.pid != null) {
+							pid = String(parsed.pid);
+							launchDetail = parsed.launch_detail || null;
+						}
+					} catch {}
+				}
 				return {
-					data,
-					ptyOpenError: parsePtyOpenError(data),
+					data: pid,
+					ptyOpenError: parsePtyOpenError(rawData),
+					launchDetail, // 仅调试用
 				};
 			};
 
@@ -1045,7 +1122,7 @@ export default class TerminalComponent {
 				await runSharedEnvironmentOperation("refresh", async () => {
 					// Refresh replaces the shared axs binary/process. Older in-flight
 					// session attempts must stop before they can attach to the old state.
-					markSharedEnvironmentChanged();
+					markSharedEnvironmentChanged("refresh"); // 仅调试用
 
 					try {
 						ensureAttemptIsStillValid();
@@ -1079,6 +1156,13 @@ export default class TerminalComponent {
 			}
 
 			this.pid = sessionResult.data.trim();
+			if (sessionResult.launchDetail) { // 仅调试用
+				pushTerminalSessionDebugLog("launch-detail", { // 仅调试用
+					name: this.terminalDisplayName, // 仅调试用
+					pid: this.pid, // 仅调试用
+					launchDetail: sessionResult.launchDetail, // 仅调试用
+				}); // 仅调试用
+			} // 仅调试用
 			return this.pid;
 		} catch (error) {
 			if (error?.name === "TerminalSessionStaleError") {
@@ -1108,6 +1192,15 @@ export default class TerminalComponent {
 			}
 		} catch (error) {
 			if (error?.name === "TerminalSessionStaleError") {
+				pushTerminalSessionDebugLog( // 仅调试用
+					"connect-stale-return", // 仅调试用
+					{ // 仅调试用
+						name: this.terminalDisplayName || null, // 仅调试用
+						pid: this.pid || pid || null, // 仅调试用
+						isReconnecting, // 仅调试用
+					}, // 仅调试用
+					"warn", // 仅调试用
+				); // 仅调试用
 				return;
 			}
 			throw error;
@@ -1236,6 +1329,23 @@ export default class TerminalComponent {
 							containsMotdMarker: /motd|welcome|acode/i.test(text), // 仅调试用
 							dataType: typeof event.data === "string" ? "text" : event.data?.constructor?.name || typeof event.data, // 仅调试用
 						}, // 仅调试用
+					); // 仅调试用
+				} // 仅调试用
+
+				if ( // 仅调试用
+					this._bootstrapFrameLogCount <= 3 || // 仅调试用
+					/motd|welcome|root@localhost|\[rc:|\[motd:/i.test(text) // 仅调试用
+				) { // 仅调试用
+					pushTerminalSessionDebugLog( // 仅调试用
+						"bootstrap-visibility", // 仅调试用
+						{ // 仅调试用
+							name: this.terminalDisplayName || null, // 仅调试用
+							pid: this.pid || null, // 仅调试用
+							preview: summarizeTerminalDebugPreview(text, 180), // 仅调试用
+							containsMotdMarker: /motd|welcome|acode/i.test(text), // 仅调试用
+							visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+						}, // 仅调试用
+						this.container?.offsetParent ? "info" : "warn", // 仅调试用
 					); // 仅调试用
 				} // 仅调试用
 
@@ -1572,15 +1682,46 @@ export default class TerminalComponent {
 			// black non-scrollable area the user still sees on Terminal 1. Re-anchor both xterm's
 			// logical viewport and the DOM scroller to the live bottom row as soon as the tab is
 			// visible so the rendered layer snaps back into the container immediately.
+			const containerScrollTopBefore = this.container.scrollTop; // 仅调试用
+			// WebView auto-scrolls the nearest scrollable ancestor (even overflow:hidden ones)
+			// to keep the focused xterm textarea visible. This shifts the whole xterm layer
+			// above the container, leaving a black gap at the bottom. Resetting the container's
+			// own scrollTop to 0 snaps the content back into its correct position.
+			this.container.scrollTop = 0;
 			this.terminal.scrollToBottom();
 			if (viewportElement) {
 				viewportElement.scrollTop = viewportElement.scrollHeight;
 			}
+			const containerScrollTopAfter = this.container.scrollTop; // 仅调试用
+			const xtermRectAfterFix = xtermElement?.getBoundingClientRect() || null; // 仅调试用
+			pushTerminalSessionDebugLog( // 仅调试用
+				"visible-layout-relocation-fix", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					containerScrollTopBefore, // 仅调试用
+					containerScrollTopAfter, // 仅调试用
+					xtermTopAfterFix: xtermRectAfterFix ? Math.round(xtermRectAfterFix.top) : null, // 仅调试用
+					containerTop: Math.round(rect.top), // 仅调试用
+					fixedRelocation: xtermRectAfterFix ? Math.abs(xtermRectAfterFix.top - rect.top) <= 4 : null, // 仅调试用
+				}, // 仅调试用
+				"warn", // 仅调试用
+			); // 仅调试用
 		}
 
 		if (this.terminal.rows > 0) {
 			this.terminal.clearTextureAtlas?.();
 			this.terminal.refresh(0, this.terminal.rows - 1);
+			pushTerminalSessionDebugLog( // 仅调试用
+				"visible-layout-buffer-snapshot", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
+					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+				}, // 仅调试用
+				this.container?.offsetParent ? "info" : "warn", // 仅调试用
+			); // 仅调试用
 		}
 	}
 

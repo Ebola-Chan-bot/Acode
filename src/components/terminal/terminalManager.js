@@ -41,6 +41,8 @@ class TerminalManager {
 		this.reservedTerminalNumbers = new Set();
 		this.nextSharedEnvironmentOperationId = 1;
 		this.lastAlertedSharedEnvironmentInterruptionId = null;
+		this.lastAlertedSharedEnvironmentFailureId = null;
+		this.lastHandledSharedEnvironmentFailureId = null;
 	}
 
 	writeSharedEnvironmentNotice(component, message, color = "36") {
@@ -48,18 +50,47 @@ class TerminalManager {
 		component.write(`\x1b[${color}m${message}\x1b[0m\r\n`);
 	}
 
-	createSharedEnvironmentInterruptedError(ownerName, operationTitle, operationId = null) {
+	createSharedEnvironmentInterruptedError(
+		ownerName,
+		operationTitle,
+		operationId = null,
+		options = {},
+	) {
+		const { silent = false, reason = null } = options;
 		const error = new Error(
 			`${ownerName}'s terminal ${operationTitle} was interrupted because that terminal was closed.`,
 		);
 		error.sharedEnvironmentInterrupted = true;
 		error.sharedEnvironmentOperationId = operationId;
+		error.sharedEnvironmentSilent = silent;
+		error.sharedEnvironmentInterruptionReason = reason;
 		return error;
+	}
+
+	createSharedEnvironmentFailureError(
+		type,
+		ownerName,
+		result,
+		operationId = null,
+	) {
+		const operationTitle = this.getSharedEnvironmentOperationTitle(type);
+		const message =
+			result?.error ||
+			`${ownerName}'s terminal ${operationTitle} failed.`;
+		const error = new Error(message);
+		error.sharedEnvironmentFailure = true;
+		error.sharedEnvironmentOperationId = operationId;
+		error.sharedEnvironmentOperationType = type;
+		error.sharedEnvironmentResult = result || null;
 		return error;
 	}
 
 	showSharedEnvironmentInterruptedAlertOnce(error) {
 		if (!error?.sharedEnvironmentInterrupted) {
+			return;
+		}
+
+		if (error?.sharedEnvironmentSilent) {
 			return;
 		}
 
@@ -75,6 +106,82 @@ class TerminalManager {
 		this.lastAlertedSharedEnvironmentInterruptionId =
 			operationId ?? this.lastAlertedSharedEnvironmentInterruptionId;
 		alert(strings["error"], error.message);
+	}
+
+	showSharedEnvironmentFailureAlertOnce(error) {
+		if (!error?.sharedEnvironmentFailure) {
+			return;
+		}
+
+		const operationId = error.sharedEnvironmentOperationId;
+		if (
+			operationId !== null &&
+			operationId !== undefined &&
+			this.lastAlertedSharedEnvironmentFailureId === operationId
+		) {
+			return;
+		}
+
+		this.lastAlertedSharedEnvironmentFailureId =
+			operationId ?? this.lastAlertedSharedEnvironmentFailureId;
+		alert(
+			strings["error"],
+			`Terminal environment setup failed: ${error.message}`,
+		);
+	}
+
+	handleSharedEnvironmentFailure(error, terminalId, terminalName, terminalFile, terminalComponent) {
+		const operationId = error?.sharedEnvironmentOperationId;
+		const failureAlreadyHandled =
+			operationId !== null &&
+			operationId !== undefined &&
+			this.lastHandledSharedEnvironmentFailureId === operationId;
+
+		// The owner terminal can still be outside this.terminals while its first
+		// initialization is in-flight. Clean that transient tab explicitly so a
+		// shared install/download failure does not leave one broken owner tab behind
+		// while every registered terminal is closed via closeAllTerminals().
+		const isRegisteredTerminal = Array.from(this.terminals.values()).some(
+			(terminal) => terminal.file === terminalFile,
+		);
+		if (!isRegisteredTerminal) {
+			try {
+				terminalComponent?.dispose?.();
+			} catch {}
+
+			try {
+				terminalFile._skipTerminalCloseConfirm = true;
+				terminalFile.remove(true);
+			} catch (removeError) {
+				console.error("Error removing failed shared terminal tab:", removeError);
+			}
+		}
+
+		if (!failureAlreadyHandled) {
+			this.lastHandledSharedEnvironmentFailureId =
+				operationId ?? this.lastHandledSharedEnvironmentFailureId;
+			pushTerminalRestoreDebugLog( // 仅调试用
+				"shared-environment-failure", // 仅调试用
+				{ // 仅调试用
+					terminalId, // 仅调试用
+					terminalName, // 仅调试用
+					operationId: operationId ?? null, // 仅调试用
+					operationType: error?.sharedEnvironmentOperationType || null, // 仅调试用
+					message: error?.message || null, // 仅调试用
+				}, // 仅调试用
+				"error", // 仅调试用
+			); // 仅调试用
+
+			// A download/configure failure belongs to the shared terminal environment,
+			// not to a single tab. Closing every terminal immediately prevents the UI
+			// from silently deleting only the owner tab and then letting waiting tabs
+			// restart the same failing install path one by one.
+			this.closeAllTerminals(
+				"Terminal environment setup failed. Closing all terminal tabs...",
+			);
+		}
+
+		this.showSharedEnvironmentFailureAlertOnce(error);
 	}
 
 	getSharedEnvironmentOperationTitle(type) {
@@ -167,6 +274,23 @@ class TerminalManager {
 
 		const runPromise = (async () => await run())();
 		void runPromise.catch(() => {});
+		const sharedPromise = runPromise.then((result) => {
+			// Shared install/repair operations must fail as one unit. If the owner
+			// returns { success: false }, letting waiters continue into their own run()
+			// causes the exact behavior seen in runtime logs: one terminal closes while
+			// the remaining tabs each retry the same broken download/configure flow.
+			if (result?.success === false) {
+				throw this.createSharedEnvironmentFailureError(
+					type,
+					ownerName || "Terminal maintenance",
+					result,
+					operation.id,
+				);
+			}
+
+			return result;
+		});
+		void sharedPromise.catch(() => {});
 
 		operation.interrupt = (error) => {
 			if (operation.interrupted || operation.settled) {
@@ -178,7 +302,7 @@ class TerminalManager {
 		};
 
 		operation.promise = Promise.race([
-			runPromise,
+			sharedPromise,
 			interruptedPromise,
 		]).finally(() => {
 			operation.settled = true;
@@ -214,6 +338,48 @@ class TerminalManager {
 		);
 	}
 
+	async preemptSharedEnvironmentOperationForUninstall(noticeMessage) {
+		const operation = this.sharedEnvironmentOperation;
+		if (!operation) {
+			return;
+		}
+
+		if (operation.type === "uninstall" || operation.type === "uninstall-full") {
+			await operation.promise.catch(() => {});
+			return;
+		}
+
+		const operationTitle = this.getSharedEnvironmentOperationTitle(operation.type);
+		pushTerminalRestoreDebugLog( // 仅调试用
+			"preempt-shared-operation-for-uninstall", // 仅调试用
+			{ // 仅调试用
+				activeOperationId: operation.id, // 仅调试用
+				activeOperationType: operation.type, // 仅调试用
+				activeOperationOwner: operation.ownerName || null, // 仅调试用
+				noticeMessage: noticeMessage || null, // 仅调试用
+			}, // 仅调试用
+			"warn", // 仅调试用
+		); // 仅调试用
+
+		// Uninstall owns the whole shared terminal environment. If the user requests
+		// uninstall while install/startup/repair is still running, treating the in-flight
+		// operation as a normal failure produces a burst of per-tab error dialogs even
+		// though the correct UX is to close every terminal and let uninstall proceed.
+		// Interrupt the shared operation first, mark the interruption as silent, and wait
+		// for the old owner/waiters to tear themselves down before running uninstall.
+		operation.interrupt?.(
+			this.createSharedEnvironmentInterruptedError(
+				operation.ownerName || "Terminal maintenance",
+				operationTitle,
+				operation.id,
+				{ silent: true, reason: "uninstall" },
+			),
+		);
+
+		this.closeAllTerminals(noticeMessage);
+		await operation.promise.catch(() => {});
+	}
+
 	closeAllTerminals(noticeMessage = null) {
 		const terminals = Array.from(this.terminals.entries());
 		pushTerminalRestoreDebugLog( // 仅调试用
@@ -240,14 +406,17 @@ class TerminalManager {
 
 	async uninstallTerminalEnvironment(deleteCache = false) {
 		const type = deleteCache ? "uninstall-full" : "uninstall";
+		const noticeMessage =
+			"Terminal environment is being uninstalled. Closing all terminal tabs...";
+
+		await this.preemptSharedEnvironmentOperationForUninstall(noticeMessage);
+
 		await this.runSharedEnvironmentOperation({
 			type,
 			ownerName: "Settings",
 			ownerTerminalId: null,
 			run: async () => {
-				this.closeAllTerminals(
-					"Terminal environment is being uninstalled. Closing all terminal tabs...",
-				);
+				this.closeAllTerminals(noticeMessage);
 
 				if (deleteCache) {
 					await Terminal.uninstallFull();
@@ -762,6 +931,26 @@ class TerminalManager {
 									}
 									terminalComponent.focusWhenReady();
 								} catch (error) {
+									if (
+										error?.name === "TerminalSessionStaleError" ||
+										error?.sharedEnvironmentInterrupted
+									) {
+										this.closeTerminal(uniqueId, true);
+										this.showSharedEnvironmentInterruptedAlertOnce(error);
+										return;
+									}
+
+									if (error?.sharedEnvironmentFailure) {
+										this.handleSharedEnvironmentFailure(
+											error,
+											terminalId,
+											terminalName,
+											terminalFile,
+											terminalComponent,
+										);
+										return;
+									}
+
 									console.error(
 										`Failed to initialize restored terminal ${uniqueId}:`,
 										error,
@@ -834,6 +1023,18 @@ class TerminalManager {
 							} catch {}
 
 							this.showSharedEnvironmentInterruptedAlertOnce(error);
+							resolve(null);
+							return;
+						}
+
+						if (error?.sharedEnvironmentFailure) {
+							this.handleSharedEnvironmentFailure(
+								error,
+								terminalId,
+								terminalName,
+								terminalFile,
+								terminalComponent,
+							);
 							resolve(null);
 							return;
 						}

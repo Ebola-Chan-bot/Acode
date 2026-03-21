@@ -235,6 +235,7 @@ fi
 
 
 if [ "$#" -eq 0 ]; then
+    echo "[init:normal,pid=$$]" >&2 # 仅调试用
     echo "$$" > "$PREFIX/pid"
     chmod +x "$PREFIX/axs"
 
@@ -314,16 +315,21 @@ PROMPT_COMMAND='_update_prompt_state'
 
 # Source user configs AFTER defaults (so user can override PROMPT_COMMAND)
 if [ -f "$HOME/.bashrc" ]; then
+    echo "[rc:bashrc=y]" >&2 # 仅调试用
     source "$HOME/.bashrc"
 fi
 
 if [ -f /etc/bash/bashrc ]; then
+    echo "[rc:etc=y]" >&2 # 仅调试用
     source /etc/bash/bashrc
 fi
 
 # Display MOTD (only source that reliably runs in proot bash)
 if [ -s /etc/acode_motd ]; then
+    echo "[motd:s=y,sz=$(stat -c%s /etc/acode_motd 2>/dev/null || echo err)]" >&2 # 仅调试用
     cat /etc/acode_motd
+else
+    echo "[motd:s=n,e=$([ -f /etc/acode_motd ] && echo 'empty' || echo 'missing')]" >&2 # 仅调试用
 fi
 
 # Work around proot shebang execution failures for Bash's missing-command hook.
@@ -425,25 +431,36 @@ wait_for_axs_ready() {
     # so stale UI tasks cannot race and kill a newer healthy shared AXS instance.
     for attempt in $(seq 1 100); do
         if wget -q -T 1 -O /dev/null "http://127.0.0.1:8767/status"; then
+            echo "[init:wget-ok,att=$attempt]" >&2 # 仅调试用
             echo "__ACODE_AXS_READY__"
             return 0
         fi
 
-        kill -0 "$axs_pid" 2>/dev/null || return 1
+        if ! kill -0 "$axs_pid" 2>/dev/null; then
+            echo "[init:axs-dead,att=$attempt]" >&2 # 仅调试用
+            return 1
+        fi
         sleep 0.1
     done
 
+    echo "[init:wget-timeout,att=100]" >&2 # 仅调试用
     return 1
 }
 
 #actual source
 #everytime a terminal is started initrc will run
+echo "[init:cp-axs]" >&2 # 仅调试用
 cp -f "$PREFIX/axs" /usr/local/bin/axs
 chmod 755 /usr/local/bin/axs
+echo "[init:exec-axs]" >&2 # 仅调试用
 "/usr/local/bin/axs" -c "bash --rcfile /initrc -i" &
 axs_pid=$!
+echo "[init:axs-pid=$axs_pid]" >&2 # 仅调试用
 wait_for_axs_ready "$axs_pid"
+axs_ready_rc=$? # 仅调试用
+echo "[init:ready-rc=$axs_ready_rc]" >&2 # 仅调试用
 wait "$axs_pid"
+echo "[init:wait-rc=$?]" >&2 # 仅调试用
 
 else
     exec "$@"
