@@ -327,7 +327,11 @@ fi
 # Display MOTD (only source that reliably runs in proot bash)
 if [ -s /etc/acode_motd ]; then
     echo "[motd:s=y,sz=$(stat -c%s /etc/acode_motd 2>/dev/null || echo err)]" >&2 # 仅调试用
+    motd_preview=$(head -c 48 /etc/acode_motd 2>/dev/null | tr '\r\n' '  ') # 仅调试用
+    printf '[motd:preview=%q]\n' "$motd_preview" >&2 # 仅调试用
+    echo "[motd:cat-begin]" >&2 # 仅调试用
     cat /etc/acode_motd
+    echo "[motd:cat-rc=$?]" >&2 # 仅调试用
 else
     echo "[motd:s=n,e=$([ -f /etc/acode_motd ] && echo 'empty' || echo 'missing')]" >&2 # 仅调试用
 fi
@@ -425,11 +429,17 @@ chmod +x "$PREFIX/alpine/initrc"
 wait_for_axs_ready() {
     local axs_pid="$1"
     local attempt=""
+    local axs_cmd_preview="" # 仅调试用
 
     # The frontend now waits for this explicit ready marker instead of blind
     # HTTP polling. Keep the readiness check here, next to the process launch,
     # so stale UI tasks cannot race and kill a newer healthy shared AXS instance.
     for attempt in $(seq 1 100); do
+        if [ "$attempt" = "1" ] || [ "$attempt" = "25" ] || [ "$attempt" = "50" ] || [ "$attempt" = "100" ]; then # 仅调试用
+            axs_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
+            printf '[init:poll,att=%s,pid=%s,cmd=%s]\n' "$attempt" "$axs_pid" "${axs_cmd_preview:-<unreadable>}" >&2 # 仅调试用
+        fi # 仅调试用
+
         if wget -q -T 1 -O /dev/null "http://127.0.0.1:8767/status"; then
             echo "[init:wget-ok,att=$attempt]" >&2 # 仅调试用
             echo "__ACODE_AXS_READY__"
@@ -437,21 +447,56 @@ wait_for_axs_ready() {
         fi
 
         if ! kill -0 "$axs_pid" 2>/dev/null; then
+            axs_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
+            printf '[init:axs-dead-detail,att=%s,pid=%s,cmd=%s]\n' "$attempt" "$axs_pid" "${axs_cmd_preview:-<unreadable>}" >&2 # 仅调试用
             echo "[init:axs-dead,att=$attempt]" >&2 # 仅调试用
             return 1
         fi
         sleep 0.1
     done
 
+    axs_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
+    printf '[init:wget-timeout-detail,pid=%s,cmd=%s]\n' "$axs_pid" "${axs_cmd_preview:-<unreadable>}" >&2 # 仅调试用
     echo "[init:wget-timeout,att=100]" >&2 # 仅调试用
     return 1
 }
 
 #actual source
 #everytime a terminal is started initrc will run
+# A refreshed Alpine rootfs can legitimately miss /usr/local/bin until the first
+# app-managed startup recreates it. The previous copy sequence silently fell
+# through on that missing directory and only surfaced later as a misleading
+# "AXS exited before becoming ready" error even though axs was never launched.
+# Create the target directory explicitly and fail immediately if staging the
+# binary inside the rootfs does not succeed.
 echo "[init:cp-axs]" >&2 # 仅调试用
-cp -f "$PREFIX/axs" /usr/local/bin/axs
-chmod 755 /usr/local/bin/axs
+mkdir_local_bin_error="$(mkdir -p /usr/local/bin 2>&1)" # 仅调试用
+if [ $? -ne 0 ]; then
+    echo "[init:mkdir-local-bin-failed]" >&2 # 仅调试用
+    printf '[init:mkdir-local-bin-error=%s]\n' "$mkdir_local_bin_error" >&2 # 仅调试用
+    ls -ld /usr /usr/local /usr/local/bin 2>&1 >&2 # 仅调试用
+    exit 1
+fi
+cp_axs_error="$(cp -f "$PREFIX/axs" /usr/local/bin/axs 2>&1)" # 仅调试用
+if [ $? -ne 0 ]; then
+    echo "[init:cp-axs-failed]" >&2 # 仅调试用
+    printf '[init:cp-axs-error=%s]\n' "$cp_axs_error" >&2 # 仅调试用
+    ls -l "$PREFIX/axs" 2>&1 >&2 # 仅调试用
+    ls -ld /usr /usr/local /usr/local/bin 2>&1 >&2 # 仅调试用
+    ls -l /usr/local/bin 2>&1 >&2 # 仅调试用
+    exit 1
+fi
+ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
+chmod_axs_error="$(chmod 755 /usr/local/bin/axs 2>&1)" # 仅调试用
+if [ $? -ne 0 ]; then
+    echo "[init:chmod-axs-failed]" >&2 # 仅调试用
+    printf '[init:chmod-axs-error=%s]\n' "$chmod_axs_error" >&2 # 仅调试用
+    stat /usr/local/bin/axs 2>&1 >&2 # 仅调试用
+    mount 2>&1 | grep ' on /usr\| on / ' >&2 # 仅调试用
+    ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
+    exit 1
+fi
+ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
 echo "[init:exec-axs]" >&2 # 仅调试用
 "/usr/local/bin/axs" -c "bash --rcfile /initrc -i" &
 axs_pid=$!
@@ -459,6 +504,8 @@ echo "[init:axs-pid=$axs_pid]" >&2 # 仅调试用
 wait_for_axs_ready "$axs_pid"
 axs_ready_rc=$? # 仅调试用
 echo "[init:ready-rc=$axs_ready_rc]" >&2 # 仅调试用
+axs_wait_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
+printf '[init:wait-begin,pid=%s,cmd=%s]\n' "$axs_pid" "${axs_wait_cmd_preview:-<unreadable>}" >&2 # 仅调试用
 wait "$axs_pid"
 echo "[init:wait-rc=$?]" >&2 # 仅调试用
 

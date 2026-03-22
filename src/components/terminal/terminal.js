@@ -83,6 +83,54 @@ const collectTerminalVisibilitySnapshot = (component) => { // 仅调试用
 	}; // 仅调试用
 }; // 仅调试用
 
+const collectTerminalRenderSnapshot = (component) => { // 仅调试用
+	const container = component?.container; // 仅调试用
+	const terminal = component?.terminal; // 仅调试用
+	const xtermElement = container?.querySelector?.(".xterm") || null; // 仅调试用
+	const screenElement = container?.querySelector?.(".xterm-screen") || null; // 仅调试用
+	const viewportElement = container?.querySelector?.(".xterm-viewport") || null; // 仅调试用
+	const canvases = Array.from(screenElement?.querySelectorAll?.("canvas") || []); // 仅调试用
+	const core = terminal?._core || null; // 仅调试用
+	const renderService = core?._renderService || null; // 仅调试用
+	const dimensions = renderService?.dimensions || null; // 仅调试用
+	const xtermRect = xtermElement?.getBoundingClientRect?.() || null; // 仅调试用
+	const screenRect = screenElement?.getBoundingClientRect?.() || null; // 仅调试用
+	const viewportRect = viewportElement?.getBoundingClientRect?.() || null; // 仅调试用
+	return { // 仅调试用
+		rendererType: renderService?._renderer?.constructor?.name || null, // 仅调试用
+		xtermClientWidth: xtermElement?.clientWidth ?? null, // 仅调试用
+		xtermClientHeight: xtermElement?.clientHeight ?? null, // 仅调试用
+		xtermWidth: xtermRect ? Math.round(xtermRect.width) : null, // 仅调试用
+		xtermHeight: xtermRect ? Math.round(xtermRect.height) : null, // 仅调试用
+		screenClientWidth: screenElement?.clientWidth ?? null, // 仅调试用
+		screenClientHeight: screenElement?.clientHeight ?? null, // 仅调试用
+		screenWidth: screenRect ? Math.round(screenRect.width) : null, // 仅调试用
+		screenHeight: screenRect ? Math.round(screenRect.height) : null, // 仅调试用
+		viewportClientWidth: viewportElement?.clientWidth ?? null, // 仅调试用
+		viewportClientHeight: viewportElement?.clientHeight ?? null, // 仅调试用
+		viewportWidth: viewportRect ? Math.round(viewportRect.width) : null, // 仅调试用
+		viewportHeight: viewportRect ? Math.round(viewportRect.height) : null, // 仅调试用
+		viewportScrollTop: viewportElement?.scrollTop ?? null, // 仅调试用
+		viewportScrollHeight: viewportElement?.scrollHeight ?? null, // 仅调试用
+		bufferBaseY: terminal?.buffer?.active?.baseY ?? null, // 仅调试用
+		bufferCursorY: terminal?.buffer?.active?.cursorY ?? null, // 仅调试用
+		bufferCursorX: terminal?.buffer?.active?.cursorX ?? null, // 仅调试用
+		cssCellWidth: dimensions?.css?.cell?.width ?? null, // 仅调试用
+		cssCellHeight: dimensions?.css?.cell?.height ?? null, // 仅调试用
+		cssCanvasWidth: dimensions?.css?.canvas?.width ?? null, // 仅调试用
+		cssCanvasHeight: dimensions?.css?.canvas?.height ?? null, // 仅调试用
+		deviceCanvasWidth: dimensions?.device?.canvas?.width ?? null, // 仅调试用
+		deviceCanvasHeight: dimensions?.device?.canvas?.height ?? null, // 仅调试用
+		canvasCount: canvases.length, // 仅调试用
+		canvases: canvases.slice(0, 2).map((canvas) => ({ // 仅调试用
+			width: canvas.width, // 仅调试用
+			height: canvas.height, // 仅调试用
+			clientWidth: canvas.clientWidth, // 仅调试用
+			clientHeight: canvas.clientHeight, // 仅调试用
+		})), // 仅调试用
+	}; // 仅调试用
+}; // 仅调试用
+
 class TerminalSessionStaleError extends Error {
 	constructor(message = "Terminal session attempt became stale") {
 		super(message);
@@ -143,6 +191,8 @@ export default class TerminalComponent {
 		this._sessionProcessSnapshotPromise = null; // 仅调试用
 		this._lastVisibleLayoutSyncReason = "init"; // 仅调试用
 		this._layoutSyncSequence = 0; // 仅调试用
+		this._renderEventLogCount = 0; // 仅调试用
+		this._postRefreshStateLogCount = 0; // 仅调试用
 
 		this.init();
 	}
@@ -199,6 +249,25 @@ export default class TerminalComponent {
 		this.terminal.onBell(() => {
 			this.onBell?.();
 		});
+
+		this.terminal.onRender?.((event) => { // 仅调试用
+			if (this._renderEventLogCount >= 8) { // 仅调试用
+				return; // 仅调试用
+			} // 仅调试用
+			this._renderEventLogCount += 1; // 仅调试用
+			pushTerminalSessionDebugLog( // 仅调试用
+				"xterm-render", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					start: event?.start ?? null, // 仅调试用
+					end: event?.end ?? null, // 仅调试用
+					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+					render: collectTerminalRenderSnapshot(this), // 仅调试用
+				}, // 仅调试用
+				this.container?.offsetParent ? "info" : "warn", // 仅调试用
+			); // 仅调试用
+		}); // 仅调试用
 
 		// Handle copy/paste keybindings
 		this.setupCopyPasteHandlers();
@@ -710,6 +779,7 @@ export default class TerminalComponent {
 						{ // 仅调试用
 							name: this.terminalDisplayName || null, // 仅调试用
 							pid: this.pid || null, // 仅调试用
+							initializationAttemptId: this._debugInitializationAttemptId ?? null, // 仅调试用
 							reason: "disposed", // 仅调试用
 							observedEnvironmentGeneration, // 仅调试用
 							currentEnvironmentGeneration: terminalEnvironmentGeneration, // 仅调试用
@@ -729,6 +799,7 @@ export default class TerminalComponent {
 						{ // 仅调试用
 							name: this.terminalDisplayName || null, // 仅调试用
 							pid: this.pid || null, // 仅调试用
+							initializationAttemptId: this._debugInitializationAttemptId ?? null, // 仅调试用
 							reason: "environment-generation-changed", // 仅调试用
 							observedEnvironmentGeneration, // 仅调试用
 							currentEnvironmentGeneration: terminalEnvironmentGeneration, // 仅调试用
@@ -747,6 +818,7 @@ export default class TerminalComponent {
 					{ // 仅调试用
 						name: this.terminalDisplayName || null, // 仅调试用
 						pid: this.pid || null, // 仅调试用
+						initializationAttemptId: this._debugInitializationAttemptId ?? null, // 仅调试用
 						reason, // 仅调试用
 						newGeneration: terminalEnvironmentGeneration, // 仅调试用
 					}, // 仅调试用
@@ -1198,6 +1270,7 @@ export default class TerminalComponent {
 						name: this.terminalDisplayName || null, // 仅调试用
 						pid: this.pid || pid || null, // 仅调试用
 						isReconnecting, // 仅调试用
+						initializationAttemptId: this._debugInitializationAttemptId ?? null, // 仅调试用
 					}, // 仅调试用
 					"warn", // 仅调试用
 				); // 仅调试用
@@ -1271,11 +1344,29 @@ export default class TerminalComponent {
 		};
 
 		this.websocket.onmessage = (event) => {
-			// Handle text messages (exit events)
+			// Exit events can race with hidden-tab bootstrap. Log the exact client-side
+			// visibility/render state at receipt time so backend exit_code=182 can be
+			// separated from UI materialization timing on the next reproduction. 仅调试用
 			if (typeof event.data === "string") {
 				try {
 					const message = JSON.parse(event.data);
 					if (message.type === "exit") {
+						pushTerminalSessionDebugLog( // 仅调试用
+							"process-exit-received", // 仅调试用
+							{ // 仅调试用
+								name: this.terminalDisplayName || null, // 仅调试用
+								pid: this.pid || null, // 仅调试用
+								exitData: message.data || null, // 仅调试用
+								readyState: this.websocket?.readyState ?? null, // 仅调试用
+								bootstrapFrameLogCount: this._bootstrapFrameLogCount ?? null, // 仅调试用
+								bootstrapFrameBytesSeen: this._bootstrapFrameBytesSeen ?? null, // 仅调试用
+								bootstrapOutputReady: !!this._bootstrapOutputReady, // 仅调试用
+								visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+								render: collectTerminalRenderSnapshot(this), // 仅调试用
+							}, // 仅调试用
+							message.data?.exit_code === 0 ? "info" : "warn", // 仅调试用
+						); // 仅调试用
+						void this.captureSessionProcessSnapshot(); // 仅调试用
 						this.onProcessExit?.(message.data);
 						return;
 					}
@@ -1290,6 +1381,7 @@ export default class TerminalComponent {
 			this.markBootstrapOutputReady();
 
 			const MAX_SNIFF_BYTES = 4096;
+			let shouldCapturePostWriteBuffer = false; // 仅调试用
 
 			try {
 				let text = "";
@@ -1336,17 +1428,35 @@ export default class TerminalComponent {
 					this._bootstrapFrameLogCount <= 3 || // 仅调试用
 					/motd|welcome|root@localhost|\[rc:|\[motd:/i.test(text) // 仅调试用
 				) { // 仅调试用
+					shouldCapturePostWriteBuffer = true; // 仅调试用
 					pushTerminalSessionDebugLog( // 仅调试用
 						"bootstrap-visibility", // 仅调试用
 						{ // 仅调试用
 							name: this.terminalDisplayName || null, // 仅调试用
 							pid: this.pid || null, // 仅调试用
 							preview: summarizeTerminalDebugPreview(text, 180), // 仅调试用
+							rawPreview: summarizeTerminalDebugPreview(text, 320), // 仅调试用
 							containsMotdMarker: /motd|welcome|acode/i.test(text), // 仅调试用
 							visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+							render: collectTerminalRenderSnapshot(this), // 仅调试用
 						}, // 仅调试用
 						this.container?.offsetParent ? "info" : "warn", // 仅调试用
 					); // 仅调试用
+				} // 仅调试用
+
+				if (shouldCapturePostWriteBuffer) { // 仅调试用
+					setTimeout(() => { // 仅调试用
+						pushTerminalSessionDebugLog( // 仅调试用
+							"post-write-buffer", // 仅调试用
+							{ // 仅调试用
+								name: this.terminalDisplayName || null, // 仅调试用
+								pid: this.pid || null, // 仅调试用
+								visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+								render: collectTerminalRenderSnapshot(this), // 仅调试用
+							}, // 仅调试用
+							this.container?.offsetParent ? "info" : "warn", // 仅调试用
+						); // 仅调试用
+					}, 0); // 仅调试用
 				} // 仅调试用
 
 				if (this._relocationSniffDisabled) {
@@ -1719,9 +1829,26 @@ export default class TerminalComponent {
 					pid: this.pid || null, // 仅调试用
 					reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
 					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+					render: collectTerminalRenderSnapshot(this), // 仅调试用
 				}, // 仅调试用
 				this.container?.offsetParent ? "info" : "warn", // 仅调试用
 			); // 仅调试用
+			if (this._postRefreshStateLogCount < 8) { // 仅调试用
+				this._postRefreshStateLogCount += 1; // 仅调试用
+				requestAnimationFrame?.(() => { // 仅调试用
+					pushTerminalSessionDebugLog( // 仅调试用
+						"visible-layout-post-refresh", // 仅调试用
+						{ // 仅调试用
+							name: this.terminalDisplayName || null, // 仅调试用
+							pid: this.pid || null, // 仅调试用
+							reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
+							visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+							render: collectTerminalRenderSnapshot(this), // 仅调试用
+						}, // 仅调试用
+						this.container?.offsetParent ? "info" : "warn", // 仅调试用
+					); // 仅调试用
+				}); // 仅调试用
+			} // 仅调试用
 		}
 	}
 
