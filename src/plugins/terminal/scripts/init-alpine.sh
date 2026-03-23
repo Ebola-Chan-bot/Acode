@@ -259,6 +259,17 @@ EOF
     cat <<'EOF' > "$PREFIX/alpine/initrc"
 # Source rc files if they exist
 
+    # Emit an immediate shell-entry marker before any rc sourcing. The current
+    # Terminal 2 failure exits with code 1 before the client sees bootstrap output,
+    # so this line tells us whether bash actually started executing initrc or died
+    # earlier in the exec path. 仅调试用
+    printf '[shell:initrc-enter,pid=%s,ppid=%s,argv0=%q,flags=%q,tty=%q]\n' "$$" "$PPID" "$0" "$-" "$(tty 2>/dev/null || echo no-tty)" >&2 # 仅调试用
+
+    # Keep an EXIT marker paired with the initrc-enter marker so the next repro can
+    # separate "bash never entered initrc" from "bash started and then exited 1
+    # during rc/bootstrap work" without needing logcat or an attached debugger. 仅调试用
+    trap 'shell_exit_rc=$?; printf '\''[shell:initrc-exit,pid=%s,rc=%s,last=%q,tty=%q]\n'\'' "$$" "$shell_exit_rc" "$BASH_COMMAND" "$(tty 2>/dev/null || echo no-tty)" >&2' EXIT # 仅调试用
+
 if [ -f "/etc/profile" ]; then
     source "/etc/profile"
 fi
@@ -329,9 +340,24 @@ if [ -s /etc/acode_motd ]; then
     echo "[motd:s=y,sz=$(stat -c%s /etc/acode_motd 2>/dev/null || echo err)]" >&2 # 仅调试用
     motd_preview=$(head -c 48 /etc/acode_motd 2>/dev/null | tr '\r\n' '  ') # 仅调试用
     printf '[motd:preview=%q]\n' "$motd_preview" >&2 # 仅调试用
+    motd_tty_before=$(tty 2>/dev/null || echo no-tty) # 仅调试用
+    motd_fd0_before=$(readlink /proc/$$/fd/0 2>/dev/null || echo readlink-failed) # 仅调试用
+    motd_fd1_before=$(readlink /proc/$$/fd/1 2>/dev/null || echo readlink-failed) # 仅调试用
+    motd_fd2_before=$(readlink /proc/$$/fd/2 2>/dev/null || echo readlink-failed) # 仅调试用
+    printf '[motd:cat-env,pid=%s,ppid=%s,tty=%q,fd0=%q,fd1=%q,fd2=%q]\n' "$$" "$PPID" "$motd_tty_before" "$motd_fd0_before" "$motd_fd1_before" "$motd_fd2_before" >&2 # 仅调试用
     echo "[motd:cat-begin]" >&2 # 仅调试用
-    cat /etc/acode_motd
-    echo "[motd:cat-rc=$?]" >&2 # 仅调试用
+    motd_cat_err_file="/tmp/acode-motd-cat.$$.err" # 仅调试用
+    rm -f "$motd_cat_err_file" # 仅调试用
+    cat /etc/acode_motd 2>"$motd_cat_err_file" # 仅调试用
+    motd_cat_rc=$? # 仅调试用
+    echo "[motd:cat-rc=$motd_cat_rc]" >&2 # 仅调试用
+    if [ "$motd_cat_rc" -ne 0 ]; then # 仅调试用
+        if [ -s "$motd_cat_err_file" ]; then sed 's/^/[motd:cat-stderr] /' "$motd_cat_err_file" >&2; else echo '[motd:cat-stderr=<empty>]' >&2; fi # 仅调试用
+        ps -o pid=,ppid=,stat=,tty=,cmd= -p "$$" -p "$PPID" 2>/dev/null | sed 's/^/[motd:ps] /' >&2 # 仅调试用
+        stty -a 2>/dev/null | tr '\r\n' '  ' | sed 's/^/[motd:stty] /' >&2 # 仅调试用
+        printf '[motd:cat-post,tty=%q,fd0=%q,fd1=%q,fd2=%q]\n' "$(tty 2>/dev/null || echo no-tty)" "$(readlink /proc/$$/fd/0 2>/dev/null || echo readlink-failed)" "$(readlink /proc/$$/fd/1 2>/dev/null || echo readlink-failed)" "$(readlink /proc/$$/fd/2 2>/dev/null || echo readlink-failed)" >&2 # 仅调试用
+    fi # 仅调试用
+    rm -f "$motd_cat_err_file" # 仅调试用
 else
     echo "[motd:s=n,e=$([ -f /etc/acode_motd ] && echo 'empty' || echo 'missing')]" >&2 # 仅调试用
 fi
@@ -430,6 +456,16 @@ wait_for_axs_ready() {
     local axs_pid="$1"
     local attempt=""
     local axs_cmd_preview="" # 仅调试用
+    local wget_status_body="" # 仅调试用
+    local wget_status_preview="" # 仅调试用
+    local wget_status_error="" # 仅调试用
+    local wget_status_rc_hex="" # 仅调试用
+    local wget_root_body="" # 仅调试用
+    local wget_root_preview="" # 仅调试用
+    local wget_root_error="" # 仅调试用
+    local wget_root_rc_hex="" # 仅调试用
+    local wget_status_rc="0" # 仅调试用
+    local wget_root_rc="0" # 仅调试用
 
     # The frontend now waits for this explicit ready marker instead of blind
     # HTTP polling. Keep the readiness check here, next to the process launch,
@@ -440,11 +476,41 @@ wait_for_axs_ready() {
             printf '[init:poll,att=%s,pid=%s,cmd=%s]\n' "$attempt" "$axs_pid" "${axs_cmd_preview:-<unreadable>}" >&2 # 仅调试用
         fi # 仅调试用
 
-        if wget -q -T 1 -O /dev/null "http://127.0.0.1:8767/status"; then
+        wget_status_body="$(wget -q -T 1 -O - "http://127.0.0.1:8767/status" 2>&1)" # 仅调试用
+        wget_status_rc=$? # 仅调试用
+        wget_status_error="$wget_status_body" # 仅调试用
+        if [ "$wget_status_rc" -eq 0 ]; then
+            wget_status_preview="$(printf '%s' "$wget_status_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
+            # A previous runtime capture timed out while the final logged rc was 0,
+            # which should be impossible in this branch structure. Log the exact
+            # branch entry so the next repro can separate true ready detection from
+            # stream reordering or a stale on-device script. # 仅调试用
+            printf '[init:wget-ready-branch,att=%s,rc=%s,body=%s]\n' "$attempt" "$wget_status_rc" "${wget_status_preview:-<empty>}" >&2 # 仅调试用
             echo "[init:wget-ok,att=$attempt]" >&2 # 仅调试用
+            printf '[init:wget-ok-body,att=%s,body=%s]\n' "$attempt" "${wget_status_preview:-<empty>}" >&2 # 仅调试用
             echo "__ACODE_AXS_READY__"
             return 0
         fi
+
+        # If this ever fires, the shell believed rc was the string 0 but still did
+        # not enter the numeric ready branch above. That would point to hidden bytes
+        # or a shell/runtime mismatch rather than a normal axs startup failure. # 仅调试用
+        if [ "$wget_status_rc" = "0" ]; then
+            wget_status_rc_hex="$(printf '%s' "$wget_status_rc" | od -An -tx1 | tr -d ' \n')" # 仅调试用
+            printf '[init:wget-zero-string-without-ready,att=%s,rc=%s,hex=%s]\n' "$attempt" "$wget_status_rc" "${wget_status_rc_hex:-<empty>}" >&2 # 仅调试用
+        fi # 仅调试用
+
+        if [ "$attempt" = "1" ] || [ "$attempt" = "25" ] || [ "$attempt" = "50" ] || [ "$attempt" = "100" ]; then # 仅调试用
+            wget_status_preview="$(printf '%s' "$wget_status_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
+            printf '[init:wget-status-failed,att=%s,rc=%s,err=%s]\n' "$attempt" "$wget_status_rc" "${wget_status_error:-<empty>}" >&2 # 仅调试用
+            printf '[init:wget-status-body,att=%s,body=%s]\n' "$attempt" "${wget_status_preview:-<empty>}" >&2 # 仅调试用
+            wget_root_body="$(wget -q -T 1 -O - "http://127.0.0.1:8767/" 2>&1)" # 仅调试用
+            wget_root_rc=$? # 仅调试用
+            wget_root_error="$wget_root_body" # 仅调试用
+            wget_root_preview="$(printf '%s' "$wget_root_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
+            printf '[init:wget-root-probe,att=%s,rc=%s,err=%s]\n' "$attempt" "$wget_root_rc" "${wget_root_error:-<empty>}" >&2 # 仅调试用
+            printf '[init:wget-root-body,att=%s,body=%s]\n' "$attempt" "$wget_root_preview" >&2 # 仅调试用
+        fi # 仅调试用
 
         if ! kill -0 "$axs_pid" 2>/dev/null; then
             axs_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
@@ -456,7 +522,17 @@ wait_for_axs_ready() {
     done
 
     axs_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
+    wget_status_preview="$(printf '%s' "$wget_status_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
+    wget_root_preview="$(printf '%s' "$wget_root_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
+    wget_status_rc_hex="$(printf '%s' "$wget_status_rc" | od -An -tx1 | tr -d ' \n')" # 仅调试用
+    wget_root_rc_hex="$(printf '%s' "$wget_root_rc" | od -An -tx1 | tr -d ' \n')" # 仅调试用
     printf '[init:wget-timeout-detail,pid=%s,cmd=%s]\n' "$axs_pid" "${axs_cmd_preview:-<unreadable>}" >&2 # 仅调试用
+    printf '[init:wget-timeout-last-status,rc=%s,err=%s]\n' "$wget_status_rc" "${wget_status_error:-<empty>}" >&2 # 仅调试用
+    printf '[init:wget-timeout-last-status-rc-hex,hex=%s]\n' "${wget_status_rc_hex:-<empty>}" >&2 # 仅调试用
+    printf '[init:wget-timeout-last-status-body,body=%s]\n' "${wget_status_preview:-<empty>}" >&2 # 仅调试用
+    printf '[init:wget-timeout-last-root,rc=%s,err=%s]\n' "$wget_root_rc" "${wget_root_error:-<empty>}" >&2 # 仅调试用
+    printf '[init:wget-timeout-last-root-rc-hex,hex=%s]\n' "${wget_root_rc_hex:-<empty>}" >&2 # 仅调试用
+    printf '[init:wget-timeout-last-root-body,body=%s]\n' "${wget_root_preview:-<empty>}" >&2 # 仅调试用
     echo "[init:wget-timeout,att=100]" >&2 # 仅调试用
     return 1
 }
@@ -478,9 +554,17 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 cp_axs_error="$(cp -f "$PREFIX/axs" /usr/local/bin/axs 2>&1)" # 仅调试用
-if [ $? -ne 0 ]; then
+cp_axs_rc=$? # 仅调试用
+if [ $cp_axs_rc -ne 0 ]; then
+    # Some devices report a failing cp here with an empty stderr payload. Keep
+    # the shell rc plus the pre-exec file state so the next repro can tell
+    # whether we lost the destination entry, hit a permission boundary, or saw
+    # a toolchain-level failure before axs ever launched. 仅调试用
     echo "[init:cp-axs-failed]" >&2 # 仅调试用
+    printf '[init:cp-axs-rc=%s]\n' "$cp_axs_rc" >&2 # 仅调试用
     printf '[init:cp-axs-error=%s]\n' "$cp_axs_error" >&2 # 仅调试用
+    stat "$PREFIX/axs" 2>&1 >&2 # 仅调试用
+    stat /usr/local/bin/axs 2>&1 >&2 # 仅调试用
     ls -l "$PREFIX/axs" 2>&1 >&2 # 仅调试用
     ls -ld /usr /usr/local /usr/local/bin 2>&1 >&2 # 仅调试用
     ls -l /usr/local/bin 2>&1 >&2 # 仅调试用
@@ -489,12 +573,24 @@ fi
 ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
 chmod_axs_error="$(chmod 755 /usr/local/bin/axs 2>&1)" # 仅调试用
 if [ $? -ne 0 ]; then
-    echo "[init:chmod-axs-failed]" >&2 # 仅调试用
+    # After a fresh reinstall, proot can expose / as read-only while still leaving
+    # the copied axs binary executable with its original mode bits. In that case the
+    # chmod syscall fails, but treating that as fatal is wrong because axs was staged
+    # successfully and can still be launched. Only abort when the final file is not
+    # executable; otherwise keep the readonly-rootfs evidence and continue. 仅调试用
+    if [ ! -x /usr/local/bin/axs ]; then
+        echo "[init:chmod-axs-failed]" >&2 # 仅调试用
+        printf '[init:chmod-axs-error=%s]\n' "$chmod_axs_error" >&2 # 仅调试用
+        stat /usr/local/bin/axs 2>&1 >&2 # 仅调试用
+        mount 2>&1 | grep ' on /usr\| on / ' >&2 # 仅调试用
+        ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
+        exit 1
+    fi
+    echo "[init:chmod-axs-skipped-ro-rootfs]" >&2 # 仅调试用
     printf '[init:chmod-axs-error=%s]\n' "$chmod_axs_error" >&2 # 仅调试用
     stat /usr/local/bin/axs 2>&1 >&2 # 仅调试用
     mount 2>&1 | grep ' on /usr\| on / ' >&2 # 仅调试用
     ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
-    exit 1
 fi
 ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
 echo "[init:exec-axs]" >&2 # 仅调试用

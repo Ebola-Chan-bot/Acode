@@ -67,19 +67,63 @@ const summarizeTerminalBufferLines = (terminal, maxLines = 3) => { // 仅调试�
 	return lines; // 仅调试用
 }; // 仅调试用
 
+const summarizeTerminalBufferWindow = (terminal, start, count = 4) => { // 仅调试用
+	const buffer = terminal?.buffer?.active; // 仅调试用
+	if (!buffer || typeof buffer.length !== "number") return []; // 仅调试用
+	const safeStart = Math.max(0, Math.min(start, Math.max(0, buffer.length - 1))); // 仅调试用
+	const safeEnd = Math.min(buffer.length, safeStart + Math.max(0, count)); // 仅调试用
+	const lines = []; // 仅调试用
+	for (let index = safeStart; index < safeEnd; index += 1) { // 仅调试用
+		const line = buffer.getLine(index); // 仅调试用
+		const text = line?.translateToString?.(true) || ""; // 仅调试用
+		lines.push({ // 仅调试用
+			index, // 仅调试用
+			text: summarizeTerminalDebugPreview(text, 160), // 仅调试用
+		}); // 仅调试用
+	} // 仅调试用
+	return lines; // 仅调试用
+}; // 仅调试用
+
+const collectTerminalMotdSnapshot = (terminal) => { // 仅调试用
+	const buffer = terminal?.buffer?.active; // 仅调试用
+	if (!buffer || typeof buffer.length !== "number") return null; // 仅调试用
+	const matches = []; // 仅调试用
+	for (let index = 0; index < buffer.length; index += 1) { // 仅调试用
+		const line = buffer.getLine(index); // 仅调试用
+		const text = line?.translateToString?.(true) || ""; // 仅调试用
+		if (!/Welcome to Alpine Linux in Acode!|Working with packages|apk add <package>|apk del <package>|apk update && apk upgrade/.test(text)) continue; // 仅调试用
+		matches.push({ // 仅调试用
+			index, // 仅调试用
+			text: summarizeTerminalDebugPreview(text, 160), // 仅调试用
+		}); // 仅调试用
+		if (matches.length >= 8) break; // 仅调试用
+	} // 仅调试用
+	return { // 仅调试用
+		matchCount: matches.length, // 仅调试用
+		matches, // 仅调试用
+	}; // 仅调试用
+}; // 仅调试用
+
 const collectTerminalVisibilitySnapshot = (component) => { // 仅调试用
 	const container = component?.container; // 仅调试用
 	const terminal = component?.terminal; // 仅调试用
 	const rect = container?.getBoundingClientRect?.() || null; // 仅调试用
+	const buffer = terminal?.buffer?.active; // 仅调试用
+	const viewportY = buffer?.viewportY ?? null; // 仅调试用
+	const rows = terminal?.rows ?? null; // 仅调试用
 	return { // 仅调试用
 		hasOffsetParent: !!container?.offsetParent, // 仅调试用
 		containerWidth: rect ? Math.round(rect.width) : null, // 仅调试用
 		containerHeight: rect ? Math.round(rect.height) : null, // 仅调试用
-		rows: terminal?.rows ?? null, // 仅调试用
+		rows, // 仅调试用
 		cols: terminal?.cols ?? null, // 仅调试用
-		bufferLength: terminal?.buffer?.active?.length ?? null, // 仅调试用
-		bufferViewportY: terminal?.buffer?.active?.viewportY ?? null, // 仅调试用
+		bufferLength: buffer?.length ?? null, // 仅调试用
+		bufferViewportY: viewportY, // 仅调试用
+		bufferBaseY: buffer?.baseY ?? null, // 仅调试用
 		bufferTail: summarizeTerminalBufferLines(terminal), // 仅调试用
+		viewportHead: viewportY === null ? [] : summarizeTerminalBufferWindow(terminal, viewportY, 4), // 仅调试用
+		viewportTail: viewportY === null || rows === null ? [] : summarizeTerminalBufferWindow(terminal, Math.max(0, viewportY + Math.max(0, rows - 4)), 4), // 仅调试用
+		motd: collectTerminalMotdSnapshot(terminal), // 仅调试用
 	}; // 仅调试用
 }; // 仅调试用
 
@@ -193,6 +237,8 @@ export default class TerminalComponent {
 		this._layoutSyncSequence = 0; // 仅调试用
 		this._renderEventLogCount = 0; // 仅调试用
 		this._postRefreshStateLogCount = 0; // 仅调试用
+		this._wasVisibleOnLastLayoutSync = false;
+		this._webglReactivationRecoveryCount = 0; // 仅调试用
 
 		this.init();
 	}
@@ -1619,6 +1665,55 @@ export default class TerminalComponent {
 		}
 	}
 
+	rebuildWebglRenderer(reason = "unspecified") {
+		if (!this.webglAddon) {
+			return false;
+		}
+
+		try {
+			// Runtime traces showed Terminal 3 reaching a fully visible state with a populated
+			// xterm buffer and a live prompt while the screen still stayed blank. The common factor
+			// is that the tab had just transitioned from hidden to visible under Android WebView,
+			// which can leave the WebGL renderer bound to stale hidden-tab surfaces even after a
+			// normal fit/refresh cycle. Rebuilding the renderer at that exact visibility boundary
+			// keeps the same session and buffer but forces xterm to bind fresh canvases to the live
+			// viewport, which targets the observed root cause directly instead of retrying startup.
+			this.webglAddon.dispose();
+			const addon = new WebglAddon();
+			if (typeof addon.onContextLoss === "function") {
+				addon.onContextLoss(() => this._handleWebglContextLoss());
+			}
+			this.terminal.loadAddon(addon);
+			this.webglAddon = addon;
+			this._webglReactivationRecoveryCount += 1; // 仅调试用
+			pushTerminalSessionDebugLog( // 仅调试用
+				"webgl-reactivation-rebuild", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					reason, // 仅调试用
+					recoveryCount: this._webglReactivationRecoveryCount, // 仅调试用
+					render: collectTerminalRenderSnapshot(this), // 仅调试用
+				}, // 仅调试用
+				"warn", // 仅调试用
+			); // 仅调试用
+			return true;
+		} catch (error) {
+			console.error("Failed to rebuild WebGL renderer:", error);
+			pushTerminalSessionDebugLog( // 仅调试用
+				"webgl-reactivation-rebuild-failed", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					reason, // 仅调试用
+					error: error?.message || String(error), // 仅调试用
+				}, // 仅调试用
+				"error", // 仅调试用
+			); // 仅调试用
+			return false;
+		}
+	}
+
 	/**
 	 * Write line to terminal
 	 * @param {string} data - Data to write
@@ -1748,12 +1843,19 @@ export default class TerminalComponent {
 		const viewportElement = this.container.querySelector(".xterm-viewport");
 		const xtermRectBefore = xtermElement?.getBoundingClientRect() || null; // 仅调试用
 		const viewportRectBefore = viewportElement?.getBoundingClientRect() || null; // 仅调试用
+		const isCurrentlyVisible = !!this.container.offsetParent;
+		const becameVisible =
+			isCurrentlyVisible && !this._wasVisibleOnLastLayoutSync;
+		this._wasVisibleOnLastLayoutSync = isCurrentlyVisible;
 		const isViewportRelocated =
 			xtermElement &&
 			Math.abs(xtermElement.getBoundingClientRect().top - rect.top) > 4;
 		const syncSequence = ++this._layoutSyncSequence; // 仅调试用
 
 		this.fit();
+		if (becameVisible && this.webglAddon) {
+			this.rebuildWebglRenderer("visible-layout-reactivation");
+		}
 
 		const xtermRectAfter = xtermElement?.getBoundingClientRect() || null; // 仅调试用
 		const viewportRectAfter = viewportElement?.getBoundingClientRect() || null; // 仅调试用

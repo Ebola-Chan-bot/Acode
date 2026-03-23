@@ -267,11 +267,13 @@ export default function terminalSettings() {
 					strings.confirm,
 					"Are you sure you want to uninstall the terminal?",
 				);
+				console.warn("[terminal-settings] uninstall-confirmation", { confirmation }); // 仅调试用
 				if (confirmation) {
 					const deleteCache = await confirm(
 						strings.confirm,
 						"Also delete download cache? Keeping it makes re-install faster.",
 					);
+					console.warn("[terminal-settings] uninstall-delete-cache-confirmation", { deleteCache }); // 仅调试用
 					loader.showTitleLoader();
 					TerminalManager.uninstallTerminalEnvironment(deleteCache)
 						.then(() => {
