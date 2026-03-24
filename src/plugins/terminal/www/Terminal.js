@@ -165,6 +165,24 @@ const renderInitAlpineContent = (content, alpineBranch) => {
     return content.replaceAll("__ALPINE_BRANCH__", alpineBranch);
 };
 
+const verifyWrittenInitAlpine = async (filesDir, logger = console.log) => {
+    const initAlpinePath = `${filesDir}/init-alpine.sh`;
+    const initAlpineContent = await Executor.execute(`cat "${initAlpinePath}"`);
+    const hasBashProbe = initAlpineContent.includes("[init:bash-probe-begin]");
+    const hasExecAxs = initAlpineContent.includes("[init:exec-axs]");
+    const lineCount = initAlpineContent.split("\n").length;
+
+    // Recent 182 repros showed wget probe lines from filesDir/init-alpine.sh while the
+    // newer bash probe block was completely missing, even though the packaged asset had
+    // already been updated. Verify the exact runtime script path before launching so we
+    // fail fast on stale or partially-written files instead of diagnosing the wrong file. 
+    logger(`[init:script-verify,bash_probe=${hasBashProbe ? 1 : 0},exec_axs=${hasExecAxs ? 1 : 0},lines=${lineCount},path=${initAlpinePath}]`);
+
+    if (!hasBashProbe || !hasExecAxs) {
+        throw new Error(`Runtime init-alpine verification failed: bashProbe=${hasBashProbe} execAxs=${hasExecAxs} path=${initAlpinePath} lines=${lineCount}`);
+    }
+};
+
 const Terminal = {
     async getDownloadTargets() {
         const arch = await new Promise((resolve, reject) => {
@@ -237,6 +255,7 @@ const Terminal = {
             return new Promise((resolve) => {
                 (async () => {
                     await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
+                    await verifyWrittenInitAlpine(filesDir, logger);
                     await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
                     await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
                     await setExecutable(`${filesDir}/alpine/bin/rm`, true);
@@ -283,6 +302,7 @@ const Terminal = {
             });
         } else {
             await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
+            await verifyWrittenInitAlpine(filesDir, logger);
             await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
             await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
             await setExecutable(`${filesDir}/alpine/bin/rm`, true);
@@ -338,11 +358,11 @@ const Terminal = {
      */
     async install(logger = console.log, err_logger = console.error) {
         return withSharedInstall(logger, err_logger, async (logger, err_logger) => {
-            return this.installInternal(logger, err_logger, false);
+            return this.installInternal(logger, err_logger);
         });
     },
 
-    async installInternal(logger, err_logger, _retried) {
+    async installInternal(logger, err_logger) {
         if (!(await this.isSupported())) {
             return {
                 success: false,
@@ -532,18 +552,8 @@ const Terminal = {
             logger("⚙️  Updating sandbox enviroment...");
             const configureResult = await this.startAxs(true, logger, err_logger);
 
-            // A fresh install can occasionally fail its first configuring boot with a non-zero
-            // exit (for example exit 182) and then succeed immediately on the next configure run
-            // against the same extracted rootfs. Treating that first result as terminal death
-            // makes the owner tab disappear even though the environment is recoverable.
             if (configureResult === true || configureResult?.success === true) {
                 return configureResult;
-            }
-
-            if (!_retried) {
-                logger("🔄  Retrying terminal configuration...");
-                await Executor.execute(`rm -rf "${filesDir}/.configured"`).catch(() => {});
-                return this.installInternal(logger, err_logger, true);
             }
 
             return configureResult || {
@@ -553,15 +563,10 @@ const Terminal = {
 
         } catch (e) {
             err_logger("Installation failed:", e);
-            // Clean up everything so retry starts fresh (including potentially corrupted downloads)
+            // Clean up everything so the next manual attempt starts from a fully fresh state
+            // instead of inheriting partially downloaded or partially extracted artifacts from
+            // the failed run that just produced the diagnostic logs above.
             await Executor.execute(`rm -rf "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/.download-manifest"`).catch(() => {});
-            if (!_retried) {
-                // Retry inside the same shared install run. Calling install() here would re-enter
-                // withSharedInstall() and await the current shared promise, which deadlocks the UI
-                // right after "Retrying installation from scratch..." when extraction/download fails.
-                logger("🔄  Retrying installation from scratch...");
-                return this.installInternal(logger, err_logger, true);
-            }
             return {
                 success: false,
                 error: formatInstallError(e),

@@ -238,6 +238,7 @@ export default class TerminalComponent {
 		this._renderEventLogCount = 0; // 仅调试用
 		this._postRefreshStateLogCount = 0; // 仅调试用
 		this._wasVisibleOnLastLayoutSync = false;
+		this._hiddenBootstrapOutputNeedsVisibleAnchor = false;
 		this._webglReactivationRecoveryCount = 0; // 仅调试用
 
 		this.init();
@@ -1064,27 +1065,7 @@ export default class TerminalComponent {
 							// Bump the shared-environment generation here so older attempts
 							// fail fast, while this owner continues on the new generation.
 							markSharedEnvironmentChanged("startup"); // 仅调试用
-							try {
-								await startAxsAndWaitForReady(false);
-							} catch (startupError) {
-								const startupMessage = String(startupError?.message || "");
-
-								// Freshly bootstrapped proot can occasionally die with exit 182
-								// before init-alpine.sh even starts, then succeed immediately on
-								// the next identical launch. Retry exactly once here so that this
-								// transient cold-start failure is not misreported as installation
-								// failure or escalated into an unnecessary full repair.
-								if (!startupMessage.includes("exit 182")) {
-									throw startupError;
-								}
-
-								writeLifecycleLog(
-									"AXS cold start exited with 182 before readiness; retrying launch once.",
-									true,
-								);
-								ensureAttemptIsStillValid();
-								await startAxsAndWaitForReady(false);
-							}
+							await startAxsAndWaitForReady(false);
 						}
 					});
 					ensureAttemptIsStillValid();
@@ -1428,6 +1409,7 @@ export default class TerminalComponent {
 
 			const MAX_SNIFF_BYTES = 4096;
 			let shouldCapturePostWriteBuffer = false; // 仅调试用
+			const containsBootstrapMarker = /motd|welcome|root@localhost|\[rc:|\[motd:/i; // 仅调试用
 
 			try {
 				let text = "";
@@ -1447,6 +1429,16 @@ export default class TerminalComponent {
 
 				if (!text) {
 					return;
+				}
+
+				// Terminal 1's missing-MOTD repro showed the shell finishing bootstrap while the
+				// tab was hidden by an automatic tab switch. When that happens, xterm keeps the
+				// hidden-tab viewport state and the first visible paint can reopen on stale
+				// scrollback instead of the live prompt/MOTD region. Remember that hidden
+				// bootstrap arrived so the next visible-layout sync can explicitly re-anchor the
+				// viewport once the tab becomes visible again.
+				if (!this.container?.offsetParent && containsBootstrapMarker.test(text)) {
+					this._hiddenBootstrapOutputNeedsVisibleAnchor = true;
 				}
 
 				if ( // 仅调试用
@@ -1472,7 +1464,7 @@ export default class TerminalComponent {
 
 				if ( // 仅调试用
 					this._bootstrapFrameLogCount <= 3 || // 仅调试用
-					/motd|welcome|root@localhost|\[rc:|\[motd:/i.test(text) // 仅调试用
+					containsBootstrapMarker.test(text) // 仅调试用
 				) { // 仅调试用
 					shouldCapturePostWriteBuffer = true; // 仅调试用
 					pushTerminalSessionDebugLog( // 仅调试用
@@ -1861,6 +1853,8 @@ export default class TerminalComponent {
 		const viewportRectAfter = viewportElement?.getBoundingClientRect() || null; // 仅调试用
 		const isViewportStillRelocated = // 仅调试用
 			xtermRectAfter && Math.abs(xtermRectAfter.top - rect.top) > 4; // 仅调试用
+		const shouldAnchorHiddenBootstrapViewport =
+			becameVisible && this._hiddenBootstrapOutputNeedsVisibleAnchor;
 
 		if (isViewportRelocated || isViewportStillRelocated) { // 仅调试用
 			pushTerminalSessionDebugLog( // 仅调试用
@@ -1886,14 +1880,17 @@ export default class TerminalComponent {
 			); // 仅调试用
 		} // 仅调试用
 
-		if (isViewportRelocated) {
+		if (isViewportRelocated || shouldAnchorHiddenBootstrapViewport) {
 			// When a previously hidden terminal is reactivated with the IME already affecting
 			// layout, WebView/xterm can restore the old internal viewport scroll offset before
 			// the new visible height is applied. The runtime trace captured that as xterm.top < 0
 			// while the terminal container itself stayed in place, which is exactly the large
 			// black non-scrollable area the user still sees on Terminal 1. Re-anchor both xterm's
 			// logical viewport and the DOM scroller to the live bottom row as soon as the tab is
-			// visible so the rendered layer snaps back into the container immediately.
+			// visible so the rendered layer snaps back into the container immediately. The same
+			// re-anchor is also required when bootstrap output arrived while the tab was hidden:
+			// otherwise the first visible paint can reuse hidden-tab scrollback and make the
+			// MOTD/prompt region appear missing even though it is already in the buffer.
 			const containerScrollTopBefore = this.container.scrollTop; // 仅调试用
 			// WebView auto-scrolls the nearest scrollable ancestor (even overflow:hidden ones)
 			// to keep the focused xterm textarea visible. This shifts the whole xterm layer
@@ -1906,11 +1903,13 @@ export default class TerminalComponent {
 			}
 			const containerScrollTopAfter = this.container.scrollTop; // 仅调试用
 			const xtermRectAfterFix = xtermElement?.getBoundingClientRect() || null; // 仅调试用
+			this._hiddenBootstrapOutputNeedsVisibleAnchor = false;
 			pushTerminalSessionDebugLog( // 仅调试用
 				"visible-layout-relocation-fix", // 仅调试用
 				{ // 仅调试用
 					name: this.terminalDisplayName || null, // 仅调试用
 					pid: this.pid || null, // 仅调试用
+					anchorHiddenBootstrapViewport: shouldAnchorHiddenBootstrapViewport, // 仅调试用
 					containerScrollTopBefore, // 仅调试用
 					containerScrollTopAfter, // 仅调试用
 					xtermTopAfterFix: xtermRectAfterFix ? Math.round(xtermRectAfterFix.top) : null, // 仅调试用

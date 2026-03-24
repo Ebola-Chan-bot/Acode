@@ -90,4 +90,10 @@ ARGS="$ARGS --link2symlink"
 # context, whereas the crash affects all users on vulnerable kernels.
 ARGS="$ARGS -L"
 
+printf '[sandbox:proot-begin,pid=%s,ppid=%s,proot=%q,loader=%q,loader32=%q,prefix=%q,tmp=%q,args=%q]\n' "$$" "$PPID" "$PROOT" "${PROOT_LOADER:-unset}" "${PROOT_LOADER32:-unset}" "$PREFIX" "${PROOT_TMP_DIR:-unset}" "$ARGS" >&2 # 仅调试用
+ls -l "$PROOT" "$PREFIX/init-alpine.sh" /bin/sh 2>&1 | sed 's/^/[sandbox:ls] /' >&2 # 仅调试用
 $PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
+proot_rc=$? # 仅调试用
+printf '[sandbox:proot-rc=%s,installing=%q,args=%q]\n' "$proot_rc" "$1" "$*" >&2 # 仅调试用
+if [ "$proot_rc" -ne 0 ]; then stat "$PROOT" "$PREFIX/init-alpine.sh" /bin/sh 2>&1 | sed 's/^/[sandbox:stat] /' >&2; fi # 仅调试用
+exit "$proot_rc"

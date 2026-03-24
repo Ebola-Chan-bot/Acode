@@ -346,6 +346,18 @@ if [ -s /etc/acode_motd ]; then
     motd_fd2_before=$(readlink /proc/$$/fd/2 2>/dev/null || echo readlink-failed) # 仅调试用
     printf '[motd:cat-env,pid=%s,ppid=%s,tty=%q,fd0=%q,fd1=%q,fd2=%q]\n' "$$" "$PPID" "$motd_tty_before" "$motd_fd0_before" "$motd_fd1_before" "$motd_fd2_before" >&2 # 仅调试用
     echo "[motd:cat-begin]" >&2 # 仅调试用
+    # 当前有效复现已经证明：同一份 /etc/acode_motd 在非交互 source 与 `bash --rcfile -i -c`
+    # 探针里都能正常输出，但真实终端 child 中直接 `cat` 到当前 stdio 会返回 182 且 stderr 为空。
+    # 这里额外探测“cat 到普通文件”是否成功，用来把问题收敛成“读文件失败”还是“向终端 fd 写失败”。 仅调试用
+    motd_cat_file_probe="/tmp/acode-motd-file-probe.$$.out" # 仅调试用
+    motd_cat_file_err_probe="/tmp/acode-motd-file-probe.$$.err" # 仅调试用
+    rm -f "$motd_cat_file_probe" "$motd_cat_file_err_probe" # 仅调试用
+    cat /etc/acode_motd >"$motd_cat_file_probe" 2>"$motd_cat_file_err_probe" # 仅调试用
+    motd_cat_file_rc=$? # 仅调试用
+    echo "[motd:cat-file-rc=$motd_cat_file_rc]" >&2 # 仅调试用
+    if [ -s "$motd_cat_file_probe" ]; then head -n 2 "$motd_cat_file_probe" | sed 's/^/[motd:cat-file-stdout] /' >&2; else echo '[motd:cat-file-stdout=<empty>]' >&2; fi # 仅调试用
+    if [ -s "$motd_cat_file_err_probe" ]; then sed 's/^/[motd:cat-file-stderr] /' "$motd_cat_file_err_probe" >&2; else echo '[motd:cat-file-stderr=<empty>]' >&2; fi # 仅调试用
+    rm -f "$motd_cat_file_probe" "$motd_cat_file_err_probe" # 仅调试用
     motd_cat_err_file="/tmp/acode-motd-cat.$$.err" # 仅调试用
     rm -f "$motd_cat_err_file" # 仅调试用
     cat /etc/acode_motd 2>"$motd_cat_err_file" # 仅调试用
@@ -593,6 +605,71 @@ if [ $? -ne 0 ]; then
     ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
 fi
 ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
+# 这里在启动 axs 前强制打开后端 terminal tracing，是因为当前“三个终端只有 prompt、没有 MOTD”现象仅靠前端日志已经无法继续区分：到底是 /etc/acode_motd 根本没生成，还是 PTY 已经产出首屏但 WS replay 只回放到了尾部。axs 代码里的 PTY first output / WS replay handshake 日志默认被关闭，不显式打开就永远拿不到下一步诊断所需证据。 仅调试用
+export AXS_TERMINAL_LOG=1 # 仅调试用
+export RUST_LOG=warn # 仅调试用
+# Exit 182 currently lands before initrc emits any marker, which means the failure
+# happens earlier than MOTD generation and is likely in bash exec or loader startup
+# under proot. Probe a minimal non-interactive bash first so the next repro can tell
+# whether bash itself is already broken or only the interactive rcfile/PTy path fails. 仅调试用
+echo "[init:bash-probe-begin]" >&2 # 仅调试用
+printf '[init:bash-probe-path=%s]\n' "$(command -v bash 2>/dev/null || echo missing)" >&2 # 仅调试用
+ls -l /bin/bash 2>&1 | sed 's/^/[init:bash-probe-ls] /' >&2 # 仅调试用
+bash_probe_out_file="/tmp/acode-bash-probe.out" # 仅调试用
+bash_probe_err_file="/tmp/acode-bash-probe.err" # 仅调试用
+rm -f "$bash_probe_out_file" "$bash_probe_err_file" # 仅调试用
+bash --noprofile --norc -c 'printf "[init:bash-probe-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' >"$bash_probe_out_file" 2>"$bash_probe_err_file" # 仅调试用
+bash_probe_rc=$? # 仅调试用
+printf '[init:bash-probe-rc=%s]\n' "$bash_probe_rc" >&2 # 仅调试用
+if [ -s "$bash_probe_out_file" ]; then sed 's/^/[init:bash-probe-stdout] /' "$bash_probe_out_file" >&2; else echo '[init:bash-probe-stdout=<empty>]' >&2; fi # 仅调试用
+if [ -s "$bash_probe_err_file" ]; then sed 's/^/[init:bash-probe-stderr] /' "$bash_probe_err_file" >&2; else echo '[init:bash-probe-stderr=<empty>]' >&2; fi # 仅调试用
+# 现在已经证明 bash 本体和纯交互模式都能起来，但 `--rcfile /initrc -i` 仍然 182 且
+# 连 `shell:initrc-enter` 都没有。下一步先把 `/initrc` 当普通文件验证，避免继续把
+# “文件不可读/不可解析”和“只有 rcfile 机制异常”混在一起。 仅调试用
+ls -l /initrc 2>&1 | sed 's/^/[init:initrc-ls] /' >&2 # 仅调试用
+stat /initrc 2>&1 | sed 's/^/[init:initrc-stat] /' >&2 # 仅调试用
+head -n 6 /initrc 2>&1 | sed 's/^/[init:initrc-head] /' >&2 # 仅调试用
+od -An -tx1 -N 32 /initrc 2>&1 | tr '\n' ' ' | sed 's/^/[init:initrc-hex] /' >&2 # 仅调试用
+printf '\n' >&2 # 仅调试用
+initrc_source_out_file="/tmp/acode-initrc-source.out" # 仅调试用
+initrc_source_err_file="/tmp/acode-initrc-source.err" # 仅调试用
+rm -f "$initrc_source_out_file" "$initrc_source_err_file" # 仅调试用
+bash --noprofile --norc -c '. /initrc; printf "[init:initrc-source-ok,pid=%s,ppid=%s,argv0=%q,flags=%q]\n" "$$" "$PPID" "$0" "$-"' >"$initrc_source_out_file" 2>"$initrc_source_err_file" # 仅调试用
+initrc_source_rc=$? # 仅调试用
+printf '[init:initrc-source-rc=%s]\n' "$initrc_source_rc" >&2 # 仅调试用
+if [ -s "$initrc_source_out_file" ]; then sed 's/^/[init:initrc-source-stdout] /' "$initrc_source_out_file" >&2; else echo '[init:initrc-source-stdout=<empty>]' >&2; fi # 仅调试用
+if [ -s "$initrc_source_err_file" ]; then sed 's/^/[init:initrc-source-stderr] /' "$initrc_source_err_file" >&2; else echo '[init:initrc-source-stderr=<empty>]' >&2; fi # 仅调试用
+# 22:46 的有效复现里最小 bash probe 已经成功，但真正的 `bash --rcfile /initrc -i`
+# 仍然以 182 立即退出且没有 `shell:initrc-enter`。继续把“纯交互 bash 失败”与
+# “只有带 rcfile 的交互 bash 才失败”拆开，否则还会把根因卡在过宽的交互启动区间。 仅调试用
+bash_interactive_out_file="/tmp/acode-bash-interactive.out" # 仅调试用
+bash_interactive_err_file="/tmp/acode-bash-interactive.err" # 仅调试用
+rm -f "$bash_interactive_out_file" "$bash_interactive_err_file" # 仅调试用
+bash --noprofile --norc -i -c 'printf "[init:bash-interactive-ok,pid=%s,ppid=%s,argv0=%q,flags=%q]\n" "$$" "$PPID" "$0" "$-"' >"$bash_interactive_out_file" 2>"$bash_interactive_err_file" # 仅调试用
+bash_interactive_rc=$? # 仅调试用
+printf '[init:bash-interactive-rc=%s]\n' "$bash_interactive_rc" >&2 # 仅调试用
+if [ -s "$bash_interactive_out_file" ]; then sed 's/^/[init:bash-interactive-stdout] /' "$bash_interactive_out_file" >&2; else echo '[init:bash-interactive-stdout=<empty>]' >&2; fi # 仅调试用
+if [ -s "$bash_interactive_err_file" ]; then sed 's/^/[init:bash-interactive-stderr] /' "$bash_interactive_err_file" >&2; else echo '[init:bash-interactive-stderr=<empty>]' >&2; fi # 仅调试用
+bash_rcfile_out_file="/tmp/acode-bash-rcfile.out" # 仅调试用
+bash_rcfile_err_file="/tmp/acode-bash-rcfile.err" # 仅调试用
+rm -f "$bash_rcfile_out_file" "$bash_rcfile_err_file" # 仅调试用
+bash --noprofile --rcfile /initrc -i -c 'printf "[init:bash-rcfile-ok,pid=%s,ppid=%s,argv0=%q,flags=%q]\n" "$$" "$PPID" "$0" "$-"' >"$bash_rcfile_out_file" 2>"$bash_rcfile_err_file" # 仅调试用
+bash_rcfile_rc=$? # 仅调试用
+printf '[init:bash-rcfile-rc=%s]\n' "$bash_rcfile_rc" >&2 # 仅调试用
+if [ -s "$bash_rcfile_out_file" ]; then sed 's/^/[init:bash-rcfile-stdout] /' "$bash_rcfile_out_file" >&2; else echo '[init:bash-rcfile-stdout=<empty>]' >&2; fi # 仅调试用
+if [ -s "$bash_rcfile_err_file" ]; then sed 's/^/[init:bash-rcfile-stderr] /' "$bash_rcfile_err_file" >&2; else echo '[init:bash-rcfile-stderr=<empty>]' >&2; fi # 仅调试用
+if command -v ldd >/dev/null 2>&1; then # 仅调试用
+    bash_ldd_out_file="/tmp/acode-bash-ldd.out" # 仅调试用
+    bash_ldd_err_file="/tmp/acode-bash-ldd.err" # 仅调试用
+    rm -f "$bash_ldd_out_file" "$bash_ldd_err_file" # 仅调试用
+    ldd /bin/bash >"$bash_ldd_out_file" 2>"$bash_ldd_err_file" # 仅调试用
+    bash_ldd_rc=$? # 仅调试用
+    printf '[init:bash-ldd-rc=%s]\n' "$bash_ldd_rc" >&2 # 仅调试用
+    if [ -s "$bash_ldd_out_file" ]; then sed 's/^/[init:bash-ldd-stdout] /' "$bash_ldd_out_file" >&2; else echo '[init:bash-ldd-stdout=<empty>]' >&2; fi # 仅调试用
+    if [ -s "$bash_ldd_err_file" ]; then sed 's/^/[init:bash-ldd-stderr] /' "$bash_ldd_err_file" >&2; else echo '[init:bash-ldd-stderr=<empty>]' >&2; fi # 仅调试用
+else
+    echo '[init:bash-ldd-missing]' >&2 # 仅调试用
+fi
 echo "[init:exec-axs]" >&2 # 仅调试用
 "/usr/local/bin/axs" -c "bash --rcfile /initrc -i" &
 axs_pid=$!
