@@ -264,6 +264,10 @@ EOF
     # so this line tells us whether bash actually started executing initrc or died
     # earlier in the exec path. 仅调试用
     printf '[shell:initrc-enter,pid=%s,ppid=%s,argv0=%q,flags=%q,tty=%q]\n' "$$" "$PPID" "$0" "$-" "$(tty 2>/dev/null || echo no-tty)" >&2 # 仅调试用
+    # 当前复现里真实 PTY 已经出现 prompt，但同阶段的 stderr 探针一个都没有，单看 stderr
+    # 已经无法判断是 initrc 根本没执行，还是 live shell 的 stderr 在 WS/PTY 链路里被吞掉。
+    # 这里补一个直接写进 PTY stdout 的入口标记，下次复现只要看首屏有没有这行就能立刻分流。 仅调试用
+    printf '[shell:initrc-stdout-enter,pid=%s,ppid=%s,argv0=%q,flags=%q,tty=%q]\n' "$$" "$PPID" "$0" "$-" "$(tty 2>/dev/null || echo no-tty)" # 仅调试用
 
     # Keep an EXIT marker paired with the initrc-enter marker so the next repro can
     # separate "bash never entered initrc" from "bash started and then exited 1
@@ -338,6 +342,10 @@ fi
 # Display MOTD (only source that reliably runs in proot bash)
 if [ -s /etc/acode_motd ]; then
     echo "[motd:s=y,sz=$(stat -c%s /etc/acode_motd 2>/dev/null || echo err)]" >&2 # 仅调试用
+    # live shell 里如果这行能显示而后面的 MOTD 文本没显示，问题就不再是 rcfile 未执行，
+    # 而是实际 `cat /etc/acode_motd` 或终端输出链路出了问题。把阶段标记写到 stdout 可以
+    # 直接和首屏内容对齐，比只看 stderr 探针更可靠。 仅调试用
+    printf '[motd:stdout-begin,sz=%s]\n' "$(stat -c%s /etc/acode_motd 2>/dev/null || echo err)" # 仅调试用
     motd_preview=$(head -c 48 /etc/acode_motd 2>/dev/null | tr '\r\n' '  ') # 仅调试用
     printf '[motd:preview=%q]\n' "$motd_preview" >&2 # 仅调试用
     motd_tty_before=$(tty 2>/dev/null || echo no-tty) # 仅调试用
@@ -362,6 +370,7 @@ if [ -s /etc/acode_motd ]; then
     rm -f "$motd_cat_err_file" # 仅调试用
     cat /etc/acode_motd 2>"$motd_cat_err_file" # 仅调试用
     motd_cat_rc=$? # 仅调试用
+    printf '[motd:stdout-end,rc=%s]\n' "$motd_cat_rc" # 仅调试用
     echo "[motd:cat-rc=$motd_cat_rc]" >&2 # 仅调试用
     if [ "$motd_cat_rc" -ne 0 ]; then # 仅调试用
         if [ -s "$motd_cat_err_file" ]; then sed 's/^/[motd:cat-stderr] /' "$motd_cat_err_file" >&2; else echo '[motd:cat-stderr=<empty>]' >&2; fi # 仅调试用
@@ -371,6 +380,7 @@ if [ -s /etc/acode_motd ]; then
     fi # 仅调试用
     rm -f "$motd_cat_err_file" # 仅调试用
 else
+    printf '[motd:stdout-missing,e=%s]\n' "$([ -f /etc/acode_motd ] && echo empty || echo missing)" # 仅调试用
     echo "[motd:s=n,e=$([ -f /etc/acode_motd ] && echo 'empty' || echo 'missing')]" >&2 # 仅调试用
 fi
 

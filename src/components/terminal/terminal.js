@@ -936,6 +936,11 @@ export default class TerminalComponent {
 			const writeLifecycleLog = (message, isError = false) => {
 				const cleanMessage = String(message ?? "").replace(/^(stdout|stderr)\s+/, "");
 				if (cleanMessage) {
+					startupLifecycleOutputSeen = true;
+					if (startupProgressNoticeTimer) {
+						clearTimeout(startupProgressNoticeTimer);
+						startupProgressNoticeTimer = null;
+					}
 					this.terminal.write(
 						`${isError ? "\x1b[31m" : ""}${cleanMessage}\x1b[0m\r\n`,
 					);
@@ -949,10 +954,103 @@ export default class TerminalComponent {
 
 			const runSharedEnvironmentOperation = async (type, run) => {
 				if (this.environmentCoordinator?.runExclusive) {
-					return this.environmentCoordinator.runExclusive({ type, run });
+					return this.environmentCoordinator.runExclusive({
+						type,
+						run: async () => {
+							// Shared startup/repair/refresh owners intentionally bump the terminal
+							// environment generation before waiters resume their own local checks.
+							// Reusing the stale pre-wait generation here makes the waiter abort its
+							// normal connect path, leaving the tab stuck on the transient waiting
+							// screen and forcing the UI to fall back to the internal terminal_N id.
+							observedEnvironmentGeneration = terminalEnvironmentGeneration;
+							return run();
+						},
+					});
 				}
 
 				return run();
+			};
+
+			let startupProgressNoticeTimer = null;
+			let startupLifecycleOutputSeen = false;
+			const clearStartupProgressNoticeTimer = () => {
+				if (startupProgressNoticeTimer) {
+					clearTimeout(startupProgressNoticeTimer);
+					startupProgressNoticeTimer = null;
+				}
+			};
+
+			const showStartupProgressNotice = (message, delayMs = 0) => {
+				clearStartupProgressNoticeTimer();
+				const writeNotice = () => {
+					if (startupLifecycleOutputSeen) {
+						return;
+					}
+					this.terminal.write(`\x1b[36m${message}\x1b[0m\r\n`);
+				};
+
+				// Terminal startup currently waits for the shared AXS/proot bootstrap before
+				// the first lifecycle line arrives. Without an early foreground notice, users
+				// see a long black screen and misread normal startup work as a freeze.
+				if (delayMs <= 0) {
+					writeNotice();
+					return;
+				}
+
+				startupProgressNoticeTimer = setTimeout(() => {
+					startupProgressNoticeTimer = null;
+					writeNotice();
+				}, delayMs);
+			};
+
+			const repairAxsAfterStartupFailure = async () => {
+				// Keep the startup timeout and the follow-up repair inside the same shared
+				// owner flow. Otherwise waiter tabs observe the recoverable ready-timeout as
+				// a terminal-creation failure, show a popup, and remove themselves even
+				// though the owner terminal is still repairing the shared environment.
+				toast("Repairing terminal environment...");
+
+				// Repair tears down and rebuilds the shared runtime. Once repair starts,
+				// any older concurrent createSession flow must become stale instead of
+				// continuing with assumptions from the pre-repair environment.
+				markSharedEnvironmentChanged("repair"); // 仅调试用
+
+				try {
+					ensureAttemptIsStillValid();
+					await Terminal.stopAxs();
+				} catch (_) {
+					/* ignore */
+				}
+
+				const repairOk = await Terminal.startAxs(
+					true,
+					(message) => writeLifecycleLog(message, false),
+					(message) => writeLifecycleLog(message, true),
+				);
+				ensureAttemptIsStillValid();
+				if (!repairOk) {
+					try {
+						ensureAttemptIsStillValid();
+						await Terminal.resetConfigured();
+					} catch (_) {
+						/* ignore */
+					}
+					throw new Error("AXS repair failed");
+				}
+
+				await startAxsAndWaitForReady(false);
+				ensureAttemptIsStillValid();
+
+				if (!(await pollAxs(1))) {
+					ensureAttemptIsStillValid();
+					try {
+						ensureAttemptIsStillValid();
+						await Terminal.resetConfigured();
+					} catch (_) {
+						/* ignore */
+					}
+					throw new Error("Failed to start AXS server after repair attempt");
+				}
 			};
 
 			const syncTerminalLayout = async () => {
@@ -996,6 +1094,12 @@ export default class TerminalComponent {
 				let readyReject;
 				let readySettled = false;
 				let readyTimeoutId = null;
+				startupLifecycleOutputSeen = false;
+				showStartupProgressNotice("Starting terminal environment...");
+				showStartupProgressNotice(
+					"Terminal environment is still starting. Waiting for AXS output...",
+					1500,
+				);
 
 				const readyPromise = new Promise((resolve, reject) => {
 					readyResolve = resolve;
@@ -1040,52 +1144,58 @@ export default class TerminalComponent {
 				);
 
 				if (installing) {
+					clearStartupProgressNoticeTimer();
 					return startResult;
 				}
 
-				await Promise.race([
-					readyPromise,
-					new Promise((_, reject) => {
-						readyTimeoutId = setTimeout(() => {
-							reject(new Error("AXS did not emit a ready event"));
-						}, 15000);
-					}),
-				]);
+				try {
+					await Promise.race([
+						readyPromise,
+						new Promise((_, reject) => {
+							readyTimeoutId = setTimeout(() => {
+								reject(new Error("AXS did not emit a ready event"));
+							}, 15000);
+						}),
+					]);
+				} finally {
+					clearStartupProgressNoticeTimer();
+				}
 			};
 
-			let axsStartupFailed = false;
 			if (!axsRunning) {
-				try {
-					await runSharedEnvironmentOperation("startup", async () => {
-						ensureAttemptIsStillValid();
-						const sharedAxsRunning = await Terminal.isAxsRunning();
-						ensureAttemptIsStillValid();
-						if (!sharedAxsRunning) {
-							// Starting/stopping AXS changes the single shared terminal runtime.
-							// Bump the shared-environment generation here so older attempts
-							// fail fast, while this owner continues on the new generation.
-							markSharedEnvironmentChanged("startup"); // 仅调试用
-							await startAxsAndWaitForReady(false);
-						}
-					});
+				await runSharedEnvironmentOperation("startup", async () => {
 					ensureAttemptIsStillValid();
-				} catch (startupError) {
-					if (
-						startupError?.name === "TerminalSessionStaleError" ||
-						startupError?.sharedEnvironmentInterrupted
-					) {
-						throw startupError;
+					const sharedAxsRunning = await Terminal.isAxsRunning();
+					ensureAttemptIsStillValid();
+					if (sharedAxsRunning) {
+						return;
 					}
-					// AXS process exited before becoming ready (e.g. exit 182 on a fresh
-					// install where the Alpine environment is in a degraded state). Fall
-					// through to the repair path which reinstalls the environment.
-					writeLifecycleLog(
-						`AXS startup failed: ${startupError.message}`,
-						true,
-					);
-					axsStartupFailed = true;
-					ensureAttemptIsStillValid();
-				}
+
+					// Starting/stopping AXS changes the single shared terminal runtime.
+					// Bump the shared-environment generation here so older attempts
+					// fail fast, while this owner continues on the new generation.
+					markSharedEnvironmentChanged("startup"); // 仅调试用
+					try {
+						await startAxsAndWaitForReady(false);
+					} catch (startupError) {
+						if (
+							startupError?.name === "TerminalSessionStaleError" ||
+							startupError?.sharedEnvironmentInterrupted
+						) {
+							throw startupError;
+						}
+						// AXS can miss the ready marker on the first shared startup while the
+						// environment is still degraded. Repair it here so all waiter tabs keep
+						// following the same shared operation instead of surfacing a false UI failure.
+						writeLifecycleLog(
+							`AXS startup failed: ${startupError.message}`,
+							true,
+						);
+						ensureAttemptIsStillValid();
+						await repairAxsAfterStartupFailure();
+					}
+				});
+				ensureAttemptIsStillValid();
 			}
 
 			// Always wait for the HTTP endpoint, even if the PID is already alive.
@@ -1094,54 +1204,13 @@ export default class TerminalComponent {
 			// Cold starts can spend tens of seconds finishing apk work inside proot.
 			// If we repair too early, we kill the first AXS instance just as it becomes
 			// reachable and force an unnecessary reinstall loop.
-			const initialPollRetries = axsRunning && !axsStartupFailed ? 10 : 1;
-			if (axsStartupFailed || !(await pollAxs(initialPollRetries))) {
+			const initialPollRetries = axsRunning ? 10 : 1;
+			if (!(await pollAxs(initialPollRetries))) {
 				ensureAttemptIsStillValid();
 				await runSharedEnvironmentOperation("repair", async () => {
-					// AXS failed to become reachable — attempt auto-repair
-					toast("Repairing terminal environment...");
-
-					// Repair tears down and rebuilds the shared runtime. Once repair starts,
-					// any older concurrent createSession flow must become stale instead of
-					// continuing with assumptions from the pre-repair environment.
-					markSharedEnvironmentChanged("repair"); // 仅调试用
-
-					try {
-						ensureAttemptIsStillValid();
-						await Terminal.stopAxs();
-					} catch (_) {
-						/* ignore */
-					}
-
-					const repairOk = await Terminal.startAxs(
-						true,
-						(message) => writeLifecycleLog(message, false),
-						(message) => writeLifecycleLog(message, true),
-					);
-					ensureAttemptIsStillValid();
-					if (!repairOk) {
-						try {
-							ensureAttemptIsStillValid();
-							await Terminal.resetConfigured();
-						} catch (_) {
-							/* ignore */
-						}
-						throw new Error("AXS repair failed");
-					}
-
-					await startAxsAndWaitForReady(false);
-					ensureAttemptIsStillValid();
-
-					if (!(await pollAxs(1))) {
-						ensureAttemptIsStillValid();
-						try {
-							ensureAttemptIsStillValid();
-							await Terminal.resetConfigured();
-						} catch (_) {
-							/* ignore */
-						}
-						throw new Error("Failed to start AXS server after repair attempt");
-					}
+					// If HTTP still is not reachable after startup, reuse the same repair path
+					// so every concurrent terminal observes one shared outcome instead of racing.
+					await repairAxsAfterStartupFailure();
 				});
 				ensureAttemptIsStillValid();
 			}
@@ -1322,7 +1391,7 @@ export default class TerminalComponent {
 		this._pendingFocusAfterBootstrap = false;
 		this._bootstrapFrameLogCount = 0; // 仅调试用
 		this._bootstrapFrameBytesSeen = 0; // 仅调试用
-		this._sessionProcessSnapshotPromise = null; // 仅调试用
+		this._websocketDebugMessageLogCount = 0; // 仅调试用
 		pushTerminalSessionDebugLog( // 仅调试用
 			"connect-begin", // 仅调试用
 			{ // 仅调试用
@@ -1335,9 +1404,34 @@ export default class TerminalComponent {
 				containerHeight: this.container ? Math.round(this.container.getBoundingClientRect().height) : null, // 仅调试用
 			}, // 仅调试用
 		); // 仅调试用
-		void this.captureSessionProcessSnapshot(); // 仅调试用
 
 		this.websocket = new WebSocket(wsUrl);
+		pushTerminalSessionDebugLog( // 仅调试用
+			"websocket-created", // 仅调试用
+			{ // 仅调试用
+				name: this.terminalDisplayName || null, // 仅调试用
+				pid: this.pid || null, // 仅调试用
+				url: wsUrl, // 仅调试用
+				readyState: this.websocket?.readyState ?? null, // 仅调试用
+				binaryType: this.websocket?.binaryType ?? null, // 仅调试用
+				constructorName: this.websocket?.constructor?.name || null, // 仅调试用
+			}, // 仅调试用
+		); // 仅调试用
+		setTimeout(() => { // 仅调试用
+			if (this.isConnected || this._bootstrapFrameLogCount > 0) return; // 仅调试用
+			pushTerminalSessionDebugLog( // 仅调试用
+				"websocket-pending-without-open", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					readyState: this.websocket?.readyState ?? null, // 仅调试用
+					hasAttachAddon: !!this.attachAddon, // 仅调试用
+					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+					render: collectTerminalRenderSnapshot(this), // 仅调试用
+				}, // 仅调试用
+				"warn", // 仅调试用
+			); // 仅调试用
+		}, 1200); // 仅调试用
 
 		// The backend replays scrollback immediately after the WebSocket upgrade.
 		// If AttachAddon is only installed in onopen, those first binary frames can
@@ -1351,6 +1445,16 @@ export default class TerminalComponent {
 		this.attachAddon = new AttachAddon(this.websocket);
 		this.terminal.loadAddon(this.attachAddon);
 		this.terminal.unicode.activeVersion = "11";
+		this.websocket.addEventListener("open", () => { // 仅调试用
+			pushTerminalSessionDebugLog( // 仅调试用
+				"websocket-open-event", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					readyState: this.websocket?.readyState ?? null, // 仅调试用
+				}, // 仅调试用
+			); // 仅调试用
+		}); // 仅调试用
 
 		this.websocket.onopen = () => {
 			this.isConnected = true;
@@ -1369,6 +1473,32 @@ export default class TerminalComponent {
 			// viewport change can still corrupt the initial prompt layout on restored tabs.
 			// Focus is deferred until bootstrap output is actually visible.
 		};
+
+		this.websocket.addEventListener("message", (event) => { // 仅调试用
+			if (this._websocketDebugMessageLogCount >= 3) return; // 仅调试用
+			this._websocketDebugMessageLogCount += 1; // 仅调试用
+			pushTerminalSessionDebugLog( // 仅调试用
+				"websocket-raw-message", // 仅调试用
+				{ // 仅调试用
+					name: this.terminalDisplayName || null, // 仅调试用
+					pid: this.pid || null, // 仅调试用
+					messageIndex: this._websocketDebugMessageLogCount, // 仅调试用
+					readyState: this.websocket?.readyState ?? null, // 仅调试用
+					dataType: typeof event.data === "string" ? "text" : event.data?.constructor?.name || typeof event.data, // 仅调试用
+					byteLength: typeof event.data === "string"
+						? event.data.length
+						: event.data instanceof ArrayBuffer
+							? event.data.byteLength
+							: event.data instanceof Blob
+								? event.data.size
+								: null, // 仅调试用
+					preview: typeof event.data === "string"
+						? summarizeTerminalDebugPreview(event.data, 180)
+						: "<non-text>", // 仅调试用
+					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+				}, // 仅调试用
+			); // 仅调试用
+		}); // 仅调试用
 
 		this.websocket.onmessage = (event) => {
 			// Exit events can race with hidden-tab bootstrap. Log the exact client-side
@@ -1393,7 +1523,6 @@ export default class TerminalComponent {
 							}, // 仅调试用
 							message.data?.exit_code === 0 ? "info" : "warn", // 仅调试用
 						); // 仅调试用
-						void this.captureSessionProcessSnapshot(); // 仅调试用
 						this.onProcessExit?.(message.data);
 						return;
 					}
@@ -1526,62 +1655,6 @@ export default class TerminalComponent {
 			this.onError?.(error);
 		};
 	}
-
-	async captureSessionProcessSnapshot() { // 仅调试用
-		if (!this.serverMode || !this.pid || this._sessionProcessSnapshotPromise) { // 仅调试用
-			return this._sessionProcessSnapshotPromise; // 仅调试用
-		} // 仅调试用
-
-		const executor = window?.Executor?.BackgroundExecutor || window?.Executor; // 仅调试用
-		if (!executor || typeof executor.execute !== "function") { // 仅调试用
-			return null; // 仅调试用
-		} // 仅调试用
-
-		const targetPid = String(this.pid); // 仅调试用
-		const snapshotCommand = [ // 仅调试用
-			`target_pid="${targetPid}"`, // 仅调试用
-			`axs_pid="$(cat "$PREFIX/pid" 2>/dev/null)"`, // 仅调试用
-			`target_ppid="$(awk '{print $4}' "/proc/$target_pid/stat" 2>/dev/null)"`, // 仅调试用
-			`printf "target_pid=%s\\n" "$target_pid"`, // 仅调试用
-			`printf "target_cmd="`, // 仅调试用
-			`[ -r "/proc/$target_pid/cmdline" ] && tr '\\000' ' ' < "/proc/$target_pid/cmdline"`, // 仅调试用
-			`printf "\\ntarget_ppid=%s\\n" "$target_ppid"`, // 仅调试用
-			`printf "parent_cmd="`, // 仅调试用
-			`[ -n "$target_ppid" ] && [ -r "/proc/$target_ppid/cmdline" ] && tr '\\000' ' ' < "/proc/$target_ppid/cmdline"`, // 仅调试用
-			`printf "\\naxs_pid=%s\\n" "$axs_pid"`, // 仅调试用
-			`printf "axs_cmd="`, // 仅调试用
-			`[ -n "$axs_pid" ] && [ -r "/proc/$axs_pid/cmdline" ] && tr '\\000' ' ' < "/proc/$axs_pid/cmdline"`, // 仅调试用
-			`printf "\\n"`, // 仅调试用
-		].join('; '); // 仅调试用
-
-		this._sessionProcessSnapshotPromise = executor // 仅调试用
-			.execute(snapshotCommand, true) // 仅调试用
-			.then((snapshot) => { // 仅调试用
-				pushTerminalSessionDebugLog( // 仅调试用
-					"session-process-snapshot", // 仅调试用
-					{ // 仅调试用
-						name: this.terminalDisplayName || null, // 仅调试用
-						pid: this.pid || null, // 仅调试用
-						snapshot: summarizeTerminalDebugPreview(snapshot, 400), // 仅调试用
-					}, // 仅调试用
-				); // 仅调试用
-				return snapshot; // 仅调试用
-			}) // 仅调试用
-			.catch((error) => { // 仅调试用
-				pushTerminalSessionDebugLog( // 仅调试用
-					"session-process-snapshot-error", // 仅调试用
-					{ // 仅调试用
-						name: this.terminalDisplayName || null, // 仅调试用
-						pid: this.pid || null, // 仅调试用
-						errorMessage: error?.message || String(error), // 仅调试用
-					}, // 仅调试用
-					"warn", // 仅调试用
-				); // 仅调试用
-				return null; // 仅调试用
-			}); // 仅调试用
-
-		return this._sessionProcessSnapshotPromise; // 仅调试用
-	} // 仅调试用
 
 	async syncExistingSessionLayoutBeforeReconnect() {
 		if (!this.serverMode || !this.pid || !this.container) {

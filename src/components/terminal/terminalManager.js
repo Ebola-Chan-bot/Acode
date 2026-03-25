@@ -443,16 +443,6 @@ class TerminalManager {
 		}
 
 		const operationTitle = this.getSharedEnvironmentOperationTitle(operation.type);
-		pushTerminalRestoreDebugLog( // 仅调试用
-			"preempt-shared-operation-for-uninstall", // 仅调试用
-			{ // 仅调试用
-				activeOperationId: operation.id, // 仅调试用
-				activeOperationType: operation.type, // 仅调试用
-				activeOperationOwner: operation.ownerName || null, // 仅调试用
-				noticeMessage: noticeMessage || null, // 仅调试用
-			}, // 仅调试用
-			"warn", // 仅调试用
-		); // 仅调试用
 
 		// Uninstall owns the whole shared terminal environment. If the user requests
 		// uninstall while install/startup/repair is still running, treating the in-flight
@@ -475,14 +465,6 @@ class TerminalManager {
 
 	closeAllTerminals(noticeMessage = null) {
 		const terminals = Array.from(this.terminals.entries());
-		pushTerminalRestoreDebugLog( // 仅调试用
-			"close-all-terminals", // 仅调试用
-			{ // 仅调试用
-				noticeMessage: noticeMessage || null, // 仅调试用
-				terminalIds: terminals.map(([terminalId]) => terminalId), // 仅调试用
-			}, // 仅调试用
-			"warn", // 仅调试用
-		); // 仅调试用
 
 		for (const [terminalId, terminal] of terminals) {
 			if (noticeMessage) {
@@ -501,17 +483,6 @@ class TerminalManager {
 		const type = deleteCache ? "uninstall-full" : "uninstall";
 		const noticeMessage =
 			"Terminal environment is being uninstalled. Closing all terminal tabs...";
-		// 这里记录 uninstall/full uninstall 的调用栈，是因为 2026-03-23 的 Terminal 2 闪退日志显示 ownerName=Settings、operationType=uninstall-full，但用户明确表示当时不可能主动点了卸载。当前需要先确认是否真由设置页交互触发，还是有别的代码误入该路径，不能继续靠 ownerName 推断来源。 仅调试用
-		pushTerminalRestoreDebugLog( // 仅调试用
-			"uninstall-terminal-environment-invoked", // 仅调试用
-			{ // 仅调试用
-				deleteCache, // 仅调试用
-				type, // 仅调试用
-				callerStack: new Error("terminal uninstall invoked").stack || null, // 仅调试用
-				activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-			}, // 仅调试用
-			"warn", // 仅调试用
-		); // 仅调试用
 
 		await this.preemptSharedEnvironmentOperationForUninstall(noticeMessage);
 
