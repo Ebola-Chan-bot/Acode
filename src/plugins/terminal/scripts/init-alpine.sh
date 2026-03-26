@@ -1,3 +1,6 @@
+# 仅调试用: first-line probe — if this line is ABSENT while proot exits 182,
+# then /bin/sh itself crashed before script execution began (ptrace setup failure).
+echo "[alpine:L1,pid=$$,ppid=$PPID,args=$*]" >&2
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/share/bin:/usr/share/sbin:/usr/local/bin:/usr/local/sbin:/system/bin:/system/xbin:$PREFIX/local/bin
 export HOME=/home
 export TERM=xterm-256color
@@ -145,13 +148,15 @@ if [ -n "$missing_packages" ]; then
         # In proot, persisting APKINDEX may fail with Operation not permitted;
         # install directly without local index cache writes.
         run_apk_step "apk add required-packages" "$repo_mode" apk add --no-cache $missing_packages
-        if [ $? -ne 0 ]; then
+        apk_add_rc=$?
+        if [ "$apk_add_rc" -ne 0 ]; then
             if repair_script_interpreters; then
                 run_apk_step "apk add required-packages after interpreter repair" "$repo_mode" apk add --no-cache $missing_packages
+                apk_add_rc=$?
             fi
         fi
 
-        if [ $? -ne 0 ] && ! required_packages_ready; then
+        if [ "$apk_add_rc" -ne 0 ] && ! required_packages_ready; then
             # The first apk add after a fresh reinstall can transiently die before the
             # payload is fully visible inside proot, then succeed immediately on the
             # next identical invocation against the same repositories. Retry exactly
@@ -159,9 +164,10 @@ if [ -n "$missing_packages" ]; then
             # UI as a fatal "installation failed with exit code 1/182" crash.
             echo -e "\e[33;1m[!] \e[0mapk add failed before required packages became visible; retrying once with ${repo_mode} repositories\e[0m"
             run_apk_step "apk add required-packages retry" "$repo_mode" apk add --no-cache $missing_packages
+            apk_add_rc=$?
         fi
 
-        if [ $? -ne 0 ] && required_packages_ready; then
+        if [ "$apk_add_rc" -ne 0 ] && required_packages_ready; then
             # Under proot, apk may unpack the required payload successfully and then
             # fail only while finalizing its database/trigger scripts because kernel
             # shebang execution is unreliable in this environment after reinstall.
@@ -173,7 +179,7 @@ if [ -n "$missing_packages" ]; then
             break
         fi
 
-        if [ $? -ne 0 ]; then
+        if [ "$apk_add_rc" -ne 0 ]; then
             echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
             continue
         fi
@@ -238,6 +244,7 @@ if [ "$#" -eq 0 ]; then
     echo "[init:normal,pid=$$]" >&2 # 仅调试用
     echo "$$" > "$PREFIX/pid"
     chmod +x "$PREFIX/axs"
+    echo "[init:normal-post-pid]" >&2 # 仅调试用: 到此说明 pid 写入和 chmod 正常
 
     if [ ! -s "$PREFIX/alpine/etc/acode_motd" ]; then
         cat <<EOF > "$PREFIX/alpine/etc/acode_motd"
@@ -259,10 +266,45 @@ EOF
     cat <<'EOF' > "$PREFIX/alpine/initrc"
 # Source rc files if they exist
 
+    # Pure-builtin probe: no forks, no command substitution.
+    # If this line appears in scrollback, bash reached rcfile processing;
+    # if only [axs:tty=y,pgrp=ok] appears, exec(bash) or bash initialization
+    # failed before rcfile was read.  (Terminal 1 rc=182 crash diagnostic) 仅调试用
+    printf '[initrc:L1,pid=%s,ppid=%s]\n' "$$" "$PPID" # 仅调试用
+
+    # 仅调试用: signal 54 forensics — read /proc/self/status signal fields to see
+    # if signal 54 was delivered-and-blocked (SigPnd bit 53). Also read parent
+    # (axs) and grandparent (proot) signal state to trace the signal source.
+    # bit 53 in 16-char hex SigPnd = 3rd char from left, mask 0x2.
+    if [ -f /proc/self/status ]; then
+        _sig_self=$(grep '^Sig' /proc/self/status 2>/dev/null | tr '\n' ' ')
+        _sig_parent=$(grep '^Sig' /proc/$PPID/status 2>/dev/null | tr '\n' ' ')
+        _gpid=$(awk '/^PPid:/{print $2}' /proc/$PPID/status 2>/dev/null)
+        _sig_gparent=$(grep '^Sig' /proc/$_gpid/status 2>/dev/null | tr '\n' ' ')
+        _gp_comm=$(cat /proc/$_gpid/comm 2>/dev/null)
+        _p_comm=$(cat /proc/$PPID/comm 2>/dev/null)
+        printf '[initrc:sig54-forensics,self=%s(%s),parent=%s(%s),grandparent=%s(%s)]\n' \
+            "$$" "$_sig_self" "$PPID" "$_sig_parent" "$_gpid" "$_sig_gparent"
+        printf '[initrc:ancestry,self=%s,parent=%s(%s),grandparent=%s(%s)]\n' \
+            "$$" "$PPID" "$_p_comm" "$_gpid" "$_gp_comm"
+        # Check if signal 54 (bit 53) is pending in self
+        _sigpnd=$(awk '/^SigPnd:/{print $2}' /proc/self/status 2>/dev/null)
+        if [ -n "$_sigpnd" ]; then
+            # Extract 3rd hex char from left (0-indexed: position 2), check bit 1 (mask 0x2)
+            _hex3=$(echo "$_sigpnd" | cut -c3)
+            _val=$(printf '%d' "0x$_hex3" 2>/dev/null || echo 0)
+            if [ $((_val & 2)) -ne 0 ]; then
+                printf '[initrc:sig54-PENDING,sigpnd=%s]\n' "$_sigpnd"
+            else
+                printf '[initrc:sig54-not-pending,sigpnd=%s]\n' "$_sigpnd"
+            fi
+        fi
+    fi # 仅调试用
+
     # Emit an immediate shell-entry marker before any rc sourcing. The current
-    # Terminal 2 failure exits with code 1 before the client sees bootstrap output,
-    # so this line tells us whether bash actually started executing initrc or died
-    # earlier in the exec path. 仅调试用
+    # Terminal 1 crash exits with code 182 before the client sees bootstrap output;
+    # the pure-builtin [initrc:L1] above disambiguates "exec failed" from
+    # "bash started but crashed during rcfile evaluation". 仅调试用
     printf '[shell:initrc-enter,pid=%s,ppid=%s,argv0=%q,flags=%q,tty=%q]\n' "$$" "$PPID" "$0" "$-" "$(tty 2>/dev/null || echo no-tty)" >&2 # 仅调试用
     # 当前复现里真实 PTY 已经出现 prompt，但同阶段的 stderr 探针一个都没有，单看 stderr
     # 已经无法判断是 initrc 根本没执行，还是 live shell 的 stderr 在 WS/PTY 链路里被吞掉。
@@ -339,49 +381,16 @@ if [ -f /etc/bash/bashrc ]; then
     source /etc/bash/bashrc
 fi
 
-# Display MOTD (only source that reliably runs in proot bash)
+# Display MOTD
+# Use shell builtins (read+printf) instead of cat to output MOTD.
+# In proot, external binaries like cat need execve which proot intercepts via ptrace.
+# When a second terminal instance runs concurrently, cat writing to the PTY fd fails
+# with rc=182 (empty stderr). Shell builtins run in-process without execve, bypassing
+# the proot ptrace issue entirely.
 if [ -s /etc/acode_motd ]; then
-    echo "[motd:s=y,sz=$(stat -c%s /etc/acode_motd 2>/dev/null || echo err)]" >&2 # 仅调试用
-    # live shell 里如果这行能显示而后面的 MOTD 文本没显示，问题就不再是 rcfile 未执行，
-    # 而是实际 `cat /etc/acode_motd` 或终端输出链路出了问题。把阶段标记写到 stdout 可以
-    # 直接和首屏内容对齐，比只看 stderr 探针更可靠。 仅调试用
-    printf '[motd:stdout-begin,sz=%s]\n' "$(stat -c%s /etc/acode_motd 2>/dev/null || echo err)" # 仅调试用
-    motd_preview=$(head -c 48 /etc/acode_motd 2>/dev/null | tr '\r\n' '  ') # 仅调试用
-    printf '[motd:preview=%q]\n' "$motd_preview" >&2 # 仅调试用
-    motd_tty_before=$(tty 2>/dev/null || echo no-tty) # 仅调试用
-    motd_fd0_before=$(readlink /proc/$$/fd/0 2>/dev/null || echo readlink-failed) # 仅调试用
-    motd_fd1_before=$(readlink /proc/$$/fd/1 2>/dev/null || echo readlink-failed) # 仅调试用
-    motd_fd2_before=$(readlink /proc/$$/fd/2 2>/dev/null || echo readlink-failed) # 仅调试用
-    printf '[motd:cat-env,pid=%s,ppid=%s,tty=%q,fd0=%q,fd1=%q,fd2=%q]\n' "$$" "$PPID" "$motd_tty_before" "$motd_fd0_before" "$motd_fd1_before" "$motd_fd2_before" >&2 # 仅调试用
-    echo "[motd:cat-begin]" >&2 # 仅调试用
-    # 当前有效复现已经证明：同一份 /etc/acode_motd 在非交互 source 与 `bash --rcfile -i -c`
-    # 探针里都能正常输出，但真实终端 child 中直接 `cat` 到当前 stdio 会返回 182 且 stderr 为空。
-    # 这里额外探测“cat 到普通文件”是否成功，用来把问题收敛成“读文件失败”还是“向终端 fd 写失败”。 仅调试用
-    motd_cat_file_probe="/tmp/acode-motd-file-probe.$$.out" # 仅调试用
-    motd_cat_file_err_probe="/tmp/acode-motd-file-probe.$$.err" # 仅调试用
-    rm -f "$motd_cat_file_probe" "$motd_cat_file_err_probe" # 仅调试用
-    cat /etc/acode_motd >"$motd_cat_file_probe" 2>"$motd_cat_file_err_probe" # 仅调试用
-    motd_cat_file_rc=$? # 仅调试用
-    echo "[motd:cat-file-rc=$motd_cat_file_rc]" >&2 # 仅调试用
-    if [ -s "$motd_cat_file_probe" ]; then head -n 2 "$motd_cat_file_probe" | sed 's/^/[motd:cat-file-stdout] /' >&2; else echo '[motd:cat-file-stdout=<empty>]' >&2; fi # 仅调试用
-    if [ -s "$motd_cat_file_err_probe" ]; then sed 's/^/[motd:cat-file-stderr] /' "$motd_cat_file_err_probe" >&2; else echo '[motd:cat-file-stderr=<empty>]' >&2; fi # 仅调试用
-    rm -f "$motd_cat_file_probe" "$motd_cat_file_err_probe" # 仅调试用
-    motd_cat_err_file="/tmp/acode-motd-cat.$$.err" # 仅调试用
-    rm -f "$motd_cat_err_file" # 仅调试用
-    cat /etc/acode_motd 2>"$motd_cat_err_file" # 仅调试用
-    motd_cat_rc=$? # 仅调试用
-    printf '[motd:stdout-end,rc=%s]\n' "$motd_cat_rc" # 仅调试用
-    echo "[motd:cat-rc=$motd_cat_rc]" >&2 # 仅调试用
-    if [ "$motd_cat_rc" -ne 0 ]; then # 仅调试用
-        if [ -s "$motd_cat_err_file" ]; then sed 's/^/[motd:cat-stderr] /' "$motd_cat_err_file" >&2; else echo '[motd:cat-stderr=<empty>]' >&2; fi # 仅调试用
-        ps -o pid=,ppid=,stat=,tty=,cmd= -p "$$" -p "$PPID" 2>/dev/null | sed 's/^/[motd:ps] /' >&2 # 仅调试用
-        stty -a 2>/dev/null | tr '\r\n' '  ' | sed 's/^/[motd:stty] /' >&2 # 仅调试用
-        printf '[motd:cat-post,tty=%q,fd0=%q,fd1=%q,fd2=%q]\n' "$(tty 2>/dev/null || echo no-tty)" "$(readlink /proc/$$/fd/0 2>/dev/null || echo readlink-failed)" "$(readlink /proc/$$/fd/1 2>/dev/null || echo readlink-failed)" "$(readlink /proc/$$/fd/2 2>/dev/null || echo readlink-failed)" >&2 # 仅调试用
-    fi # 仅调试用
-    rm -f "$motd_cat_err_file" # 仅调试用
-else
-    printf '[motd:stdout-missing,e=%s]\n' "$([ -f /etc/acode_motd ] && echo empty || echo missing)" # 仅调试用
-    echo "[motd:s=n,e=$([ -f /etc/acode_motd ] && echo 'empty' || echo 'missing')]" >&2 # 仅调试用
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line"
+    done < /etc/acode_motd
 fi
 
 # Work around proot shebang execution failures for Bash's missing-command hook.
@@ -473,89 +482,42 @@ if ! grep -q 'PS1=' "$PREFIX/alpine/initrc"; then
 fi
 
 chmod +x "$PREFIX/alpine/initrc"
+echo "[init:normal-post-initrc]" >&2 # 仅调试用: 到此说明 MOTD + initrc heredoc + PS1 + chmod 全部正常
 
 wait_for_axs_ready() {
     local axs_pid="$1"
-    local attempt=""
-    local axs_cmd_preview="" # 仅调试用
-    local wget_status_body="" # 仅调试用
-    local wget_status_preview="" # 仅调试用
-    local wget_status_error="" # 仅调试用
-    local wget_status_rc_hex="" # 仅调试用
-    local wget_root_body="" # 仅调试用
-    local wget_root_preview="" # 仅调试用
-    local wget_root_error="" # 仅调试用
-    local wget_root_rc_hex="" # 仅调试用
-    local wget_status_rc="0" # 仅调试用
-    local wget_root_rc="0" # 仅调试用
 
     # The frontend now waits for this explicit ready marker instead of blind
     # HTTP polling. Keep the readiness check here, next to the process launch,
     # so stale UI tasks cannot race and kill a newer healthy shared AXS instance.
     for attempt in $(seq 1 100); do
-        if [ "$attempt" = "1" ] || [ "$attempt" = "25" ] || [ "$attempt" = "50" ] || [ "$attempt" = "100" ]; then # 仅调试用
-            axs_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
-            printf '[init:poll,att=%s,pid=%s,cmd=%s]\n' "$attempt" "$axs_pid" "${axs_cmd_preview:-<unreadable>}" >&2 # 仅调试用
-        fi # 仅调试用
-
-        wget_status_body="$(wget -q -T 1 -O - "http://127.0.0.1:8767/status" 2>&1)" # 仅调试用
-        wget_status_rc=$? # 仅调试用
-        wget_status_error="$wget_status_body" # 仅调试用
-        if [ "$wget_status_rc" -eq 0 ]; then
-            wget_status_preview="$(printf '%s' "$wget_status_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
-            # A previous runtime capture timed out while the final logged rc was 0,
-            # which should be impossible in this branch structure. Log the exact
-            # branch entry so the next repro can separate true ready detection from
-            # stream reordering or a stale on-device script. # 仅调试用
-            printf '[init:wget-ready-branch,att=%s,rc=%s,body=%s]\n' "$attempt" "$wget_status_rc" "${wget_status_preview:-<empty>}" >&2 # 仅调试用
-            echo "[init:wget-ok,att=$attempt]" >&2 # 仅调试用
-            printf '[init:wget-ok-body,att=%s,body=%s]\n' "$attempt" "${wget_status_preview:-<empty>}" >&2 # 仅调试用
+        # 仅调试用: log each poll attempt to diagnose proot kill -0 false negative.
+        # Root cause hypothesis: proot's virtual PID space hasn't registered the
+        # background child yet when kill -0 runs, falsely reporting it dead while
+        # AXS is actually starting (confirmed: [axs:bind-ok] appears AFTER ready-rc=1).
+        local wget_rc=0 # 仅调试用
+        wget -q -T 1 -O - "http://127.0.0.1:8767/status" >/dev/null 2>&1 || wget_rc=$? # 仅调试用
+        if [ "$wget_rc" -eq 0 ]; then # 仅调试用
+            printf '[init:ready-poll,attempt=%s,wget=0,alive=y]\n' "$attempt" >&2 # 仅调试用
             echo "__ACODE_AXS_READY__"
             return 0
         fi
 
-        # If this ever fires, the shell believed rc was the string 0 but still did
-        # not enter the numeric ready branch above. That would point to hidden bytes
-        # or a shell/runtime mismatch rather than a normal axs startup failure. # 仅调试用
-        if [ "$wget_status_rc" = "0" ]; then
-            wget_status_rc_hex="$(printf '%s' "$wget_status_rc" | od -An -tx1 | tr -d ' \n')" # 仅调试用
-            printf '[init:wget-zero-string-without-ready,att=%s,rc=%s,hex=%s]\n' "$attempt" "$wget_status_rc" "${wget_status_rc_hex:-<empty>}" >&2 # 仅调试用
-        fi # 仅调试用
-
-        if [ "$attempt" = "1" ] || [ "$attempt" = "25" ] || [ "$attempt" = "50" ] || [ "$attempt" = "100" ]; then # 仅调试用
-            wget_status_preview="$(printf '%s' "$wget_status_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
-            printf '[init:wget-status-failed,att=%s,rc=%s,err=%s]\n' "$attempt" "$wget_status_rc" "${wget_status_error:-<empty>}" >&2 # 仅调试用
-            printf '[init:wget-status-body,att=%s,body=%s]\n' "$attempt" "${wget_status_preview:-<empty>}" >&2 # 仅调试用
-            wget_root_body="$(wget -q -T 1 -O - "http://127.0.0.1:8767/" 2>&1)" # 仅调试用
-            wget_root_rc=$? # 仅调试用
-            wget_root_error="$wget_root_body" # 仅调试用
-            wget_root_preview="$(printf '%s' "$wget_root_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
-            printf '[init:wget-root-probe,att=%s,rc=%s,err=%s]\n' "$attempt" "$wget_root_rc" "${wget_root_error:-<empty>}" >&2 # 仅调试用
-            printf '[init:wget-root-body,att=%s,body=%s]\n' "$attempt" "$wget_root_preview" >&2 # 仅调试用
-        fi # 仅调试用
-
-        if ! kill -0 "$axs_pid" 2>/dev/null; then
-            axs_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
-            printf '[init:axs-dead-detail,att=%s,pid=%s,cmd=%s]\n' "$attempt" "$axs_pid" "${axs_cmd_preview:-<unreadable>}" >&2 # 仅调试用
-            echo "[init:axs-dead,att=$attempt]" >&2 # 仅调试用
+        local kill_rc=0 # 仅调试用
+        kill -0 "$axs_pid" 2>/dev/null || kill_rc=$? # 仅调试用
+        if [ "$kill_rc" -ne 0 ]; then
+            # 仅调试用: proot kill -0 returned non-zero — check /proc to verify
+            # whether the process is truly dead or proot is lying.
+            local proc_exists="n" # 仅调试用
+            [ -d "/proc/$axs_pid" ] && proc_exists="y" # 仅调试用
+            printf '[init:ready-poll,attempt=%s,wget=%s,kill0=%s,proc=%s,BAIL]\n' "$attempt" "$wget_rc" "$kill_rc" "$proc_exists" >&2 # 仅调试用
             return 1
         fi
+        [ "$attempt" -le 3 ] && printf '[init:ready-poll,attempt=%s,wget=%s,alive=y]\n' "$attempt" "$wget_rc" >&2 # 仅调试用
         sleep 0.1
     done
 
-    axs_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
-    wget_status_preview="$(printf '%s' "$wget_status_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
-    wget_root_preview="$(printf '%s' "$wget_root_body" | tr '\n' ' ' | head -c 200)" # 仅调试用
-    wget_status_rc_hex="$(printf '%s' "$wget_status_rc" | od -An -tx1 | tr -d ' \n')" # 仅调试用
-    wget_root_rc_hex="$(printf '%s' "$wget_root_rc" | od -An -tx1 | tr -d ' \n')" # 仅调试用
-    printf '[init:wget-timeout-detail,pid=%s,cmd=%s]\n' "$axs_pid" "${axs_cmd_preview:-<unreadable>}" >&2 # 仅调试用
-    printf '[init:wget-timeout-last-status,rc=%s,err=%s]\n' "$wget_status_rc" "${wget_status_error:-<empty>}" >&2 # 仅调试用
-    printf '[init:wget-timeout-last-status-rc-hex,hex=%s]\n' "${wget_status_rc_hex:-<empty>}" >&2 # 仅调试用
-    printf '[init:wget-timeout-last-status-body,body=%s]\n' "${wget_status_preview:-<empty>}" >&2 # 仅调试用
-    printf '[init:wget-timeout-last-root,rc=%s,err=%s]\n' "$wget_root_rc" "${wget_root_error:-<empty>}" >&2 # 仅调试用
-    printf '[init:wget-timeout-last-root-rc-hex,hex=%s]\n' "${wget_root_rc_hex:-<empty>}" >&2 # 仅调试用
-    printf '[init:wget-timeout-last-root-body,body=%s]\n' "${wget_root_preview:-<empty>}" >&2 # 仅调试用
-    echo "[init:wget-timeout,att=100]" >&2 # 仅调试用
+    printf '[init:ready-poll,exhausted=100]\n' >&2 # 仅调试用
     return 1
 }
 
@@ -567,61 +529,36 @@ wait_for_axs_ready() {
 # "AXS exited before becoming ready" error even though axs was never launched.
 # Create the target directory explicitly and fail immediately if staging the
 # binary inside the rootfs does not succeed.
-echo "[init:cp-axs]" >&2 # 仅调试用
-mkdir_local_bin_error="$(mkdir -p /usr/local/bin 2>&1)" # 仅调试用
-if [ $? -ne 0 ]; then
-    echo "[init:mkdir-local-bin-failed]" >&2 # 仅调试用
-    printf '[init:mkdir-local-bin-error=%s]\n' "$mkdir_local_bin_error" >&2 # 仅调试用
-    ls -ld /usr /usr/local /usr/local/bin 2>&1 >&2 # 仅调试用
-    exit 1
-fi
-cp_axs_error="$(cp -f "$PREFIX/axs" /usr/local/bin/axs 2>&1)" # 仅调试用
-cp_axs_rc=$? # 仅调试用
-if [ $cp_axs_rc -ne 0 ]; then
-    # Some devices report a failing cp here with an empty stderr payload. Keep
-    # the shell rc plus the pre-exec file state so the next repro can tell
-    # whether we lost the destination entry, hit a permission boundary, or saw
-    # a toolchain-level failure before axs ever launched. 仅调试用
-    echo "[init:cp-axs-failed]" >&2 # 仅调试用
-    printf '[init:cp-axs-rc=%s]\n' "$cp_axs_rc" >&2 # 仅调试用
-    printf '[init:cp-axs-error=%s]\n' "$cp_axs_error" >&2 # 仅调试用
-    stat "$PREFIX/axs" 2>&1 >&2 # 仅调试用
-    stat /usr/local/bin/axs 2>&1 >&2 # 仅调试用
-    ls -l "$PREFIX/axs" 2>&1 >&2 # 仅调试用
-    ls -ld /usr /usr/local /usr/local/bin 2>&1 >&2 # 仅调试用
-    ls -l /usr/local/bin 2>&1 >&2 # 仅调试用
-    exit 1
-fi
-ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
-chmod_axs_error="$(chmod 755 /usr/local/bin/axs 2>&1)" # 仅调试用
-if [ $? -ne 0 ]; then
-    # After a fresh reinstall, proot can expose / as read-only while still leaving
-    # the copied axs binary executable with its original mode bits. In that case the
-    # chmod syscall fails, but treating that as fatal is wrong because axs was staged
-    # successfully and can still be launched. Only abort when the final file is not
-    # executable; otherwise keep the readonly-rootfs evidence and continue. 仅调试用
+# 仅调试用: proot-rc=1 时 [init:normal] 后无任何中间探针直接退出, 以下三个 || exit 1
+# 是嫌疑人。逐个添加探针定位具体哪一步失败。
+echo "[init:pre-mkdir]" >&2 # 仅调试用
+mkdir -p /usr/local/bin || { echo "[init:mkdir-FAIL,rc=$?]" >&2; exit 1; }
+echo "[init:pre-cp,src=$PREFIX/axs]" >&2 # 仅调试用
+ls -l "$PREFIX/axs" 2>&1 | sed 's/^/[init:axs-ls] /' >&2 # 仅调试用
+cp -f "$PREFIX/axs" /usr/local/bin/axs || { echo "[init:cp-FAIL,rc=$?]" >&2; exit 1; }
+# After a fresh reinstall, proot can expose / as read-only while still leaving
+# the copied axs binary executable with its original mode bits. In that case the
+# chmod syscall fails, but treating that as fatal is wrong because axs was staged
+# successfully and can still be launched. Only abort when the final file is not
+# executable; otherwise continue.
+if ! chmod 755 /usr/local/bin/axs 2>/dev/null; then
     if [ ! -x /usr/local/bin/axs ]; then
-        echo "[init:chmod-axs-failed]" >&2 # 仅调试用
-        printf '[init:chmod-axs-error=%s]\n' "$chmod_axs_error" >&2 # 仅调试用
-        stat /usr/local/bin/axs 2>&1 >&2 # 仅调试用
-        mount 2>&1 | grep ' on /usr\| on / ' >&2 # 仅调试用
-        ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
+        echo "[init:chmod-FAIL,not-executable]" >&2 # 仅调试用
         exit 1
     fi
-    echo "[init:chmod-axs-skipped-ro-rootfs]" >&2 # 仅调试用
-    printf '[init:chmod-axs-error=%s]\n' "$chmod_axs_error" >&2 # 仅调试用
-    stat /usr/local/bin/axs 2>&1 >&2 # 仅调试用
-    mount 2>&1 | grep ' on /usr\| on / ' >&2 # 仅调试用
-    ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
 fi
-ls -l /usr/local/bin/axs 2>&1 >&2 # 仅调试用
-# 这里在启动 axs 前强制打开后端 terminal tracing，是因为当前“三个终端只有 prompt、没有 MOTD”现象仅靠前端日志已经无法继续区分：到底是 /etc/acode_motd 根本没生成，还是 PTY 已经产出首屏但 WS replay 只回放到了尾部。axs 代码里的 PTY first output / WS replay handshake 日志默认被关闭，不显式打开就永远拿不到下一步诊断所需证据。 仅调试用
+echo "[init:axs-staged-ok]" >&2 # 仅调试用: axs 已成功部署到 /usr/local/bin
+# Enable axs PTY tracing: Terminal 1 crashes with exit 182 in ~6ms, and axs-side
+# logs (PTY first output, WS replay, pty reader exit) are essential to distinguish
+# whether the PTY link broke vs bash never started. 仅调试用
 export AXS_TERMINAL_LOG=1 # 仅调试用
 export RUST_LOG=warn # 仅调试用
 # Exit 182 currently lands before initrc emits any marker, which means the failure
 # happens earlier than MOTD generation and is likely in bash exec or loader startup
-# under proot. Probe a minimal non-interactive bash first so the next repro can tell
-# whether bash itself is already broken or only the interactive rcfile/PTy path fails. 仅调试用
+# under proot. All non-PTY bash probes below succeed (including --rcfile /initrc -i),
+# confirming bash/initrc are NOT broken — the issue is specific to PTY-based spawn
+# through axs. The pure-builtin [initrc:L1] probe added to initrc will disambiguate
+# "exec(bash) failed" from "bash crashed during initialization before rcfile". 仅调试用
 echo "[init:bash-probe-begin]" >&2 # 仅调试用
 printf '[init:bash-probe-path=%s]\n' "$(command -v bash 2>/dev/null || echo missing)" >&2 # 仅调试用
 ls -l /bin/bash 2>&1 | sed 's/^/[init:bash-probe-ls] /' >&2 # 仅调试用
@@ -680,6 +617,10 @@ if command -v ldd >/dev/null 2>&1; then # 仅调试用
 else
     echo '[init:bash-ldd-missing]' >&2 # 仅调试用
 fi
+# 仅调试用: wrapper 脚本方案已验证不可行 — proot ptrace 拦截 execve 时
+# 对 /tmp 内脚本产生 EFAULT (Bad address, os error 14)，导致所有 PTY 创建失败。
+# 直接使用 bash，依赖 pre_exec 中的 [axs:tty=y,pgrp=ok] 探针 +
+# initrc 首行 [initrc:L1] 探针来定位崩溃阶段。
 echo "[init:exec-axs]" >&2 # 仅调试用
 "/usr/local/bin/axs" -c "bash --rcfile /initrc -i" &
 axs_pid=$!

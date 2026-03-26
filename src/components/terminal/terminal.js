@@ -1611,13 +1611,16 @@ export default class TerminalComponent {
 					); // 仅调试用
 				} // 仅调试用
 
-				if (shouldCapturePostWriteBuffer) { // 仅调试用
+				// post-write-buffer: 仅记录前3次，避免每次 xterm write 都产生大量日志噪音 仅调试用
+				if (shouldCapturePostWriteBuffer && (this._postWriteBufferLogCount || 0) < 3) { // 仅调试用
+					this._postWriteBufferLogCount = (this._postWriteBufferLogCount || 0) + 1; // 仅调试用
 					setTimeout(() => { // 仅调试用
 						pushTerminalSessionDebugLog( // 仅调试用
 							"post-write-buffer", // 仅调试用
 							{ // 仅调试用
 								name: this.terminalDisplayName || null, // 仅调试用
 								pid: this.pid || null, // 仅调试用
+								count: this._postWriteBufferLogCount, // 仅调试用
 								visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
 								render: collectTerminalRenderSnapshot(this), // 仅调试用
 							}, // 仅调试用
@@ -1996,17 +1999,22 @@ export default class TerminalComponent {
 		if (this.terminal.rows > 0) {
 			this.terminal.clearTextureAtlas?.();
 			this.terminal.refresh(0, this.terminal.rows - 1);
-			pushTerminalSessionDebugLog( // 仅调试用
-				"visible-layout-buffer-snapshot", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
-					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-					render: collectTerminalRenderSnapshot(this), // 仅调试用
-				}, // 仅调试用
-				this.container?.offsetParent ? "info" : "warn", // 仅调试用
-			); // 仅调试用
+			// visible-layout-buffer-snapshot: 仅记录前5次，避免频繁 tab 切换产生大量噪音 仅调试用
+			if ((this._visibleLayoutSnapshotLogCount || 0) < 5) { // 仅调试用
+				this._visibleLayoutSnapshotLogCount = (this._visibleLayoutSnapshotLogCount || 0) + 1; // 仅调试用
+				pushTerminalSessionDebugLog( // 仅调试用
+					"visible-layout-buffer-snapshot", // 仅调试用
+					{ // 仅调试用
+						name: this.terminalDisplayName || null, // 仅调试用
+						pid: this.pid || null, // 仅调试用
+						count: this._visibleLayoutSnapshotLogCount, // 仅调试用
+						reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
+						visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
+						render: collectTerminalRenderSnapshot(this), // 仅调试用
+					}, // 仅调试用
+					this.container?.offsetParent ? "info" : "warn", // 仅调试用
+				); // 仅调试用
+			} // 仅调试用
 			if (this._postRefreshStateLogCount < 8) { // 仅调试用
 				this._postRefreshStateLogCount += 1; // 仅调试用
 				requestAnimationFrame?.(() => { // 仅调试用
