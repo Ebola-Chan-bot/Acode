@@ -104,14 +104,23 @@ const collectTerminalMotdSnapshot = (terminal) => { // 仅调试用
 	}; // 仅调试用
 }; // 仅调试用
 
-const collectTerminalVisibilitySnapshot = (component) => { // 仅调试用
+const summarizeTerminalDebugLineTexts = (lines = []) => { // 仅调试用
+	const parts = lines.map((line) => line?.text || "").filter(Boolean); // 仅调试用
+	return parts.length ? parts.join(" | ") : null; // 仅调试用
+}; // 仅调试用
+
+const collectTerminalVisibilitySnapshot = (component, detail = "compact") => { // 仅调试用
 	const container = component?.container; // 仅调试用
 	const terminal = component?.terminal; // 仅调试用
 	const rect = container?.getBoundingClientRect?.() || null; // 仅调试用
 	const buffer = terminal?.buffer?.active; // 仅调试用
 	const viewportY = buffer?.viewportY ?? null; // 仅调试用
 	const rows = terminal?.rows ?? null; // 仅调试用
-	return { // 仅调试用
+	const bufferTail = summarizeTerminalBufferLines(terminal); // 仅调试用
+	const viewportHead = viewportY === null ? [] : summarizeTerminalBufferWindow(terminal, viewportY, 4); // 仅调试用
+	const viewportTail = viewportY === null || rows === null ? [] : summarizeTerminalBufferWindow(terminal, Math.max(0, viewportY + Math.max(0, rows - 4)), 4); // 仅调试用
+	const motd = collectTerminalMotdSnapshot(terminal); // 仅调试用
+	const baseSnapshot = { // 仅调试用
 		hasOffsetParent: !!container?.offsetParent, // 仅调试用
 		containerWidth: rect ? Math.round(rect.width) : null, // 仅调试用
 		containerHeight: rect ? Math.round(rect.height) : null, // 仅调试用
@@ -120,14 +129,27 @@ const collectTerminalVisibilitySnapshot = (component) => { // 仅调试用
 		bufferLength: buffer?.length ?? null, // 仅调试用
 		bufferViewportY: viewportY, // 仅调试用
 		bufferBaseY: buffer?.baseY ?? null, // 仅调试用
-		bufferTail: summarizeTerminalBufferLines(terminal), // 仅调试用
-		viewportHead: viewportY === null ? [] : summarizeTerminalBufferWindow(terminal, viewportY, 4), // 仅调试用
-		viewportTail: viewportY === null || rows === null ? [] : summarizeTerminalBufferWindow(terminal, Math.max(0, viewportY + Math.max(0, rows - 4)), 4), // 仅调试用
-		motd: collectTerminalMotdSnapshot(terminal), // 仅调试用
+	}; // 仅调试用
+	// Exit-code-182 forensics need whether output materialized, not repeated full buffer dumps; relocation-specific logs keep exact geometry separately. 仅调试用
+	if (detail !== "full") { // 仅调试用
+		return { // 仅调试用
+			...baseSnapshot, // 仅调试用
+			bufferTailPreview: summarizeTerminalDebugLineTexts(bufferTail), // 仅调试用
+			viewportHeadPreview: summarizeTerminalDebugLineTexts(viewportHead), // 仅调试用
+			viewportTailPreview: summarizeTerminalDebugLineTexts(viewportTail), // 仅调试用
+			motdMatchCount: motd?.matchCount ?? 0, // 仅调试用
+		}; // 仅调试用
+	} // 仅调试用
+	return { // 仅调试用
+		...baseSnapshot, // 仅调试用
+		bufferTail, // 仅调试用
+		viewportHead, // 仅调试用
+		viewportTail, // 仅调试用
+		motd, // 仅调试用
 	}; // 仅调试用
 }; // 仅调试用
 
-const collectTerminalRenderSnapshot = (component) => { // 仅调试用
+const collectTerminalRenderSnapshot = (component, detail = "compact") => { // 仅调试用
 	const container = component?.container; // 仅调试用
 	const terminal = component?.terminal; // 仅调试用
 	const xtermElement = container?.querySelector?.(".xterm") || null; // 仅调试用
@@ -140,18 +162,10 @@ const collectTerminalRenderSnapshot = (component) => { // 仅调试用
 	const xtermRect = xtermElement?.getBoundingClientRect?.() || null; // 仅调试用
 	const screenRect = screenElement?.getBoundingClientRect?.() || null; // 仅调试用
 	const viewportRect = viewportElement?.getBoundingClientRect?.() || null; // 仅调试用
-	return { // 仅调试用
+	const baseSnapshot = { // 仅调试用
 		rendererType: renderService?._renderer?.constructor?.name || null, // 仅调试用
-		xtermClientWidth: xtermElement?.clientWidth ?? null, // 仅调试用
-		xtermClientHeight: xtermElement?.clientHeight ?? null, // 仅调试用
 		xtermWidth: xtermRect ? Math.round(xtermRect.width) : null, // 仅调试用
 		xtermHeight: xtermRect ? Math.round(xtermRect.height) : null, // 仅调试用
-		screenClientWidth: screenElement?.clientWidth ?? null, // 仅调试用
-		screenClientHeight: screenElement?.clientHeight ?? null, // 仅调试用
-		screenWidth: screenRect ? Math.round(screenRect.width) : null, // 仅调试用
-		screenHeight: screenRect ? Math.round(screenRect.height) : null, // 仅调试用
-		viewportClientWidth: viewportElement?.clientWidth ?? null, // 仅调试用
-		viewportClientHeight: viewportElement?.clientHeight ?? null, // 仅调试用
 		viewportWidth: viewportRect ? Math.round(viewportRect.width) : null, // 仅调试用
 		viewportHeight: viewportRect ? Math.round(viewportRect.height) : null, // 仅调试用
 		viewportScrollTop: viewportElement?.scrollTop ?? null, // 仅调试用
@@ -161,11 +175,25 @@ const collectTerminalRenderSnapshot = (component) => { // 仅调试用
 		bufferCursorX: terminal?.buffer?.active?.cursorX ?? null, // 仅调试用
 		cssCellWidth: dimensions?.css?.cell?.width ?? null, // 仅调试用
 		cssCellHeight: dimensions?.css?.cell?.height ?? null, // 仅调试用
+		canvasCount: canvases.length, // 仅调试用
+	}; // 仅调试用
+	if (detail !== "full") { // 仅调试用
+		return baseSnapshot; // 仅调试用
+	} // 仅调试用
+	return { // 仅调试用
+		...baseSnapshot, // 仅调试用
+		xtermClientWidth: xtermElement?.clientWidth ?? null, // 仅调试用
+		xtermClientHeight: xtermElement?.clientHeight ?? null, // 仅调试用
+		screenClientWidth: screenElement?.clientWidth ?? null, // 仅调试用
+		screenClientHeight: screenElement?.clientHeight ?? null, // 仅调试用
+		screenWidth: screenRect ? Math.round(screenRect.width) : null, // 仅调试用
+		screenHeight: screenRect ? Math.round(screenRect.height) : null, // 仅调试用
+		viewportClientWidth: viewportElement?.clientWidth ?? null, // 仅调试用
+		viewportClientHeight: viewportElement?.clientHeight ?? null, // 仅调试用
 		cssCanvasWidth: dimensions?.css?.canvas?.width ?? null, // 仅调试用
 		cssCanvasHeight: dimensions?.css?.canvas?.height ?? null, // 仅调试用
 		deviceCanvasWidth: dimensions?.device?.canvas?.width ?? null, // 仅调试用
 		deviceCanvasHeight: dimensions?.device?.canvas?.height ?? null, // 仅调试用
-		canvasCount: canvases.length, // 仅调试用
 		canvases: canvases.slice(0, 2).map((canvas) => ({ // 仅调试用
 			width: canvas.width, // 仅调试用
 			height: canvas.height, // 仅调试用
@@ -298,7 +326,7 @@ export default class TerminalComponent {
 		});
 
 		this.terminal.onRender?.((event) => { // 仅调试用
-			if (this._renderEventLogCount >= 8) { // 仅调试用
+			if (this._renderEventLogCount >= 2) { // 仅调试用
 				return; // 仅调试用
 			} // 仅调试用
 			this._renderEventLogCount += 1; // 仅调试用
@@ -1999,8 +2027,8 @@ export default class TerminalComponent {
 		if (this.terminal.rows > 0) {
 			this.terminal.clearTextureAtlas?.();
 			this.terminal.refresh(0, this.terminal.rows - 1);
-			// visible-layout-buffer-snapshot: 仅记录前5次，避免频繁 tab 切换产生大量噪音 仅调试用
-			if ((this._visibleLayoutSnapshotLogCount || 0) < 5) { // 仅调试用
+			// visible-layout-buffer-snapshot: 仅记录前2次，避免频繁 tab 切换与 steady-state 刷新淹没 182 诊断日志 仅调试用
+			if ((this._visibleLayoutSnapshotLogCount || 0) < 2) { // 仅调试用
 				this._visibleLayoutSnapshotLogCount = (this._visibleLayoutSnapshotLogCount || 0) + 1; // 仅调试用
 				pushTerminalSessionDebugLog( // 仅调试用
 					"visible-layout-buffer-snapshot", // 仅调试用
@@ -2015,7 +2043,7 @@ export default class TerminalComponent {
 					this.container?.offsetParent ? "info" : "warn", // 仅调试用
 				); // 仅调试用
 			} // 仅调试用
-			if (this._postRefreshStateLogCount < 8) { // 仅调试用
+			if (this._postRefreshStateLogCount < 2) { // 仅调试用
 				this._postRefreshStateLogCount += 1; // 仅调试用
 				requestAnimationFrame?.(() => { // 仅调试用
 					pushTerminalSessionDebugLog( // 仅调试用

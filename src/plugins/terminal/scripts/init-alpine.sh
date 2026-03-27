@@ -486,19 +486,36 @@ echo "[init:normal-post-initrc]" >&2 # 仅调试用: 到此说明 MOTD + initrc 
 
 wait_for_axs_ready() {
     local axs_pid="$1"
+    # 仅调试用: musl libc strftime 不支持 %N (纳秒)，date +%s%3N 可能输出非法值
+    # 导致 $(( )) 算术表达式静默失败，从而使循环体中所有依赖 elapsed_ms 的探针全部丢失。
+    # 改用 date +%s (仅秒)，放弃毫秒精度；同时保留原始格式输出用于确认假设。
+    local ready_poll_date_raw # 仅调试用
+    ready_poll_date_raw=$(date '+%s%3N') # 仅调试用
+    local ready_poll_date_s # 仅调试用
+    ready_poll_date_s=$(date +%s) # 仅调试用
+    printf '[init:date-format-test,raw=%s,sonly=%s]\n' "$ready_poll_date_raw" "$ready_poll_date_s" >&2 # 仅调试用
+    local ready_poll_started_at # 仅调试用
+    ready_poll_started_at=$(date +%s) # 仅调试用
 
     # The frontend now waits for this explicit ready marker instead of blind
     # HTTP polling. Keep the readiness check here, next to the process launch,
     # so stale UI tasks cannot race and kill a newer healthy shared AXS instance.
     for attempt in $(seq 1 100); do
-        # 仅调试用: log each poll attempt to diagnose proot kill -0 false negative.
-        # Root cause hypothesis: proot's virtual PID space hasn't registered the
-        # background child yet when kill -0 runs, falsely reporting it dead while
-        # AXS is actually starting (confirmed: [axs:bind-ok] appears AFTER ready-rc=1).
+        # 仅调试用: 循环体入口金丝雀 — 前轮中 ready-poll,attempt= 日志全部缺失，
+        # 需确认循环体是否真正执行以及是否在 date/算术行崩溃。
+        [ "$attempt" -le 3 ] && printf '[init:loop-canary,i=%s,pid=%s]\n' "$attempt" "$axs_pid" >&2 # 仅调试用
         local wget_rc=0 # 仅调试用
-        wget -q -T 1 -O - "http://127.0.0.1:8767/status" >/dev/null 2>&1 || wget_rc=$? # 仅调试用
-        if [ "$wget_rc" -eq 0 ]; then # 仅调试用
-            printf '[init:ready-poll,attempt=%s,wget=0,alive=y]\n' "$attempt" >&2 # 仅调试用
+        local now_s # 仅调试用
+        now_s=$(date +%s) # 仅调试用
+        local elapsed_s # 仅调试用
+        elapsed_s=$((now_s - ready_poll_started_at)) # 仅调试用
+        local should_log_attempt="n" # 仅调试用
+        case "$attempt" in 1|2|3|10|25|50|75|100) should_log_attempt="y" ;; esac # 仅调试用
+        wget -q -T 1 -O - "http://127.0.0.1:8767/status" >/dev/null 2>&1 || wget_rc=$?
+        # 仅调试用: 前 3 次无条件输出 wget 返回值，确认是否每次都是 182 (signal 54)
+        [ "$attempt" -le 3 ] && printf '[init:wget-detail,i=%s,rc=%s]\n' "$attempt" "$wget_rc" >&2 # 仅调试用
+        if [ "$wget_rc" -eq 0 ]; then
+            printf '[init:ready-poll,attempt=%s,wget=0,alive=y,elapsed_s=%s]\n' "$attempt" "$elapsed_s" >&2 # 仅调试用
             echo "__ACODE_AXS_READY__"
             return 0
         fi
@@ -510,14 +527,25 @@ wait_for_axs_ready() {
             # whether the process is truly dead or proot is lying.
             local proc_exists="n" # 仅调试用
             [ -d "/proc/$axs_pid" ] && proc_exists="y" # 仅调试用
-            printf '[init:ready-poll,attempt=%s,wget=%s,kill0=%s,proc=%s,BAIL]\n' "$attempt" "$wget_rc" "$kill_rc" "$proc_exists" >&2 # 仅调试用
+            printf '[init:ready-poll,attempt=%s,wget=%s,kill0=%s,proc=%s,elapsed_s=%s,BAIL]\n' "$attempt" "$wget_rc" "$kill_rc" "$proc_exists" "$elapsed_s" >&2 # 仅调试用
             return 1
         fi
-        [ "$attempt" -le 3 ] && printf '[init:ready-poll,attempt=%s,wget=%s,alive=y]\n' "$attempt" "$wget_rc" >&2 # 仅调试用
+        [ "$should_log_attempt" = "y" ] && printf '[init:ready-poll,attempt=%s,wget=%s,alive=y,elapsed_s=%s]\n' "$attempt" "$wget_rc" "$elapsed_s" >&2 # 仅调试用
         sleep 0.1
     done
 
-    printf '[init:ready-poll,exhausted=100]\n' >&2 # 仅调试用
+    local final_ready_out_file="/tmp/acode-ready-final.out.$$" # 仅调试用
+    local final_ready_err_file="/tmp/acode-ready-final.err.$$" # 仅调试用
+    rm -f "$final_ready_out_file" "$final_ready_err_file" # 仅调试用
+    local final_ready_wget_rc=0 # 仅调试用
+    wget -S -T 1 -O "$final_ready_out_file" "http://127.0.0.1:8767/status" 2>"$final_ready_err_file" || final_ready_wget_rc=$? # 仅调试用
+    local final_now_s # 仅调试用
+    final_now_s=$(date +%s) # 仅调试用
+    local final_elapsed_s # 仅调试用
+    final_elapsed_s=$((final_now_s - ready_poll_started_at)) # 仅调试用
+    printf '[init:ready-poll,exhausted=100,elapsed_s=%s,final_wget=%s]\n' "$final_elapsed_s" "$final_ready_wget_rc" >&2 # 仅调试用
+    if [ -s "$final_ready_out_file" ]; then sed 's/^/[init:ready-final-stdout] /' "$final_ready_out_file" >&2; else echo '[init:ready-final-stdout=<empty>]' >&2; fi # 仅调试用
+    if [ -s "$final_ready_err_file" ]; then sed 's/^/[init:ready-final-stderr] /' "$final_ready_err_file" >&2; else echo '[init:ready-final-stderr=<empty>]' >&2; fi # 仅调试用
     return 1
 }
 
@@ -531,8 +559,21 @@ wait_for_axs_ready() {
 # binary inside the rootfs does not succeed.
 # 仅调试用: proot-rc=1 时 [init:normal] 后无任何中间探针直接退出, 以下三个 || exit 1
 # 是嫌疑人。逐个添加探针定位具体哪一步失败。
-echo "[init:pre-mkdir]" >&2 # 仅调试用
-mkdir -p /usr/local/bin || { echo "[init:mkdir-FAIL,rc=$?]" >&2; exit 1; }
+echo "[init:pre-mkdir,target=/usr/local/bin,prefix=$PREFIX]" >&2 # 仅调试用
+ls -ld / /usr /usr/local 2>&1 | sed 's/^/[init:mkdir-path] /' >&2 # 仅调试用
+mkdir_err_file="/tmp/acode-init-mkdir.err.$$" # 仅调试用
+rm -f "$mkdir_err_file" # 仅调试用
+mkdir -p /usr/local/bin 2>"$mkdir_err_file" || { # 仅调试用
+    mkdir_rc=$? # 仅调试用
+    if [ -s "$mkdir_err_file" ]; then sed 's/^/[init:mkdir-stderr] /' "$mkdir_err_file" >&2; else echo "[init:mkdir-stderr=<empty>]" >&2; fi # 仅调试用
+    stat / /usr /usr/local 2>&1 | sed 's/^/[init:mkdir-stat] /' >&2 # 仅调试用
+    echo "[init:mkdir-FAIL,rc=$mkdir_rc]" >&2 # 仅调试用
+    rm -f "$mkdir_err_file" # 仅调试用
+    exit 1 # 仅调试用
+} # 仅调试用
+if [ -s "$mkdir_err_file" ]; then sed 's/^/[init:mkdir-stderr] /' "$mkdir_err_file" >&2; fi # 仅调试用
+rm -f "$mkdir_err_file" # 仅调试用
+ls -ld /usr/local/bin 2>&1 | sed 's/^/[init:mkdir-ok] /' >&2 # 仅调试用
 echo "[init:pre-cp,src=$PREFIX/axs]" >&2 # 仅调试用
 ls -l "$PREFIX/axs" 2>&1 | sed 's/^/[init:axs-ls] /' >&2 # 仅调试用
 cp -f "$PREFIX/axs" /usr/local/bin/axs || { echo "[init:cp-FAIL,rc=$?]" >&2; exit 1; }
