@@ -90,6 +90,31 @@ ARGS="$ARGS --link2symlink"
 # context, whereas the crash affects all users on vulnerable kernels.
 ARGS="$ARGS -L"
 
+# Kill lingering proot from previous session before starting a new one.
+# NOTE: Log analysis of 5 sessions showed sandbox:ps=<none> every time — no
+# concurrent proot was ever alive. Signal 54 still killed proot as sole instance.
+# Concurrent-proot theory was DISPROVEN. This cleanup is kept as defensive
+# measure. Root cause of signal 54 is still under investigation.
+# Using PID file for precision (not pkill) to avoid killing unrelated processes.
+_old_pid=$(cat "$PREFIX/pid" 2>/dev/null)
+if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
+    printf '[sandbox:cleanup,old_pid=%s,sending=TERM]\n' "$_old_pid" >&2
+    kill -TERM "$_old_pid" 2>/dev/null
+    _wait_i=0
+    while [ "$_wait_i" -lt 20 ] && kill -0 "$_old_pid" 2>/dev/null; do
+        sleep 0.1
+        _wait_i=$((_wait_i + 1))
+    done
+    if kill -0 "$_old_pid" 2>/dev/null; then
+        printf '[sandbox:cleanup,old_pid=%s,TERM-timeout,sending=KILL]\n' "$_old_pid" >&2
+        kill -KILL "$_old_pid" 2>/dev/null
+        sleep 0.2
+    fi
+    printf '[sandbox:cleanup,old_pid=%s,done,still_alive=%s]\n' "$_old_pid" "$(kill -0 "$_old_pid" 2>/dev/null && echo y || echo n)" >&2
+fi
+# Clear stale ptrace tracking files
+rm -rf "$PROOT_TMP_DIR"/*
+
 # Android /bin/sh's printf does not support %q, and the previous probe was corrupting
 # the very failure window we are trying to inspect. Keep this log strictly %s-based so
 # the next 182 repro preserves the real proot arguments instead of replacing them with
@@ -116,12 +141,16 @@ _sandbox_port=$(grep ':2237 ' /proc/net/tcp 2>/dev/null) # 仅调试用
 if [ -n "$_sandbox_port" ]; then echo "$_sandbox_port" | sed 's/^/[sandbox:port8767] /' >&2; else echo "[sandbox:port8767=<none>]" >&2; fi # 仅调试用
 printf '[sandbox:invoke-shell=%s,script=%s,installing=%s,args=%s]\n' "/bin/sh" "$PREFIX/init-alpine.sh" "$1" "$*" >&2 # 仅调试用
 awk '/^Sig(Q|Pnd|Blk|Ign|Cgt):/ {print}' "/proc/$$/status" 2>/dev/null | sed 's/^/[sandbox:self-status-before] /' >&2 # 仅调试用
-# 仅调试用: Pre-ignore signal 54 (SIGRTMIN+20) before fork+exec of proot.
-# Root cause: session proot (after install-phase proot) dies instantly from signal
-# 54 because it arrives in the fork→exec→signal-setup window before proot-xed.so
-# sets up its own SigIgn mask (confirmed by install proot's SigIgn 7fffffffffc0f053).
-# SIG_IGN is preserved across execve(2), so proot will inherit the ignore
-# disposition and survive the race window.
+# 仅调试用: Session process info via /proc/PID/stat — the old ps -o probe
+# used pid,ppid,pgid,sid,tpgid,stat,comm,args which Android toybox doesn't
+# support, dumping 100+ lines of help text instead of process data.
+for _sb_p in $$ $PPID; do awk '{printf("[sandbox:session-before] pid=%s comm=%s state=%s ppid=%s pgrp=%s sid=%s tty=%s tpgid=%s\n", $1, $2, $3, $4, $5, $6, $7, $8)}' "/proc/$_sb_p/stat" 2>/dev/null >&2; done # 仅调试用
+cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null | sed 's/^/[sandbox:ptrace_scope] /' >&2 || echo "[sandbox:ptrace_scope=<unavailable>]" >&2 # 仅调试用
+grep -E '^(Seccomp|NoNewPrivs):' "/proc/$$/status" 2>/dev/null | sed 's/^/[sandbox:seccomp] /' >&2 || echo "[sandbox:seccomp=<unavailable>]" >&2 # 仅调试用
+# 仅调试用: Keep signal 54 ignored across fork+exec while the exit-182 investigation
+# continues. Fresh logs show failing proot already has SigIgn 7fffffffffc0f053 before
+# exit 182, so this trap is no longer treated as proof of root cause; the new logs below
+# are meant to distinguish "proot itself got 54" from "proot returned a tracee status 182".
 trap '' 54 # 仅调试用
 printf '[sandbox:sig54-pre-ignored]\n' >&2 # 仅调试用
 # 仅调试用: Start proot asynchronously and sample /proc/$proot_pid before a fast
@@ -130,15 +159,32 @@ printf '[sandbox:sig54-pre-ignored]\n' >&2 # 仅调试用
 $PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@" & # 仅调试用
 proot_pid=$! # 仅调试用
 printf '[sandbox:proot-pid=%s]\n' "$proot_pid" >&2 # 仅调试用
+# 仅调试用: Immediate proot status capture — race to read /proc before signal 54
+# kills proot (observed death within first 50ms probe in session 5).
+awk '/^(Name|State|Tgid|Pid|PPid|TracerPid|Sig(Q|Pnd|Blk|Ign|Cgt)):/' "/proc/$proot_pid/status" 2>/dev/null | sed "s/^/[sandbox:proot-immediate] /" >&2 || printf '[sandbox:proot-immediate=<gone>]\n' >&2 # 仅调试用
+for _sb_p in $$ $PPID $proot_pid; do awk '{printf("[sandbox:session-with-proot] pid=%s comm=%s state=%s ppid=%s pgrp=%s sid=%s tty=%s tpgid=%s\n", $1, $2, $3, $4, $5, $6, $7, $8)}' "/proc/$_sb_p/stat" 2>/dev/null >&2; done # 仅调试用
 probe_round=1 # 仅调试用
 while [ "$probe_round" -le 5 ]; do # 仅调试用
     if [ ! -d "/proc/$proot_pid" ]; then # 仅调试用
         printf '[sandbox:proot-proc-missing#%s]\n' "$probe_round" >&2 # 仅调试用
+        # 仅调试用: Check if dead proot is a zombie (still reapable) or fully gone.
+        # kill -0 succeeds for zombies; /proc/PID/status may still be readable.
+        if kill -0 "$proot_pid" 2>/dev/null; then # 仅调试用
+            printf '[sandbox:proot-zombie=%s]\n' "$proot_pid" >&2 # 仅调试用
+            awk '/^(Name|State|SigPnd|ShdPnd|SigIgn):/' "/proc/$proot_pid/status" 2>/dev/null | sed "s/^/[sandbox:proot-zombie-status] /" >&2 # 仅调试用
+        else # 仅调试用
+            printf '[sandbox:proot-fully-gone=%s]\n' "$proot_pid" >&2 # 仅调试用
+        fi # 仅调试用
         break # 仅调试用
     fi
     awk '/^(Name|State|Tgid|Pid|PPid|TracerPid|SigQ|SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt):/ {print}' "/proc/$proot_pid/status" 2>/dev/null | sed "s/^/[sandbox:proot-status#$probe_round] /" >&2 # 仅调试用
+    awk -v round="$probe_round" '{printf("[sandbox:proot-stat#%s] pid=%s state=%s ppid=%s pgrp=%s session=%s tty_nr=%s tpgid=%s flags=%s\\n", round, $1, $3, $4, $5, $6, $7, $8, $9)}' "/proc/$proot_pid/stat" 2>/dev/null >&2 # 仅调试用
     _sandbox_proot_cmdline=$(tr '\0' ' ' < "/proc/$proot_pid/cmdline" 2>/dev/null) # 仅调试用
     if [ -n "$_sandbox_proot_cmdline" ]; then printf '[sandbox:proot-cmdline#%s] %s\n' "$probe_round" "$_sandbox_proot_cmdline" >&2; else printf '[sandbox:proot-cmdline#%s=<empty>]\n' "$probe_round" >&2; fi # 仅调试用
+    _sandbox_proot_tasks=$(ls "/proc/$proot_pid/task" 2>/dev/null | tr '\n' ' ') # 仅调试用
+    if [ -n "$_sandbox_proot_tasks" ]; then printf '[sandbox:proot-tasks#%s=%s]\n' "$probe_round" "$_sandbox_proot_tasks" >&2; else printf '[sandbox:proot-tasks#%s=<none>]\n' "$probe_round" >&2; fi # 仅调试用
+    _sandbox_proot_wchan=$(cat "/proc/$proot_pid/wchan" 2>/dev/null) # 仅调试用
+    if [ -n "$_sandbox_proot_wchan" ]; then printf '[sandbox:proot-wchan#%s=%s]\n' "$probe_round" "$_sandbox_proot_wchan" >&2; else printf '[sandbox:proot-wchan#%s=<empty>]\n' "$probe_round" >&2; fi # 仅调试用
     _sandbox_children=$(cat "/proc/$proot_pid/task/$proot_pid/children" 2>/dev/null) # 仅调试用
     if [ -n "$_sandbox_children" ]; then # 仅调试用
         printf '[sandbox:proot-children#%s=%s]\n' "$probe_round" "$_sandbox_children" >&2 # 仅调试用
@@ -162,13 +208,15 @@ proot_rc=$? # 仅调试用
 printf '[sandbox:proot-rc=%s,installing=%s,args=%s]\n' "$proot_rc" "$1" "$*" >&2 # 仅调试用
 # 仅调试用: signal analysis — exit codes > 128 indicate the child was killed by
 # signal (exit_code - 128). 182 - 128 = 54, which is SIGRTMIN+20 on Linux.
-# If [alpine:L1] probe is ABSENT in the log above, /bin/sh never started
-# inside proot — the crash is in proot's ptrace setup, not the script.
+# If [alpine:L1] is ABSENT, /bin/sh did not reach script entry. With current evidence,
+# that alone no longer proves proot itself died before installing SigIgn; correlate it
+# with [sandbox:proot-stat], [sandbox:proot-wchan], and [sandbox:child-status] first.
 if [ "$proot_rc" -ne 0 ]; then
     if [ "$proot_rc" -gt 128 ]; then
         printf '[sandbox:signal=%s,code=128+%s]\n' "$((proot_rc - 128))" "$((proot_rc - 128))" >&2
     fi
     awk '/^Sig(Q|Pnd|Blk|Ign|Cgt):/ {print}' "/proc/$$/status" 2>/dev/null | sed 's/^/[sandbox:self-status-after] /' >&2 # 仅调试用
+    for _sb_p in $$ $PPID; do awk '{printf("[sandbox:session-after] pid=%s comm=%s state=%s ppid=%s pgrp=%s sid=%s tty=%s tpgid=%s\n", $1, $2, $3, $4, $5, $6, $7, $8)}' "/proc/$_sb_p/stat" 2>/dev/null >&2; done # 仅调试用
     stat "$PROOT" "$PREFIX/init-alpine.sh" /bin/sh 2>&1 | sed 's/^/[sandbox:stat] /' >&2
     # Check if libtalloc symlink is valid — broken symlink would prevent proot from loading
     ls -lL "$PREFIX/libtalloc.so.2" 2>&1 | sed 's/^/[sandbox:libtalloc] /' >&2

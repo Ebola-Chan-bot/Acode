@@ -262,8 +262,13 @@ EOF
 
     # Create/update initrc (always overwrite to keep in sync with app updates)
     # Cost: ~3KB heredoc write per startup, sub-millisecond — negligible.
-    #initrc runs in bash so we can use bash features 
-    cat <<'EOF' > "$PREFIX/alpine/initrc"
+    #initrc runs in bash so we can use bash features
+    # Write to temp file first, then mv to final path. cat is an external binary
+    # intercepted by proot ptrace; when concurrent terminal sessions cause signal 54,
+    # cat exits with rc=182 and produces 0 bytes. The > redirect truncates the target
+    # BEFORE cat runs, so writing directly to initrc would destroy the working copy.
+    # Using a temp file preserves the existing initrc on failure.
+    cat <<'EOF' > "$PREFIX/alpine/initrc.tmp"
 # Source rc files if they exist
 
     # Pure-builtin probe: no forks, no command substitution.
@@ -472,17 +477,39 @@ acode() {
 }
 
 EOF
+_initrc_heredoc_rc=$? # 仅调试用
+_initrc_post_heredoc_size=$(wc -c < "$PREFIX/alpine/initrc.tmp" 2>/dev/null) # 仅调试用
+_initrc_post_heredoc_line1=$(head -n 1 "$PREFIX/alpine/initrc.tmp" 2>/dev/null) # 仅调试用
+# 仅调试用: 日志显示第二次启动时 initrc 文件从 8673 字节缩水为 152 字节(仅 PS1 行),
+# 说明 heredoc 的 cat 没有产出任何内容。>重定向先截断文件, 然后 cat 以空输出退出,
+# 导致 grep 找不到 PS1= 从而追加, 最终 initrc 只剩 PS1。以下探针区分三种故障模式:
+# 1) cat 崩溃(rc>128) 2) cat 被终止但未崩溃(rc!=0) 3) heredoc temp 文件创建失败。
+printf '[init:initrc-heredoc-done,rc=%s,size=%s,line1=%s]\n' "$_initrc_heredoc_rc" "$_initrc_post_heredoc_size" "$_initrc_post_heredoc_line1" >&2 # 仅调试用
+
+# Atomically replace initrc only if heredoc succeeded (rc=0 AND non-empty).
+# On failure (signal 54 / rc=182), the existing initrc is preserved intact.
+if [ "$_initrc_heredoc_rc" -eq 0 ] && [ -s "$PREFIX/alpine/initrc.tmp" ]; then
+    mv -f "$PREFIX/alpine/initrc.tmp" "$PREFIX/alpine/initrc"
+else
+    printf '[init:initrc-heredoc-FAILED,rc=%s,keeping-old]\n' "$_initrc_heredoc_rc" >&2 # 仅调试用
+    rm -f "$PREFIX/alpine/initrc.tmp"
+fi
 
 # Add PS1 only if not already present
 if ! grep -q 'PS1=' "$PREFIX/alpine/initrc"; then
+    printf '[init:initrc-ps1-needed,size-before=%s]\n' "$_initrc_post_heredoc_size" >&2 # 仅调试用
     # Smart path shortening (fish-style: ~/p/s/components)
     echo 'PS1="\[\033[1;32m\]\u\[\033[0m\]@localhost \[\033[1;34m\]\$_PS1_PATH\[\033[0m\] \[\$([ "${_PS1_EXIT:-0}" -ne 0 ] && echo \"\033[31m\")\]\$\[\033[0m\] "' >> "$PREFIX/alpine/initrc"
     # Simple prompt (uncomment below and comment above if you prefer full paths)
     # echo 'PS1="\[\033[1;32m\]\u\[\033[0m\]@localhost \[\033[1;34m\]\w\[\033[0m\] \$ "' >> "$PREFIX/alpine/initrc"
+else
+    printf '[init:initrc-ps1-exists,size=%s]\n' "$_initrc_post_heredoc_size" >&2 # 仅调试用
 fi
 
+_initrc_final_size=$(wc -c < "$PREFIX/alpine/initrc" 2>/dev/null) # 仅调试用
+printf '[init:initrc-final,size=%s]\n' "$_initrc_final_size" >&2 # 仅调试用
 chmod +x "$PREFIX/alpine/initrc"
-echo "[init:normal-post-initrc]" >&2 # 仅调试用: 到此说明 MOTD + initrc heredoc + PS1 + chmod 全部正常
+echo "[init:normal-post-initrc]" >&2 # 仅调试用: 到此仅说明流程没有中断; heredoc 是否真正写入需查看上方 initrc-heredoc-done 探针
 
 wait_for_axs_ready() {
     local axs_pid="$1"
@@ -576,7 +603,26 @@ rm -f "$mkdir_err_file" # 仅调试用
 ls -ld /usr/local/bin 2>&1 | sed 's/^/[init:mkdir-ok] /' >&2 # 仅调试用
 echo "[init:pre-cp,src=$PREFIX/axs]" >&2 # 仅调试用
 ls -l "$PREFIX/axs" 2>&1 | sed 's/^/[init:axs-ls] /' >&2 # 仅调试用
-cp -f "$PREFIX/axs" /usr/local/bin/axs || { echo "[init:cp-FAIL,rc=$?]" >&2; exit 1; }
+ls -l /usr/local/bin/axs 2>&1 | sed 's/^/[init:dst-ls-before] /' >&2 # 仅调试用: cp目标在cp前的状态
+_cp_attempt=0 # 仅调试用: cp有时被signal 54杀，加重试和诊断
+_cp_ok=0 # 仅调试用
+while [ $_cp_attempt -lt 3 ]; do # 仅调试用
+    _cp_attempt=$((_cp_attempt + 1)) # 仅调试用
+    _cp_t0=$(date +%s%N 2>/dev/null || date +%s) # 仅调试用
+    cp -f "$PREFIX/axs" /usr/local/bin/axs 2>/tmp/cp-err.txt # 仅调试用: 分离stderr以保留错误信息
+    _cp_rc=$? # 仅调试用
+    _cp_t1=$(date +%s%N 2>/dev/null || date +%s) # 仅调试用
+    if [ -s /tmp/cp-err.txt ]; then sed 's/^/[init:cp-stderr] /' /tmp/cp-err.txt >&2; fi # 仅调试用
+    if [ $_cp_rc -eq 0 ]; then # 仅调试用
+        echo "[init:cp-ok,attempt=$_cp_attempt,t0=$_cp_t0,t1=$_cp_t1]" >&2 # 仅调试用
+        _cp_ok=1 # 仅调试用
+        break # 仅调试用
+    fi # 仅调试用
+    echo "[init:cp-retry,attempt=$_cp_attempt,rc=$_cp_rc,t0=$_cp_t0,t1=$_cp_t1]" >&2 # 仅调试用
+    ls -l /usr/local/bin/axs "$PREFIX/axs" 2>&1 | sed 's/^/[init:cp-retry-ls] /' >&2 # 仅调试用
+    sleep 0.2 # 仅调试用: 短暂等待让proot稳定
+done # 仅调试用
+if [ $_cp_ok -ne 1 ]; then echo "[init:cp-FAIL,rc=$_cp_rc,attempts=$_cp_attempt]" >&2; exit 1; fi
 # After a fresh reinstall, proot can expose / as read-only while still leaving
 # the copied axs binary executable with its original mode bits. In that case the
 # chmod syscall fails, but treating that as fatal is wrong because axs was staged
