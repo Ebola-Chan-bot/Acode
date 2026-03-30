@@ -328,10 +328,15 @@ EOF
     # 这里补一个直接写进 PTY stdout 的入口标记，下次复现只要看首屏有没有这行就能立刻分流。 仅调试用
     printf '[shell:initrc-stdout-enter,pid=%s,ppid=%s,argv0=%q,flags=%q,tty=%q]\n' "$$" "$PPID" "$0" "$-" "$(tty 2>/dev/null || echo no-tty)" # 仅调试用
 
+    # 仅调试用: 如果真实交互 bash 在 initrc 之后亲自收到了 signal 54，这里必须直接 # 仅调试用
+    # 仅调试用: 留下一手标记，再恢复默认动作并重新向自己发送 54，避免把“bash 真被 # 仅调试用
+    # 仅调试用: 54 击中”改造成一个普通返回路径。 # 仅调试用
+    trap 'shell_last=$BASH_COMMAND; trap - EXIT 54; printf "[shell:sig54-caught,pid=%s,ppid=%s,last=%q,flags=%q]\n" "$$" "$PPID" "$shell_last" "$-" >&2; kill -54 "$$"' 54 # 仅调试用
+
     # Keep an EXIT marker paired with the initrc-enter marker so the next repro can
     # separate "bash never entered initrc" from "bash started and then exited 1
     # during rc/bootstrap work" without needing logcat or an attached debugger. 仅调试用
-    trap 'shell_exit_rc=$?; printf '\''[shell:initrc-exit,pid=%s,rc=%s,last=%q,tty=%q]\n'\'' "$$" "$shell_exit_rc" "$BASH_COMMAND" "$(tty 2>/dev/null || echo no-tty)" >&2' EXIT # 仅调试用
+    trap 'shell_exit_rc=$?; printf "[shell:initrc-exit,pid=%s,ppid=%s,rc=%s,last=%q,flags=%q,tty=%q]\n" "$$" "$PPID" "$shell_exit_rc" "$BASH_COMMAND" "$-" "$(tty 2>/dev/null || echo no-tty)" >&2' EXIT # 仅调试用
 
 if [ -f "/etc/profile" ]; then
     source "/etc/profile"
@@ -378,11 +383,16 @@ _shorten_path() {
 
 _PS1_PATH="$(_shorten_path)"
 _PS1_EXIT=0
+_ACODE_DIAG_FIRST_PROMPT=1 # 仅调试用
 
 _update_prompt_state() {
     local last_exit=$?
     _PS1_PATH="$(_shorten_path)"
     _PS1_EXIT=$last_exit
+    if [ "${_ACODE_DIAG_FIRST_PROMPT:-0}" = "1" ]; then # 仅调试用
+        printf '[shell:first-prompt,pid=%s,ppid=%s,last_exit=%s,path=%q]\n' "$$" "$PPID" "$last_exit" "$_PS1_PATH" # 仅调试用
+        _ACODE_DIAG_FIRST_PROMPT=0 # 仅调试用
+    fi # 仅调试用
 }
 
 PROMPT_COMMAND='_update_prompt_state'
@@ -597,9 +607,89 @@ run_auto_exec_probe_before_axs() {
     local auto_probe_sample_interval_ms="${AXS_AUTO_EXEC_PROBE_SAMPLE_INTERVAL_MS:-5}" # 仅调试用
     local auto_probe_wrap_sig54="${AXS_AUTO_EXEC_PROBE_WRAP_SIG54:-1}" # 仅调试用
     local auto_probe_arm_ms="${AXS_AUTO_EXEC_PROBE_ARM_MS:-40}" # 仅调试用
+    local auto_probe_abort_on_trigger="${AXS_AUTO_EXEC_PROBE_ABORT_ON_TRIGGER:-0}" # 仅调试用
     local auto_probe_rc=0 # 仅调试用
 
-    printf '[init:auto-exec-probe-enabled=%s,stop=%s,max_attempts=%s,pause_ms=%s,sample_rounds=%s,sample_interval_ms=%s,wrap_sig54=%s,arm_ms=%s]\n' "$auto_probe_enabled" "$auto_probe_stop_code" "$auto_probe_max_attempts" "$auto_probe_pause_ms" "$auto_probe_sample_rounds" "$auto_probe_sample_interval_ms" "$auto_probe_wrap_sig54" "$auto_probe_arm_ms" >&2 # 仅调试用
+    run_auto_exec_signal_catcher_probe_after_trigger() {
+        local catch_stop_code="$1" # 仅调试用
+        local catch_arm_ms="$2" # 仅调试用
+        local catch_wrap_sig54="$3" # 仅调试用
+        local catch_enabled="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_ON_TRIGGER:-1}" # 仅调试用
+        local catch_max_attempts="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_MAX_ATTEMPTS:-40}" # 仅调试用
+        local catch_pause_ms="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_PAUSE_MS:-0}" # 仅调试用
+        local catch_sample_rounds="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_SAMPLE_ROUNDS:-80}" # 仅调试用
+        local catch_sample_interval_ms="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_SAMPLE_INTERVAL_MS:-1}" # 仅调试用
+        local catch_wait_ms="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_WAIT_MS:-120}" # 仅调试用
+        local catch_rc=0 # 仅调试用
+
+        printf '[init:auto-exec-probe-signal-catcher-enabled=%s,max_attempts=%s,pause_ms=%s,sample_rounds=%s,sample_interval_ms=%s,wrap_sig54=%s,wait_ms=%s]\n' "$catch_enabled" "$catch_max_attempts" "$catch_pause_ms" "$catch_sample_rounds" "$catch_sample_interval_ms" "$catch_wrap_sig54" "$catch_wait_ms" >&2 # 仅调试用
+        [ "$catch_enabled" = "1" ] || return 0 # 仅调试用
+        if [ "$catch_wrap_sig54" != "1" ]; then # 仅调试用
+            echo '[init:auto-exec-probe-signal-catcher-skipped,reason=wrap_sig54_disabled]' >&2 # 仅调试用
+            return 0 # 仅调试用
+        fi # 仅调试用
+
+        # 仅调试用: 用户现在要验证“182 是否只针对 bash”。这里把 bash 换成一个
+        # 受控 native target：sig54-probe 在 exec 前继续把 54 维持为 blocked，
+        # target 刚进入用户态就安装 handler 并放行 54。若它仍报 182，就说明问题
+        # 不是 bash 私有；若它能稳定抓到 54 且 0 退出，bash/loader 路径就更可疑。 # 仅调试用
+        echo '[init:auto-exec-probe-signal-catcher-begin,target=sig54-catch-probe]' >&2 # 仅调试用
+        /usr/local/bin/axs exec-probe --stop-on-exit-code "$catch_stop_code" --max-attempts "$catch_max_attempts" --pause-ms "$catch_pause_ms" --sample-rounds "$catch_sample_rounds" --sample-interval-ms "$catch_sample_interval_ms" --wrap-sig54-probe --sig54-probe-preserve-blocked-on-exec --arm-ms "$catch_arm_ms" -- /usr/local/bin/axs sig54-catch-probe --signal 54 --wait-ms "$catch_wait_ms" # 仅调试用
+        catch_rc=$? # 仅调试用
+
+        printf '[init:auto-exec-probe-signal-catcher-rc=%s]\n' "$catch_rc" >&2 # 仅调试用
+        if [ "$catch_rc" -eq "$catch_stop_code" ]; then # 仅调试用
+            printf '[init:auto-exec-probe-signal-catcher-triggered,rc=%s]\n' "$catch_rc" >&2 # 仅调试用
+            return 0 # 仅调试用
+        fi # 仅调试用
+        if [ "$catch_rc" -ne 0 ]; then # 仅调试用
+            printf '[init:auto-exec-probe-signal-catcher-failed,rc=%s]\n' "$catch_rc" >&2 # 仅调试用
+            return 0 # 仅调试用
+        fi # 仅调试用
+        echo '[init:auto-exec-probe-signal-catcher-exhausted-or-clean]' >&2 # 仅调试用
+        return 0 # 仅调试用
+    }
+
+    run_auto_exec_stage_wrapper_probe_after_trigger() {
+        local stage_stop_code="$1" # 仅调试用
+        local stage_arm_ms="$2" # 仅调试用
+        local stage_wrap_sig54="$3" # 仅调试用
+        local stage_enabled="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_ON_TRIGGER:-1}" # 仅调试用
+        local stage_max_attempts="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_MAX_ATTEMPTS:-40}" # 仅调试用
+        local stage_pause_ms="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_PAUSE_MS:-0}" # 仅调试用
+        local stage_sample_rounds="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_SAMPLE_ROUNDS:-80}" # 仅调试用
+        local stage_sample_interval_ms="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_SAMPLE_INTERVAL_MS:-1}" # 仅调试用
+        local stage_rc=0 # 仅调试用
+
+        printf '[init:auto-exec-probe-stage-wrapper-enabled=%s,max_attempts=%s,pause_ms=%s,sample_rounds=%s,sample_interval_ms=%s,wrap_sig54=%s]\n' "$stage_enabled" "$stage_max_attempts" "$stage_pause_ms" "$stage_sample_rounds" "$stage_sample_interval_ms" "$stage_wrap_sig54" >&2 # 仅调试用
+        [ "$stage_enabled" = "1" ] || return 0 # 仅调试用
+
+        # 仅调试用: 直连 probe 负责保留“真实触发器”，这里在它命中 182 后立刻补一轮
+        # sigprobe -> stage-wrapper -> bash 的二阶段复现，把原来不可见的 handoff 窗口
+        # 再切开一层。若这轮仍触发 182，就能直接回答故障死在 wrapper 前还是 bash 前。 # 仅调试用
+        echo '[init:auto-exec-probe-stage-wrapper-begin,target=sigprobe-stage-wrapper-bash-minimal]' >&2 # 仅调试用
+        if [ "$stage_wrap_sig54" = "1" ]; then # 仅调试用
+            /usr/local/bin/axs exec-probe --stop-on-exit-code "$stage_stop_code" --max-attempts "$stage_max_attempts" --pause-ms "$stage_pause_ms" --sample-rounds "$stage_sample_rounds" --sample-interval-ms "$stage_sample_interval_ms" --wrap-sig54-probe --arm-ms "$stage_arm_ms" -- /usr/local/bin/axs exec-stage-probe --stage-label bash-minimal -- bash --noprofile --norc -c 'printf "[init:auto-exec-probe-stage-wrapper-bash-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' # 仅调试用
+            stage_rc=$? # 仅调试用
+        else # 仅调试用
+            /usr/local/bin/axs exec-probe --stop-on-exit-code "$stage_stop_code" --max-attempts "$stage_max_attempts" --pause-ms "$stage_pause_ms" --sample-rounds "$stage_sample_rounds" --sample-interval-ms "$stage_sample_interval_ms" -- /usr/local/bin/axs exec-stage-probe --stage-label bash-minimal -- bash --noprofile --norc -c 'printf "[init:auto-exec-probe-stage-wrapper-bash-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' # 仅调试用
+            stage_rc=$? # 仅调试用
+        fi # 仅调试用
+
+        printf '[init:auto-exec-probe-stage-wrapper-rc=%s]\n' "$stage_rc" >&2 # 仅调试用
+        if [ "$stage_rc" -eq "$stage_stop_code" ]; then # 仅调试用
+            printf '[init:auto-exec-probe-stage-wrapper-triggered,rc=%s]\n' "$stage_rc" >&2 # 仅调试用
+            return 0 # 仅调试用
+        fi # 仅调试用
+        if [ "$stage_rc" -ne 0 ]; then # 仅调试用
+            printf '[init:auto-exec-probe-stage-wrapper-failed,rc=%s]\n' "$stage_rc" >&2 # 仅调试用
+            return 0 # 仅调试用
+        fi # 仅调试用
+        echo '[init:auto-exec-probe-stage-wrapper-exhausted-or-clean]' >&2 # 仅调试用
+        return 0 # 仅调试用
+    }
+
+    printf '[init:auto-exec-probe-enabled=%s,stop=%s,max_attempts=%s,pause_ms=%s,sample_rounds=%s,sample_interval_ms=%s,wrap_sig54=%s,arm_ms=%s,abort_on_trigger=%s]\n' "$auto_probe_enabled" "$auto_probe_stop_code" "$auto_probe_max_attempts" "$auto_probe_pause_ms" "$auto_probe_sample_rounds" "$auto_probe_sample_interval_ms" "$auto_probe_wrap_sig54" "$auto_probe_arm_ms" "$auto_probe_abort_on_trigger" >&2 # 仅调试用
     if [ "$auto_probe_enabled" != "1" ]; then # 仅调试用
         return 0 # 仅调试用
     fi # 仅调试用
@@ -614,9 +704,19 @@ run_auto_exec_probe_before_axs() {
     fi # 仅调试用
 
     printf '[init:auto-exec-probe-rc=%s]\n' "$auto_probe_rc" >&2 # 仅调试用
+    # 仅调试用: auto probe 的职责只是先把 182 复现并打点，不应默认替代真实启动链。 # 仅调试用
+    # 仅调试用: 之前命中后立刻 exit，前端只剩“AXS exited”这一层传播结果，bash/PTY # 仅调试用
+    # 仅调试用: 真实会话完全没机会启动，后续证据链被 probe 自己截断。默认继续进入 # 仅调试用
+    # 仅调试用: 真实 AXS 路径，只在显式要求时保留旧的 abort 行为。 # 仅调试用
     if [ "$auto_probe_rc" -eq "$auto_probe_stop_code" ]; then # 仅调试用
-        printf '[init:auto-exec-probe-triggered,rc=%s]\n' "$auto_probe_rc" >&2 # 仅调试用
-        exit "$auto_probe_rc" # 仅调试用
+        run_auto_exec_signal_catcher_probe_after_trigger "$auto_probe_stop_code" "$auto_probe_arm_ms" "$auto_probe_wrap_sig54" # 仅调试用
+        run_auto_exec_stage_wrapper_probe_after_trigger "$auto_probe_stop_code" "$auto_probe_arm_ms" "$auto_probe_wrap_sig54" # 仅调试用
+        if [ "$auto_probe_abort_on_trigger" = "1" ]; then # 仅调试用
+            printf '[init:auto-exec-probe-triggered,rc=%s,abort_on_trigger=1]\n' "$auto_probe_rc" >&2 # 仅调试用
+            exit "$auto_probe_rc" # 仅调试用
+        fi # 仅调试用
+        printf '[init:auto-exec-probe-triggered,rc=%s,abort_on_trigger=0,continuing-to-axs]\n' "$auto_probe_rc" >&2 # 仅调试用
+        return 0 # 仅调试用
     fi # 仅调试用
     if [ "$auto_probe_rc" -ne 0 ]; then # 仅调试用
         printf '[init:auto-exec-probe-failed,rc=%s]\n' "$auto_probe_rc" >&2 # 仅调试用

@@ -147,12 +147,14 @@ awk '/^Sig(Q|Pnd|Blk|Ign|Cgt):/ {print}' "/proc/$$/status" 2>/dev/null | sed 's/
 for _sb_p in $$ $PPID; do awk '{printf("[sandbox:session-before] pid=%s comm=%s state=%s ppid=%s pgrp=%s sid=%s tty=%s tpgid=%s\n", $1, $2, $3, $4, $5, $6, $7, $8)}' "/proc/$_sb_p/stat" 2>/dev/null >&2; done # 仅调试用
 cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null | sed 's/^/[sandbox:ptrace_scope] /' >&2 || echo "[sandbox:ptrace_scope=<unavailable>]" >&2 # 仅调试用
 grep -E '^(Seccomp|NoNewPrivs):' "/proc/$$/status" 2>/dev/null | sed 's/^/[sandbox:seccomp] /' >&2 || echo "[sandbox:seccomp=<unavailable>]" >&2 # 仅调试用
-# 仅调试用: Keep signal 54 ignored across fork+exec while the exit-182 investigation
-# continues. Fresh logs show failing proot already has SigIgn 7fffffffffc0f053 before
-# exit 182, so this trap is no longer treated as proof of root cause; the new logs below
-# are meant to distinguish "proot itself got 54" from "proot returned a tracee status 182".
-trap '' 54 # 仅调试用
-printf '[sandbox:sig54-pre-ignored]\n' >&2 # 仅调试用
+# 仅调试用: Use logging trap instead of silent SIG_IGN, so we can see if signal 54
+# is delivered to the parent shell (which would prove it's a broadcast/group signal
+# rather than targeted at proot alone).
+# NOTE: trap '' 54 sets SIG_IGN which is inherited by fork, but proot installs its
+# own signal handlers during startup, overriding inherited SIG_IGN. So this trap
+# only tells us about signals reaching the PARENT shell.
+trap 'printf "[sandbox:CAUGHT-SIG54-in-parent,time=$(date +%H:%M:%S.%N)]\n" >&2' 54 # 仅调试用
+printf '[sandbox:sig54-trap-set]\n' >&2 # 仅调试用
 # 仅调试用: Start proot asynchronously and sample /proc/$proot_pid before a fast
 # signal-54 death erases the child/tracer state. The failing window has no
 # [alpine:L1], so the missing fact is whether proot ever spawns /bin/sh at all.
@@ -203,14 +205,45 @@ while [ "$probe_round" -le 5 ]; do # 仅调试用
     probe_round=$((probe_round + 1)) # 仅调试用
     sleep 0.05 # 仅调试用
 done
+# 仅调试用: Before wait, poll for zombie state. /proc/PID exists for zombies;
+# we can read /proc/PID/stat field 52 (exit_signal) to see what signal the
+# kernel recorded, and compare with wait's $?.
+_zombie_captured=n # 仅调试用
+_zombie_try=0 # 仅调试用
+while [ "$_zombie_try" -lt 50 ]; do # 仅调试用
+    if [ -f "/proc/$proot_pid/stat" ]; then # 仅调试用
+        _zstate=$(awk '{print $3}' "/proc/$proot_pid/stat" 2>/dev/null) # 仅调试用
+        if [ "$_zstate" = "Z" ]; then # 仅调试用
+            # 仅调试用: Zombie found! Read full stat line before wait reaps it.
+            # Fields: $3=state, $4=ppid, $52=exit_signal, stat string has exit info
+            printf '[sandbox:zombie-stat] ' >&2 # 仅调试用
+            cat "/proc/$proot_pid/stat" 2>/dev/null >&2 # 仅调试用
+            printf '\n' >&2 # 仅调试用
+            awk '/^(Name|State|SigPnd|ShdPnd|SigIgn|SigCgt):/' "/proc/$proot_pid/status" 2>/dev/null | sed "s/^/[sandbox:zombie-status] /" >&2 # 仅调试用
+            _zombie_captured=y # 仅调试用
+            break # 仅调试用
+        fi # 仅调试用
+    else # 仅调试用
+        # /proc gone = already reaped by shell (shouldn't happen before wait)
+        printf '[sandbox:zombie-missed,try=%s]\n' "$_zombie_try" >&2 # 仅调试用
+        break # 仅调试用
+    fi # 仅调试用
+    _zombie_try=$((_zombie_try + 1)) # 仅调试用
+    sleep 0.01 # 仅调试用
+done # 仅调试用
+if [ "$_zombie_captured" = "n" ] && [ -f "/proc/$proot_pid/stat" ]; then # 仅调试用
+    printf '[sandbox:zombie-timeout,state=%s]\n' "$(awk '{print $3}' "/proc/$proot_pid/stat" 2>/dev/null)" >&2 # 仅调试用
+fi # 仅调试用
 wait "$proot_pid" # 仅调试用
 proot_rc=$? # 仅调试用
 printf '[sandbox:proot-rc=%s,installing=%s,args=%s]\n' "$proot_rc" "$1" "$*" >&2 # 仅调试用
-# 仅调试用: signal analysis — exit codes > 128 indicate the child was killed by
-# signal (exit_code - 128). 182 - 128 = 54, which is SIGRTMIN+20 on Linux.
-# If [alpine:L1] is ABSENT, /bin/sh did not reach script entry. With current evidence,
-# that alone no longer proves proot itself died before installing SigIgn; correlate it
-# with [sandbox:proot-stat], [sandbox:proot-wchan], and [sandbox:child-status] first.
+# 仅调试用: $? = 182 is AMBIGUOUS: shell cannot distinguish between:
+#   a) proot killed by signal 54 → wait encodes as 128+54=182
+#   b) proot called exit(182) internally (e.g. propagating tracee's signal death)
+# Use zombie-stat probe above to distinguish: zombie /proc/PID/stat records
+# the raw kernel wait status which separates WIFSIGNALED from WIFEXITED.
+# Also check sandbox:CAUGHT-SIG54-in-parent to see if signal hit the whole
+# process group (would prove external signal) vs proot-only (could be exit(182)).
 if [ "$proot_rc" -ne 0 ]; then
     if [ "$proot_rc" -gt 128 ]; then
         printf '[sandbox:signal=%s,code=128+%s]\n' "$((proot_rc - 128))" "$((proot_rc - 128))" >&2
