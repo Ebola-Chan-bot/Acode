@@ -81,10 +81,22 @@ repair_script_interpreters() {
 }
 
 run_apk_step() {
+    local step_label="$1" # 仅调试用
+    local repo_mode="$2" # 仅调试用
+    local step_started_at="" # 仅调试用
+    local step_finished_at="" # 仅调试用
+    local step_rc=0 # 仅调试用
     shift
     shift
+    # 仅调试用: Bracket apk add so the next slow install shows whether time is
+    # 仅调试用: spent inside apk itself before it emits any package progress.
+    step_started_at="$(date +%s 2>/dev/null || true)" # 仅调试用
+    printf '[alpine:apk-step-begin,label=%s,repo=%s,ts=%s,cmd=%s]\n' "$step_label" "$repo_mode" "$step_started_at" "$*" >&2 # 仅调试用
     "$@"
-    return $?
+    step_rc=$? # 仅调试用
+    step_finished_at="$(date +%s 2>/dev/null || true)" # 仅调试用
+    printf '[alpine:apk-step-end,label=%s,repo=%s,rc=%s,elapsed_s=%s]\n' "$step_label" "$repo_mode" "$step_rc" "$((step_finished_at - step_started_at))" >&2 # 仅调试用
+    return $step_rc
 }
 
 configure_apk_repositories() {
@@ -576,6 +588,44 @@ wait_for_axs_ready() {
     return 1
 }
 
+run_auto_exec_probe_before_axs() {
+    local auto_probe_enabled="${AXS_AUTO_EXEC_PROBE_ON_INIT:-1}" # 仅调试用
+    local auto_probe_stop_code="${AXS_AUTO_EXEC_PROBE_STOP_ON_EXIT_CODE:-182}" # 仅调试用
+    local auto_probe_max_attempts="${AXS_AUTO_EXEC_PROBE_MAX_ATTEMPTS:-200}" # 仅调试用
+    local auto_probe_pause_ms="${AXS_AUTO_EXEC_PROBE_PAUSE_MS:-0}" # 仅调试用
+    local auto_probe_sample_rounds="${AXS_AUTO_EXEC_PROBE_SAMPLE_ROUNDS:-12}" # 仅调试用
+    local auto_probe_sample_interval_ms="${AXS_AUTO_EXEC_PROBE_SAMPLE_INTERVAL_MS:-5}" # 仅调试用
+    local auto_probe_wrap_sig54="${AXS_AUTO_EXEC_PROBE_WRAP_SIG54:-1}" # 仅调试用
+    local auto_probe_arm_ms="${AXS_AUTO_EXEC_PROBE_ARM_MS:-40}" # 仅调试用
+    local auto_probe_rc=0 # 仅调试用
+
+    printf '[init:auto-exec-probe-enabled=%s,stop=%s,max_attempts=%s,pause_ms=%s,sample_rounds=%s,sample_interval_ms=%s,wrap_sig54=%s,arm_ms=%s]\n' "$auto_probe_enabled" "$auto_probe_stop_code" "$auto_probe_max_attempts" "$auto_probe_pause_ms" "$auto_probe_sample_rounds" "$auto_probe_sample_interval_ms" "$auto_probe_wrap_sig54" "$auto_probe_arm_ms" >&2 # 仅调试用
+    if [ "$auto_probe_enabled" != "1" ]; then # 仅调试用
+        return 0 # 仅调试用
+    fi # 仅调试用
+
+    echo '[init:auto-exec-probe-begin,target=bash-minimal]' >&2 # 仅调试用
+    if [ "$auto_probe_wrap_sig54" = "1" ]; then # 仅调试用
+        /usr/local/bin/axs exec-probe --stop-on-exit-code "$auto_probe_stop_code" --max-attempts "$auto_probe_max_attempts" --pause-ms "$auto_probe_pause_ms" --sample-rounds "$auto_probe_sample_rounds" --sample-interval-ms "$auto_probe_sample_interval_ms" --wrap-sig54-probe --arm-ms "$auto_probe_arm_ms" -- bash --noprofile --norc -c 'printf "[init:auto-exec-probe-bash-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' # 仅调试用
+        auto_probe_rc=$? # 仅调试用
+    else # 仅调试用
+        /usr/local/bin/axs exec-probe --stop-on-exit-code "$auto_probe_stop_code" --max-attempts "$auto_probe_max_attempts" --pause-ms "$auto_probe_pause_ms" --sample-rounds "$auto_probe_sample_rounds" --sample-interval-ms "$auto_probe_sample_interval_ms" -- bash --noprofile --norc -c 'printf "[init:auto-exec-probe-bash-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' # 仅调试用
+        auto_probe_rc=$? # 仅调试用
+    fi # 仅调试用
+
+    printf '[init:auto-exec-probe-rc=%s]\n' "$auto_probe_rc" >&2 # 仅调试用
+    if [ "$auto_probe_rc" -eq "$auto_probe_stop_code" ]; then # 仅调试用
+        printf '[init:auto-exec-probe-triggered,rc=%s]\n' "$auto_probe_rc" >&2 # 仅调试用
+        exit "$auto_probe_rc" # 仅调试用
+    fi # 仅调试用
+    if [ "$auto_probe_rc" -ne 0 ]; then # 仅调试用
+        printf '[init:auto-exec-probe-failed,rc=%s]\n' "$auto_probe_rc" >&2 # 仅调试用
+        exit "$auto_probe_rc" # 仅调试用
+    fi # 仅调试用
+
+    echo '[init:auto-exec-probe-exhausted,continuing-to-axs]' >&2 # 仅调试用
+}
+
 #actual source
 #everytime a terminal is started initrc will run
 # A refreshed Alpine rootfs can legitimately miss /usr/local/bin until the first
@@ -706,10 +756,23 @@ else
 fi
 # 仅调试用: wrapper 脚本方案已验证不可行 — proot ptrace 拦截 execve 时
 # 对 /tmp 内脚本产生 EFAULT (Bad address, os error 14)，导致所有 PTY 创建失败。
-# 直接使用 bash，依赖 pre_exec 中的 [axs:tty=y,pgrp=ok] 探针 +
-# initrc 首行 [initrc:L1] 探针来定位崩溃阶段。
+# 这里保留直接 bash 路径作为低扰动基线，继续依赖 pre_exec 中的
+# [axs:tty=y,pgrp=ok] 探针 + initrc 首行 [initrc:L1] 探针定位崩溃阶段。
+# 若要主动抓 signal 54 的 sender，则切换到 axs 内置 sig54-probe 子命令。
+# 之所以做成 axs 原生命令而不是 shell wrapper，是因为前者只增加一次
+# 原生 execve，不会重新触发已验证会在 proot 下报 EFAULT 的脚本解释器链路。 仅调试用
 echo "[init:exec-axs]" >&2 # 仅调试用
-"/usr/local/bin/axs" -c "bash --rcfile /initrc -i" &
+run_auto_exec_probe_before_axs # 仅调试用
+printf '[init:sig54-probe-enabled=%s]\n' "${AXS_SIG54_SENDER_PROBE:-0}" >&2 # 仅调试用
+axs_terminal_command='bash --rcfile /initrc -i' # 仅调试用
+if [ "${AXS_SIG54_SENDER_PROBE:-0}" = "1" ]; then # 仅调试用
+    # 仅调试用: 主动 sender probe 会先在 bash exec 之前用 sigtimedwait 盯一个很短的窗口；
+    # 默认关闭，避免它改变低扰动基线路径。需要抓 sender 时再显式打开。 仅调试用
+    axs_terminal_command='/usr/local/bin/axs sig54-probe --signal 54 --arm-ms 40 -- bash --rcfile /initrc -i' # 仅调试用
+    echo '[init:exec-axs-sig54-probe]' >&2 # 仅调试用
+fi # 仅调试用
+printf '[init:exec-axs-cmd=%s]\n' "$axs_terminal_command" >&2 # 仅调试用
+"/usr/local/bin/axs" -c "$axs_terminal_command" &
 axs_pid=$!
 echo "[init:axs-pid=$axs_pid]" >&2 # 仅调试用
 wait_for_axs_ready "$axs_pid"
