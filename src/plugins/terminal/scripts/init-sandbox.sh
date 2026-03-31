@@ -155,6 +155,20 @@ grep -E '^(Seccomp|NoNewPrivs):' "/proc/$$/status" 2>/dev/null | sed 's/^/[sandb
 # only tells us about signals reaching the PARENT shell.
 trap 'printf "[sandbox:CAUGHT-SIG54-in-parent,time=$(date +%H:%M:%S.%N)]\n" >&2' 54 # 仅调试用
 printf '[sandbox:sig54-trap-set]\n' >&2 # 仅调试用
+
+# Signal 54 (SIGRTMIN+20) kills proot or its tracee unpredictably during startup,
+# producing exit code 182 (128+54). Root cause is under investigation; the signal
+# is transient and a simple retry always succeeds within a few attempts.
+# Wrap the entire proot launch + wait + diagnostics in an infinite retry loop
+# that only re-launches on exit code 182. Any other exit code passes through.
+_proot_retry=0
+while true; do
+_proot_retry=$((_proot_retry + 1))
+printf '[sandbox:proot-attempt=%s]\n' "$_proot_retry" >&2
+
+# Clear stale ptrace tracking files from previous failed attempt
+rm -rf "$PROOT_TMP_DIR"/*
+
 # 仅调试用: Start proot asynchronously and sample /proc/$proot_pid before a fast
 # signal-54 death erases the child/tracer state. The failing window has no
 # [alpine:L1], so the missing fact is whether proot ever spawns /bin/sh at all.
@@ -261,4 +275,15 @@ if [ "$proot_rc" -ne 0 ]; then
     _sandbox_ps_after=$(ps -e -o pid,ppid,comm 2>/dev/null | grep -E 'proot|axs|init-alpine|init-sandbox' | grep -v grep) # 仅调试用
     if [ -n "$_sandbox_ps_after" ]; then echo "$_sandbox_ps_after" | sed 's/^/[sandbox:ps-after] /' >&2; else echo "[sandbox:ps-after=<none>]" >&2; fi # 仅调试用
 fi
+
+# Exit code 182 = signal 54 killed proot or its tracee; retry immediately.
+# Any other exit code (including 0) breaks out of the retry loop.
+if [ "$proot_rc" -eq 182 ]; then
+    printf '[sandbox:proot-retry,attempt=%s,rc=182]\n' "$_proot_retry" >&2
+    continue
+fi
+
+break
+done # end of proot retry loop
+
 exit "$proot_rc"
