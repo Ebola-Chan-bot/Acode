@@ -165,23 +165,6 @@ const renderInitAlpineContent = (content, alpineBranch) => {
     return content.replaceAll("__ALPINE_BRANCH__", alpineBranch);
 };
 
-const verifyWrittenInitAlpine = async (filesDir, logger = console.log) => {
-    const initAlpinePath = `${filesDir}/init-alpine.sh`;
-    const initAlpineContent = await Executor.execute(`cat "${initAlpinePath}"`);
-    const hasBashProbe = initAlpineContent.includes("[init:bash-probe-begin]");
-    const hasExecAxs = initAlpineContent.includes("[init:exec-axs]");
-    const lineCount = initAlpineContent.split("\n").length;
-
-    // Recent 182 repros showed wget probe lines from filesDir/init-alpine.sh while the
-    // newer bash probe block was completely missing, even though the packaged asset had
-    // already been updated. Verify the exact runtime script path before launching so we
-    // fail fast on stale or partially-written files instead of diagnosing the wrong file. 
-    logger(`[init:script-verify,bash_probe=${hasBashProbe ? 1 : 0},exec_axs=${hasExecAxs ? 1 : 0},lines=${lineCount},path=${initAlpinePath}]`);
-
-    if (!hasBashProbe || !hasExecAxs) {
-        throw new Error(`Runtime init-alpine verification failed: bashProbe=${hasBashProbe} execAxs=${hasExecAxs} path=${initAlpinePath} lines=${lineCount}`);
-    }
-};
 
 const Terminal = {
     async getDownloadTargets() {
@@ -255,7 +238,6 @@ const Terminal = {
             return new Promise((resolve) => {
                 (async () => {
                     await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
-                    await verifyWrittenInitAlpine(filesDir, logger);
                     await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
                     await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
                     await setExecutable(`${filesDir}/alpine/bin/rm`, true);
@@ -302,7 +284,6 @@ const Terminal = {
             });
         } else {
             await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
-            await verifyWrittenInitAlpine(filesDir, logger);
             await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
             await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
             await setExecutable(`${filesDir}/alpine/bin/rm`, true);
@@ -431,7 +412,6 @@ const Terminal = {
         let alreadyExtracted = await fileExists(`${filesDir}/.extracted`);
         let alreadyConfigured = await fileExists(`${filesDir}/.configured`);
         const hasPidFile = await fileExists(`${filesDir}/pid`);
-        console.info('[install-entry]', JSON.stringify({alreadyDownloaded,alreadyExtracted,alreadyConfigured,hasPidFile})); // 仅调试用
         try {
             const {
                 alpineUrl,
@@ -447,7 +427,6 @@ const Terminal = {
                 const currentManifest = [alpineUrl, axsUrl].join("\n");
                 const savedManifest = await Executor.execute(`cat "${filesDir}/.download-manifest" 2>/dev/null || echo ""`);
                 if (savedManifest !== currentManifest) {
-                    console.warn('[install-cache-invalidate]', 'saved:', JSON.stringify(savedManifest), 'current:', JSON.stringify(currentManifest)); // 仅调试用
                     logger("🔄  Update detected, clearing download cache...");
                     await Executor.execute(`rm -rf "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/axs" "${filesDir}/.download-manifest"`).catch(() => {});
                     alreadyDownloaded = false;
@@ -537,8 +516,6 @@ const Terminal = {
                 });
 
                 logger("📦  Extracting sandbox filesystem...");
-                const tarStat = await Executor.execute(`ls -la "${filesDir}/alpine.tar.gz" && file "${filesDir}/alpine.tar.gz" 2>&1 || echo STAT_FAILED`).catch(e => 'stat-error:'+e); // 仅调试用
-                console.info('[install-extract-pre]', tarStat); // 仅调试用
                 await Executor.execute(`tar --no-same-owner -xf "${filesDir}/alpine.tar.gz" -C "${alpineDir}"`);
 
                 logger("⚙️  Applying basic configuration...");
@@ -572,7 +549,6 @@ const Terminal = {
 
         } catch (e) {
             err_logger("Installation failed:", e);
-            console.error('[install-catch-cleanup]', 'removing all markers due to install failure:', formatInstallError(e)); // 仅调试用
             // Clean up everything so the next manual attempt starts from a fully fresh state
             // instead of inheriting partially downloaded or partially extracted artifacts from
             // the failed run that just produced the diagnostic logs above.
@@ -618,17 +594,8 @@ const Terminal = {
                 }, reject);
             });
 
-            console.info('[install-markers]', JSON.stringify({alpine:alpineExists,downloaded,extracted,configured})); // 仅调试用
-            // 仅调试用: When alpine dir disappears without explicit uninstall, log filesDir
             // and ls output to detect whether install catch-cleanup from a dying WebView
             // context deleted the rootfs (see install() catch block's rm -rf).
-            if (!alpineExists) { // 仅调试用
-                console.warn('[install-markers-missing]', JSON.stringify({filesDir})); // 仅调试用
-                Executor.execute(`ls -la "${filesDir}/" 2>&1 | head -20`).then( // 仅调试用
-                    r => console.warn('[install-markers-ls]', r), // 仅调试用
-                    () => {} // 仅调试用
-                ); // 仅调试用
-            } // 仅调试用
             resolve(alpineExists && downloaded && extracted && configured);
         });
     },

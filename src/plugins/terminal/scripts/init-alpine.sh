@@ -1,6 +1,4 @@
-# 仅调试用: first-line probe — if this line is ABSENT while proot exits 182,
-# then /bin/sh itself crashed before script execution began (ptrace setup failure).
-echo "[alpine:L1,pid=$$,ppid=$PPID,args=$*]" >&2
+printf '[init-alpine:enter,argc=%s,PREFIX=%s]\n' "$#" "$PREFIX" >&2 # 仅调试用
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/share/bin:/usr/share/sbin:/usr/local/bin:/usr/local/sbin:/system/bin:/system/xbin:$PREFIX/local/bin
 export HOME=/home
 export TERM=xterm-256color
@@ -81,22 +79,9 @@ repair_script_interpreters() {
 }
 
 run_apk_step() {
-    local step_label="$1" # 仅调试用
-    local repo_mode="$2" # 仅调试用
-    local step_started_at="" # 仅调试用
-    local step_finished_at="" # 仅调试用
-    local step_rc=0 # 仅调试用
     shift
     shift
-    # 仅调试用: Bracket apk add so the next slow install shows whether time is
-    # 仅调试用: spent inside apk itself before it emits any package progress.
-    step_started_at="$(date +%s 2>/dev/null || true)" # 仅调试用
-    printf '[alpine:apk-step-begin,label=%s,repo=%s,ts=%s,cmd=%s]\n' "$step_label" "$repo_mode" "$step_started_at" "$*" >&2 # 仅调试用
     "$@"
-    step_rc=$? # 仅调试用
-    step_finished_at="$(date +%s 2>/dev/null || true)" # 仅调试用
-    printf '[alpine:apk-step-end,label=%s,repo=%s,rc=%s,elapsed_s=%s]\n' "$step_label" "$repo_mode" "$step_rc" "$((step_finished_at - step_started_at))" >&2 # 仅调试用
-    return $step_rc
 }
 
 configure_apk_repositories() {
@@ -253,10 +238,9 @@ fi
 
 
 if [ "$#" -eq 0 ]; then
-    echo "[init:normal,pid=$$]" >&2 # 仅调试用
+    printf '[init-alpine:normal-mode,pid=%s]\n' "$$" >&2 # 仅调试用
     echo "$$" > "$PREFIX/pid"
     chmod +x "$PREFIX/axs"
-    echo "[init:normal-post-pid]" >&2 # 仅调试用: 到此说明 pid 写入和 chmod 正常
 
     if [ ! -s "$PREFIX/alpine/etc/acode_motd" ]; then
         cat <<EOF > "$PREFIX/alpine/etc/acode_motd"
@@ -282,61 +266,6 @@ EOF
     # Using a temp file preserves the existing initrc on failure.
     cat <<'EOF' > "$PREFIX/alpine/initrc.tmp"
 # Source rc files if they exist
-
-    # Pure-builtin probe: no forks, no command substitution.
-    # If this line appears in scrollback, bash reached rcfile processing;
-    # if only [axs:tty=y,pgrp=ok] appears, exec(bash) or bash initialization
-    # failed before rcfile was read.  (Terminal 1 rc=182 crash diagnostic) 仅调试用
-    printf '[initrc:L1,pid=%s,ppid=%s]\n' "$$" "$PPID" # 仅调试用
-
-    # 仅调试用: signal 54 forensics — read /proc/self/status signal fields to see
-    # if signal 54 was delivered-and-blocked (SigPnd bit 53). Also read parent
-    # (axs) and grandparent (proot) signal state to trace the signal source.
-    # bit 53 in 16-char hex SigPnd = 3rd char from left, mask 0x2.
-    if [ -f /proc/self/status ]; then
-        _sig_self=$(grep '^Sig' /proc/self/status 2>/dev/null | tr '\n' ' ')
-        _sig_parent=$(grep '^Sig' /proc/$PPID/status 2>/dev/null | tr '\n' ' ')
-        _gpid=$(awk '/^PPid:/{print $2}' /proc/$PPID/status 2>/dev/null)
-        _sig_gparent=$(grep '^Sig' /proc/$_gpid/status 2>/dev/null | tr '\n' ' ')
-        _gp_comm=$(cat /proc/$_gpid/comm 2>/dev/null)
-        _p_comm=$(cat /proc/$PPID/comm 2>/dev/null)
-        printf '[initrc:sig54-forensics,self=%s(%s),parent=%s(%s),grandparent=%s(%s)]\n' \
-            "$$" "$_sig_self" "$PPID" "$_sig_parent" "$_gpid" "$_sig_gparent"
-        printf '[initrc:ancestry,self=%s,parent=%s(%s),grandparent=%s(%s)]\n' \
-            "$$" "$PPID" "$_p_comm" "$_gpid" "$_gp_comm"
-        # Check if signal 54 (bit 53) is pending in self
-        _sigpnd=$(awk '/^SigPnd:/{print $2}' /proc/self/status 2>/dev/null)
-        if [ -n "$_sigpnd" ]; then
-            # Extract 3rd hex char from left (0-indexed: position 2), check bit 1 (mask 0x2)
-            _hex3=$(echo "$_sigpnd" | cut -c3)
-            _val=$(printf '%d' "0x$_hex3" 2>/dev/null || echo 0)
-            if [ $((_val & 2)) -ne 0 ]; then
-                printf '[initrc:sig54-PENDING,sigpnd=%s]\n' "$_sigpnd"
-            else
-                printf '[initrc:sig54-not-pending,sigpnd=%s]\n' "$_sigpnd"
-            fi
-        fi
-    fi # 仅调试用
-
-    # Emit an immediate shell-entry marker before any rc sourcing. The current
-    # Terminal 1 crash exits with code 182 before the client sees bootstrap output;
-    # the pure-builtin [initrc:L1] above disambiguates "exec failed" from
-    # "bash started but crashed during rcfile evaluation". 仅调试用
-    printf '[shell:initrc-enter,pid=%s,ppid=%s,argv0=%q,flags=%q,tty=%q]\n' "$$" "$PPID" "$0" "$-" "$(tty 2>/dev/null || echo no-tty)" >&2 # 仅调试用
-    # 当前复现里真实 PTY 已经出现 prompt，但同阶段的 stderr 探针一个都没有，单看 stderr
-    # 已经无法判断是 initrc 根本没执行，还是 live shell 的 stderr 在 WS/PTY 链路里被吞掉。
-    # 这里补一个直接写进 PTY stdout 的入口标记，下次复现只要看首屏有没有这行就能立刻分流。 仅调试用
-    printf '[shell:initrc-stdout-enter,pid=%s,ppid=%s,argv0=%q,flags=%q,tty=%q]\n' "$$" "$PPID" "$0" "$-" "$(tty 2>/dev/null || echo no-tty)" # 仅调试用
-
-    # 仅调试用: 如果真实交互 bash 在 initrc 之后亲自收到了 signal 54，这里必须直接 # 仅调试用
-    # 仅调试用: 留下一手标记，再恢复默认动作并重新向自己发送 54，避免把“bash 真被 # 仅调试用
-    # 仅调试用: 54 击中”改造成一个普通返回路径。 # 仅调试用
-    trap 'shell_last=$BASH_COMMAND; trap - EXIT 54; printf "[shell:sig54-caught,pid=%s,ppid=%s,last=%q,flags=%q]\n" "$$" "$PPID" "$shell_last" "$-" >&2; kill -54 "$$"' 54 # 仅调试用
-
-    # Keep an EXIT marker paired with the initrc-enter marker so the next repro can
-    # separate "bash never entered initrc" from "bash started and then exited 1
-    # during rc/bootstrap work" without needing logcat or an attached debugger. 仅调试用
-    trap 'shell_exit_rc=$?; printf "[shell:initrc-exit,pid=%s,ppid=%s,rc=%s,last=%q,flags=%q,tty=%q]\n" "$$" "$PPID" "$shell_exit_rc" "$BASH_COMMAND" "$-" "$(tty 2>/dev/null || echo no-tty)" >&2' EXIT # 仅调试用
 
 if [ -f "/etc/profile" ]; then
     source "/etc/profile"
@@ -383,28 +312,21 @@ _shorten_path() {
 
 _PS1_PATH="$(_shorten_path)"
 _PS1_EXIT=0
-_ACODE_DIAG_FIRST_PROMPT=1 # 仅调试用
 
 _update_prompt_state() {
     local last_exit=$?
     _PS1_PATH="$(_shorten_path)"
     _PS1_EXIT=$last_exit
-    if [ "${_ACODE_DIAG_FIRST_PROMPT:-0}" = "1" ]; then # 仅调试用
-        printf '[shell:first-prompt,pid=%s,ppid=%s,last_exit=%s,path=%q]\n' "$$" "$PPID" "$last_exit" "$_PS1_PATH" # 仅调试用
-        _ACODE_DIAG_FIRST_PROMPT=0 # 仅调试用
-    fi # 仅调试用
 }
 
 PROMPT_COMMAND='_update_prompt_state'
 
 # Source user configs AFTER defaults (so user can override PROMPT_COMMAND)
 if [ -f "$HOME/.bashrc" ]; then
-    echo "[rc:bashrc=y]" >&2 # 仅调试用
     source "$HOME/.bashrc"
 fi
 
 if [ -f /etc/bash/bashrc ]; then
-    echo "[rc:etc=y]" >&2 # 仅调试用
     source /etc/bash/bashrc
 fi
 
@@ -421,10 +343,6 @@ if [ -s /etc/acode_motd ]; then
 fi
 
 # Work around proot shebang execution failures for Bash's missing-command hook.
-# Bash normally auto-executes /usr/libexec/command-not-found when a command is
-# missing, but direct shebang execution can fail in proot with
-# "bad interpreter: Bad address". Run the original script explicitly through
-# /bin/sh so the script keeps working without relying on the broken shebang path.
 command_not_found_handle() {
     if [ -f /usr/libexec/command-not-found ]; then
         /bin/sh /usr/libexec/command-not-found "$@"
@@ -499,421 +417,51 @@ acode() {
 }
 
 EOF
-_initrc_heredoc_rc=$? # 仅调试用
-_initrc_post_heredoc_size=$(wc -c < "$PREFIX/alpine/initrc.tmp" 2>/dev/null) # 仅调试用
-_initrc_post_heredoc_line1=$(head -n 1 "$PREFIX/alpine/initrc.tmp" 2>/dev/null) # 仅调试用
-# 仅调试用: 日志显示第二次启动时 initrc 文件从 8673 字节缩水为 152 字节(仅 PS1 行),
-# 说明 heredoc 的 cat 没有产出任何内容。>重定向先截断文件, 然后 cat 以空输出退出,
-# 导致 grep 找不到 PS1= 从而追加, 最终 initrc 只剩 PS1。以下探针区分三种故障模式:
-# 1) cat 崩溃(rc>128) 2) cat 被终止但未崩溃(rc!=0) 3) heredoc temp 文件创建失败。
-printf '[init:initrc-heredoc-done,rc=%s,size=%s,line1=%s]\n' "$_initrc_heredoc_rc" "$_initrc_post_heredoc_size" "$_initrc_post_heredoc_line1" >&2 # 仅调试用
+_initrc_heredoc_rc=$?
 
 # Atomically replace initrc only if heredoc succeeded (rc=0 AND non-empty).
 # On failure (signal 54 / rc=182), the existing initrc is preserved intact.
 if [ "$_initrc_heredoc_rc" -eq 0 ] && [ -s "$PREFIX/alpine/initrc.tmp" ]; then
     mv -f "$PREFIX/alpine/initrc.tmp" "$PREFIX/alpine/initrc"
 else
-    printf '[init:initrc-heredoc-FAILED,rc=%s,keeping-old]\n' "$_initrc_heredoc_rc" >&2 # 仅调试用
     rm -f "$PREFIX/alpine/initrc.tmp"
 fi
 
 # Add PS1 only if not already present
 if ! grep -q 'PS1=' "$PREFIX/alpine/initrc"; then
-    printf '[init:initrc-ps1-needed,size-before=%s]\n' "$_initrc_post_heredoc_size" >&2 # 仅调试用
     # Smart path shortening (fish-style: ~/p/s/components)
     echo 'PS1="\[\033[1;32m\]\u\[\033[0m\]@localhost \[\033[1;34m\]\$_PS1_PATH\[\033[0m\] \[\$([ "${_PS1_EXIT:-0}" -ne 0 ] && echo \"\033[31m\")\]\$\[\033[0m\] "' >> "$PREFIX/alpine/initrc"
     # Simple prompt (uncomment below and comment above if you prefer full paths)
     # echo 'PS1="\[\033[1;32m\]\u\[\033[0m\]@localhost \[\033[1;34m\]\w\[\033[0m\] \$ "' >> "$PREFIX/alpine/initrc"
-else
-    printf '[init:initrc-ps1-exists,size=%s]\n' "$_initrc_post_heredoc_size" >&2 # 仅调试用
 fi
-
-_initrc_final_size=$(wc -c < "$PREFIX/alpine/initrc" 2>/dev/null) # 仅调试用
-printf '[init:initrc-final,size=%s]\n' "$_initrc_final_size" >&2 # 仅调试用
 chmod +x "$PREFIX/alpine/initrc"
-echo "[init:normal-post-initrc]" >&2 # 仅调试用: 到此仅说明流程没有中断; heredoc 是否真正写入需查看上方 initrc-heredoc-done 探针
 
 wait_for_axs_ready() {
     local axs_pid="$1"
-    # 仅调试用: musl libc strftime 不支持 %N (纳秒)，date +%s%3N 可能输出非法值
-    # 导致 $(( )) 算术表达式静默失败，从而使循环体中所有依赖 elapsed_ms 的探针全部丢失。
-    # 改用 date +%s (仅秒)，放弃毫秒精度；同时保留原始格式输出用于确认假设。
-    local ready_poll_date_raw # 仅调试用
-    ready_poll_date_raw=$(date '+%s%3N') # 仅调试用
-    local ready_poll_date_s # 仅调试用
-    ready_poll_date_s=$(date +%s) # 仅调试用
-    printf '[init:date-format-test,raw=%s,sonly=%s]\n' "$ready_poll_date_raw" "$ready_poll_date_s" >&2 # 仅调试用
-    local ready_poll_started_at # 仅调试用
-    ready_poll_started_at=$(date +%s) # 仅调试用
 
-    # The frontend now waits for this explicit ready marker instead of blind
-    # HTTP polling. Keep the readiness check here, next to the process launch,
-    # so stale UI tasks cannot race and kill a newer healthy shared AXS instance.
+    # Poll AXS HTTP status endpoint until ready (100 x 0.1s = 10s max).
+    # Emits __ACODE_AXS_READY__ on success for the JS frontend to detect.
     for attempt in $(seq 1 100); do
-        # 仅调试用: 循环体入口金丝雀 — 前轮中 ready-poll,attempt= 日志全部缺失，
-        # 需确认循环体是否真正执行以及是否在 date/算术行崩溃。
-        [ "$attempt" -le 3 ] && printf '[init:loop-canary,i=%s,pid=%s]\n' "$attempt" "$axs_pid" >&2 # 仅调试用
-        local wget_rc=0 # 仅调试用
-        local now_s # 仅调试用
-        now_s=$(date +%s) # 仅调试用
-        local elapsed_s # 仅调试用
-        elapsed_s=$((now_s - ready_poll_started_at)) # 仅调试用
-        local should_log_attempt="n" # 仅调试用
-        case "$attempt" in 1|2|3|10|25|50|75|100) should_log_attempt="y" ;; esac # 仅调试用
-        wget -q -T 1 -O - "http://127.0.0.1:8767/status" >/dev/null 2>&1 || wget_rc=$?
-        # 仅调试用: 前 3 次无条件输出 wget 返回值，确认是否每次都是 182 (signal 54)
-        [ "$attempt" -le 3 ] && printf '[init:wget-detail,i=%s,rc=%s]\n' "$attempt" "$wget_rc" >&2 # 仅调试用
-        if [ "$wget_rc" -eq 0 ]; then
-            printf '[init:ready-poll,attempt=%s,wget=0,alive=y,elapsed_s=%s]\n' "$attempt" "$elapsed_s" >&2 # 仅调试用
+        if wget -q -T 1 -O - "http://127.0.0.1:8767/status" >/dev/null 2>&1; then
             echo "__ACODE_AXS_READY__"
             return 0
         fi
 
-        local kill_rc=0 # 仅调试用
-        kill -0 "$axs_pid" 2>/dev/null || kill_rc=$? # 仅调试用
-        if [ "$kill_rc" -ne 0 ]; then
-            # 仅调试用: proot kill -0 returned non-zero — check /proc to verify
-            # whether the process is truly dead or proot is lying.
-            local proc_exists="n" # 仅调试用
-            [ -d "/proc/$axs_pid" ] && proc_exists="y" # 仅调试用
-            printf '[init:ready-poll,attempt=%s,wget=%s,kill0=%s,proc=%s,elapsed_s=%s,BAIL]\n' "$attempt" "$wget_rc" "$kill_rc" "$proc_exists" "$elapsed_s" >&2 # 仅调试用
+        if ! kill -0 "$axs_pid" 2>/dev/null; then
             return 1
         fi
-        [ "$should_log_attempt" = "y" ] && printf '[init:ready-poll,attempt=%s,wget=%s,alive=y,elapsed_s=%s]\n' "$attempt" "$wget_rc" "$elapsed_s" >&2 # 仅调试用
+
         sleep 0.1
     done
 
-    local final_ready_out_file="/tmp/acode-ready-final.out.$$" # 仅调试用
-    local final_ready_err_file="/tmp/acode-ready-final.err.$$" # 仅调试用
-    rm -f "$final_ready_out_file" "$final_ready_err_file" # 仅调试用
-    local final_ready_wget_rc=0 # 仅调试用
-    wget -S -T 1 -O "$final_ready_out_file" "http://127.0.0.1:8767/status" 2>"$final_ready_err_file" || final_ready_wget_rc=$? # 仅调试用
-    local final_now_s # 仅调试用
-    final_now_s=$(date +%s) # 仅调试用
-    local final_elapsed_s # 仅调试用
-    final_elapsed_s=$((final_now_s - ready_poll_started_at)) # 仅调试用
-    printf '[init:ready-poll,exhausted=100,elapsed_s=%s,final_wget=%s]\n' "$final_elapsed_s" "$final_ready_wget_rc" >&2 # 仅调试用
-    if [ -s "$final_ready_out_file" ]; then sed 's/^/[init:ready-final-stdout] /' "$final_ready_out_file" >&2; else echo '[init:ready-final-stdout=<empty>]' >&2; fi # 仅调试用
-    if [ -s "$final_ready_err_file" ]; then sed 's/^/[init:ready-final-stderr] /' "$final_ready_err_file" >&2; else echo '[init:ready-final-stderr=<empty>]' >&2; fi # 仅调试用
     return 1
 }
 
-run_auto_exec_probe_before_axs() {
-    # 仅调试用: WebSocket 在探针高频输出期间容易断连(21:38:57→21:41:44丢失2m47s数据)，
-    # 导致中间探针的 [init:] 标记全部丢失。把关键结果写入设备文件，探针结束后
-    # 一次性 cat 输出，确保 WS 重连后能看到完整结果。
-    local _probe_summary_file="/tmp/acode-probe-summary.$$.log" # 仅调试用
-    rm -f "$_probe_summary_file" # 仅调试用
-    local auto_probe_enabled="${AXS_AUTO_EXEC_PROBE_ON_INIT:-1}" # 仅调试用
-    local auto_probe_stop_code="${AXS_AUTO_EXEC_PROBE_STOP_ON_EXIT_CODE:-182}" # 仅调试用
-    local auto_probe_max_attempts="${AXS_AUTO_EXEC_PROBE_MAX_ATTEMPTS:-200}" # 仅调试用
-    local auto_probe_pause_ms="${AXS_AUTO_EXEC_PROBE_PAUSE_MS:-0}" # 仅调试用
-    local auto_probe_sample_rounds="${AXS_AUTO_EXEC_PROBE_SAMPLE_ROUNDS:-12}" # 仅调试用
-    local auto_probe_sample_interval_ms="${AXS_AUTO_EXEC_PROBE_SAMPLE_INTERVAL_MS:-5}" # 仅调试用
-    local auto_probe_wrap_sig54="${AXS_AUTO_EXEC_PROBE_WRAP_SIG54:-1}" # 仅调试用
-    local auto_probe_arm_ms="${AXS_AUTO_EXEC_PROBE_ARM_MS:-40}" # 仅调试用
-    local auto_probe_abort_on_trigger="${AXS_AUTO_EXEC_PROBE_ABORT_ON_TRIGGER:-0}" # 仅调试用
-    local auto_probe_rc=0 # 仅调试用
-
-    run_auto_exec_signal_catcher_probe_after_trigger() {
-        local catch_stop_code="$1" # 仅调试用
-        local catch_arm_ms="$2" # 仅调试用
-        local catch_wrap_sig54="$3" # 仅调试用
-        local catch_enabled="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_ON_TRIGGER:-1}" # 仅调试用
-        local catch_max_attempts="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_MAX_ATTEMPTS:-40}" # 仅调试用
-        # 仅调试用: 80轮×1ms采样=每次尝试~500行日志, 40次×0ms间隔会瞬间洪水打爆websocket传输
-        # 加 1000ms 间隔让传输层有时间排空缓冲区
-        local catch_pause_ms="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_PAUSE_MS:-1000}" # 仅调试用
-        local catch_sample_rounds="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_SAMPLE_ROUNDS:-80}" # 仅调试用
-        local catch_sample_interval_ms="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_SAMPLE_INTERVAL_MS:-1}" # 仅调试用
-        local catch_wait_ms="${AXS_AUTO_EXEC_PROBE_SIGNAL_CATCHER_WAIT_MS:-120}" # 仅调试用
-        local catch_rc=0 # 仅调试用
-
-        printf '[init:auto-exec-probe-signal-catcher-enabled=%s,max_attempts=%s,pause_ms=%s,sample_rounds=%s,sample_interval_ms=%s,wrap_sig54=%s,wait_ms=%s]\n' "$catch_enabled" "$catch_max_attempts" "$catch_pause_ms" "$catch_sample_rounds" "$catch_sample_interval_ms" "$catch_wrap_sig54" "$catch_wait_ms" >&2 # 仅调试用
-        [ "$catch_enabled" = "1" ] || return 0 # 仅调试用
-        if [ "$catch_wrap_sig54" != "1" ]; then # 仅调试用
-            echo '[init:auto-exec-probe-signal-catcher-skipped,reason=wrap_sig54_disabled]' >&2 # 仅调试用
-            return 0 # 仅调试用
-        fi # 仅调试用
-
-        # 仅调试用: 用户现在要验证“182 是否只针对 bash”。这里把 bash 换成一个
-        # 受控 native target：sig54-probe 在 exec 前继续把 54 维持为 blocked，
-        # target 刚进入用户态就安装 handler 并放行 54。若它仍报 182，就说明问题
-        # 不是 bash 私有；若它能稳定抓到 54 且 0 退出，bash/loader 路径就更可疑。 # 仅调试用
-        echo '[init:auto-exec-probe-signal-catcher-begin,target=sig54-catch-probe]' >&2 # 仅调试用
-        /usr/local/bin/axs exec-probe --stop-on-exit-code "$catch_stop_code" --max-attempts "$catch_max_attempts" --pause-ms "$catch_pause_ms" --sample-rounds "$catch_sample_rounds" --sample-interval-ms "$catch_sample_interval_ms" --wrap-sig54-probe --sig54-probe-preserve-blocked-on-exec --arm-ms "$catch_arm_ms" -- /usr/local/bin/axs sig54-catch-probe --signal 54 --wait-ms "$catch_wait_ms" # 仅调试用
-        catch_rc=$? # 仅调试用
-
-        printf '[init:auto-exec-probe-signal-catcher-rc=%s]\n' "$catch_rc" >&2 # 仅调试用
-        printf '[probe-summary:signal-catcher,rc=%s,stop=%s,attempts=%s]\n' "$catch_rc" "$catch_stop_code" "$catch_max_attempts" >> "$_probe_summary_file" # 仅调试用
-        if [ "$catch_rc" -eq "$catch_stop_code" ]; then # 仅调试用
-            printf '[init:auto-exec-probe-signal-catcher-triggered,rc=%s]\n' "$catch_rc" >&2 # 仅调试用
-            return 0 # 仅调试用
-        fi # 仅调试用
-        if [ "$catch_rc" -ne 0 ]; then # 仅调试用
-            printf '[init:auto-exec-probe-signal-catcher-failed,rc=%s]\n' "$catch_rc" >&2 # 仅调试用
-            return 0 # 仅调试用
-        fi # 仅调试用
-        echo '[init:auto-exec-probe-signal-catcher-exhausted-or-clean]' >&2 # 仅调试用
-        return 0 # 仅调试用
-    }
-
-    run_auto_exec_stage_wrapper_probe_after_trigger() {
-        local stage_stop_code="$1" # 仅调试用
-        local stage_arm_ms="$2" # 仅调试用
-        local stage_wrap_sig54="$3" # 仅调试用
-        local stage_enabled="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_ON_TRIGGER:-1}" # 仅调试用
-        local stage_max_attempts="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_MAX_ATTEMPTS:-40}" # 仅调试用
-        # 仅调试用: 同 sig54-catch-probe，重采样探针加 1000ms 间隔避免日志洪水
-        local stage_pause_ms="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_PAUSE_MS:-1000}" # 仅调试用
-        local stage_sample_rounds="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_SAMPLE_ROUNDS:-80}" # 仅调试用
-        local stage_sample_interval_ms="${AXS_AUTO_EXEC_PROBE_STAGE_WRAPPER_SAMPLE_INTERVAL_MS:-1}" # 仅调试用
-        local stage_rc=0 # 仅调试用
-
-        printf '[init:auto-exec-probe-stage-wrapper-enabled=%s,max_attempts=%s,pause_ms=%s,sample_rounds=%s,sample_interval_ms=%s,wrap_sig54=%s]\n' "$stage_enabled" "$stage_max_attempts" "$stage_pause_ms" "$stage_sample_rounds" "$stage_sample_interval_ms" "$stage_wrap_sig54" >&2 # 仅调试用
-        [ "$stage_enabled" = "1" ] || return 0 # 仅调试用
-
-        # 仅调试用: 直连 probe 负责保留“真实触发器”，这里在它命中 182 后立刻补一轮
-        # sigprobe -> stage-wrapper -> bash 的二阶段复现，把原来不可见的 handoff 窗口
-        # 再切开一层。若这轮仍触发 182，就能直接回答故障死在 wrapper 前还是 bash 前。 # 仅调试用
-        echo '[init:auto-exec-probe-stage-wrapper-begin,target=sigprobe-stage-wrapper-bash-minimal]' >&2 # 仅调试用
-        if [ "$stage_wrap_sig54" = "1" ]; then # 仅调试用
-            /usr/local/bin/axs exec-probe --stop-on-exit-code "$stage_stop_code" --max-attempts "$stage_max_attempts" --pause-ms "$stage_pause_ms" --sample-rounds "$stage_sample_rounds" --sample-interval-ms "$stage_sample_interval_ms" --wrap-sig54-probe --arm-ms "$stage_arm_ms" -- /usr/local/bin/axs exec-stage-probe --stage-label bash-minimal -- bash --noprofile --norc -c 'printf "[init:auto-exec-probe-stage-wrapper-bash-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' # 仅调试用
-            stage_rc=$? # 仅调试用
-        else # 仅调试用
-            /usr/local/bin/axs exec-probe --stop-on-exit-code "$stage_stop_code" --max-attempts "$stage_max_attempts" --pause-ms "$stage_pause_ms" --sample-rounds "$stage_sample_rounds" --sample-interval-ms "$stage_sample_interval_ms" -- /usr/local/bin/axs exec-stage-probe --stage-label bash-minimal -- bash --noprofile --norc -c 'printf "[init:auto-exec-probe-stage-wrapper-bash-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' # 仅调试用
-            stage_rc=$? # 仅调试用
-        fi # 仅调试用
-
-        printf '[init:auto-exec-probe-stage-wrapper-rc=%s]\n' "$stage_rc" >&2 # 仅调试用
-        printf '[probe-summary:stage-wrapper,rc=%s,stop=%s,attempts=%s]\n' "$stage_rc" "$stage_stop_code" "$stage_max_attempts" >> "$_probe_summary_file" # 仅调试用
-        if [ "$stage_rc" -eq "$stage_stop_code" ]; then # 仅调试用
-            printf '[init:auto-exec-probe-stage-wrapper-triggered,rc=%s]\n' "$stage_rc" >&2 # 仅调试用
-            return 0 # 仅调试用
-        fi # 仅调试用
-        if [ "$stage_rc" -ne 0 ]; then # 仅调试用
-            printf '[init:auto-exec-probe-stage-wrapper-failed,rc=%s]\n' "$stage_rc" >&2 # 仅调试用
-            return 0 # 仅调试用
-        fi # 仅调试用
-        echo '[init:auto-exec-probe-stage-wrapper-exhausted-or-clean]' >&2 # 仅调试用
-        return 0 # 仅调试用
-    }
-
-    # 仅调试用: 对照实验 — busybox sh (static ELF, 不走 musl 动态链接器)
-    # 若 busybox sh 也 182 → proot 通用 exec 路径问题，非 bash/musl 特有
-    # 若 busybox sh 正常退出 → 问题在 bash 或 musl 动态加载路径
-    run_contrast_probe_busybox_sh_after_trigger() {
-        local ctr_stop_code="$1" # 仅调试用
-        local ctr_arm_ms="$2" # 仅调试用
-        local ctr_wrap_sig54="$3" # 仅调试用
-        local ctr_enabled="${AXS_CONTRAST_PROBE_BUSYBOX_SH:-1}" # 仅调试用
-        local ctr_max_attempts="${AXS_CONTRAST_PROBE_BUSYBOX_SH_MAX_ATTEMPTS:-100}" # 仅调试用
-        # 仅调试用: 对照探针采样较轻(12轮×5ms), 500ms 间隔足以控制日志速率
-        local ctr_pause_ms="${AXS_CONTRAST_PROBE_BUSYBOX_SH_PAUSE_MS:-500}" # 仅调试用
-        local ctr_sample_rounds="${AXS_CONTRAST_PROBE_BUSYBOX_SH_SAMPLE_ROUNDS:-12}" # 仅调试用
-        local ctr_sample_interval_ms="${AXS_CONTRAST_PROBE_BUSYBOX_SH_SAMPLE_INTERVAL_MS:-5}" # 仅调试用
-        local ctr_rc=0 # 仅调试用
-
-        printf '[init:contrast-busybox-sh-enabled=%s,max_attempts=%s]\n' "$ctr_enabled" "$ctr_max_attempts" >&2 # 仅调试用
-        [ "$ctr_enabled" = "1" ] || return 0 # 仅调试用
-
-        # 仅调试用: 确认 /bin/sh 链接类型 (static or dynamic)，下一次日志就能直接读到
-        file /bin/sh 2>&1 | sed 's/^/[contrast:file-sh] /' >&2 # 仅调试用
-        readlink -f /bin/sh 2>&1 | sed 's/^/[contrast:readlink-sh] /' >&2 # 仅调试用
-
-        echo '[init:contrast-busybox-sh-begin]' >&2 # 仅调试用
-        if [ "$ctr_wrap_sig54" = "1" ]; then # 仅调试用
-            /usr/local/bin/axs exec-probe --stop-on-exit-code "$ctr_stop_code" --max-attempts "$ctr_max_attempts" --pause-ms "$ctr_pause_ms" --sample-rounds "$ctr_sample_rounds" --sample-interval-ms "$ctr_sample_interval_ms" --wrap-sig54-probe --arm-ms "$ctr_arm_ms" -- /bin/sh -c 'printf "[contrast:busybox-ok,pid=%s]\n" "$$"' # 仅调试用
-            ctr_rc=$? # 仅调试用
-        else # 仅调试用
-            /usr/local/bin/axs exec-probe --stop-on-exit-code "$ctr_stop_code" --max-attempts "$ctr_max_attempts" --pause-ms "$ctr_pause_ms" --sample-rounds "$ctr_sample_rounds" --sample-interval-ms "$ctr_sample_interval_ms" -- /bin/sh -c 'printf "[contrast:busybox-ok,pid=%s]\n" "$$"' # 仅调试用
-            ctr_rc=$? # 仅调试用
-        fi # 仅调试用
-
-        printf '[init:contrast-busybox-sh-rc=%s]\n' "$ctr_rc" >&2 # 仅调试用
-        printf '[probe-summary:busybox-sh,rc=%s,stop=%s,attempts=%s]\n' "$ctr_rc" "$ctr_stop_code" "$ctr_max_attempts" >> "$_probe_summary_file" # 仅调试用
-        if [ "$ctr_rc" -eq "$ctr_stop_code" ]; then # 仅调试用
-            printf '[init:contrast-busybox-sh-TRIGGERED,rc=%s]\n' "$ctr_rc" >&2 # 仅调试用
-        fi # 仅调试用
-        return 0 # 仅调试用
-    }
-
-    # 仅调试用: 对照实验 — wget (dynamic musl ELF, 与 bash 走同一条 ld-musl 加载路径)
-    # 若 wget 也 182 → 问题在 musl 动态链接器 / proot 的 execve 路径，非 bash 特有
-    # 若 wget 正常退出 → 问题在 bash 早期启动代码 (signal/job-control/tty init)
-    run_contrast_probe_dynamic_elf_after_trigger() {
-        local ctr_stop_code="$1" # 仅调试用
-        local ctr_arm_ms="$2" # 仅调试用
-        local ctr_wrap_sig54="$3" # 仅调试用
-        local ctr_enabled="${AXS_CONTRAST_PROBE_DYNAMIC_ELF:-1}" # 仅调试用
-        local ctr_max_attempts="${AXS_CONTRAST_PROBE_DYNAMIC_ELF_MAX_ATTEMPTS:-100}" # 仅调试用
-        # 仅调试用: 对照探针 500ms 间隔
-        local ctr_pause_ms="${AXS_CONTRAST_PROBE_DYNAMIC_ELF_PAUSE_MS:-500}" # 仅调试用
-        local ctr_sample_rounds="${AXS_CONTRAST_PROBE_DYNAMIC_ELF_SAMPLE_ROUNDS:-12}" # 仅调试用
-        local ctr_sample_interval_ms="${AXS_CONTRAST_PROBE_DYNAMIC_ELF_SAMPLE_INTERVAL_MS:-5}" # 仅调试用
-        local ctr_rc=0 # 仅调试用
-
-        printf '[init:contrast-dynamic-elf-enabled=%s,max_attempts=%s]\n' "$ctr_enabled" "$ctr_max_attempts" >&2 # 仅调试用
-        [ "$ctr_enabled" = "1" ] || return 0 # 仅调试用
-
-        # 仅调试用: 确认 wget 链接类型 (应该是 dynamic musl)
-        file /usr/bin/wget 2>&1 | sed 's/^/[contrast:file-wget] /' >&2 # 仅调试用
-        ldd /usr/bin/wget 2>&1 | sed 's/^/[contrast:ldd-wget] /' >&2 # 仅调试用
-
-        echo '[init:contrast-dynamic-elf-begin,target=wget]' >&2 # 仅调试用
-        if [ "$ctr_wrap_sig54" = "1" ]; then # 仅调试用
-            /usr/local/bin/axs exec-probe --stop-on-exit-code "$ctr_stop_code" --max-attempts "$ctr_max_attempts" --pause-ms "$ctr_pause_ms" --sample-rounds "$ctr_sample_rounds" --sample-interval-ms "$ctr_sample_interval_ms" --wrap-sig54-probe --arm-ms "$ctr_arm_ms" -- wget --version # 仅调试用
-            ctr_rc=$? # 仅调试用
-        else # 仅调试用
-            /usr/local/bin/axs exec-probe --stop-on-exit-code "$ctr_stop_code" --max-attempts "$ctr_max_attempts" --pause-ms "$ctr_pause_ms" --sample-rounds "$ctr_sample_rounds" --sample-interval-ms "$ctr_sample_interval_ms" -- wget --version # 仅调试用
-            ctr_rc=$? # 仅调试用
-        fi # 仅调试用
-
-        printf '[init:contrast-dynamic-elf-rc=%s]\n' "$ctr_rc" >&2 # 仅调试用
-        printf '[probe-summary:dynamic-elf,rc=%s,stop=%s,attempts=%s]\n' "$ctr_rc" "$ctr_stop_code" "$ctr_max_attempts" >> "$_probe_summary_file" # 仅调试用
-        if [ "$ctr_rc" -eq "$ctr_stop_code" ]; then # 仅调试用
-            printf '[init:contrast-dynamic-elf-TRIGGERED,rc=%s]\n' "$ctr_rc" >&2 # 仅调试用
-        fi # 仅调试用
-        return 0 # 仅调试用
-    }
-
-    # 仅调试用: 定向探针 — 回放 bash 5.3 早期启动系统调用
-    # 这个 native probe 逐阶段重放 bash 的 initialize_traps / initialize_shell_signals /
-    # initialize_terminating_signals / initialize_job_signals / initialize_job_control，
-    # 每个阶段之间检查 signal 54 的 pending/blocked 状态。
-    # 若 replay probe 触发 182 → 锁定到具体哪个阶段的系统调用
-    # 若 replay probe 全部通过 → 问题在 bash + musl 组合中 replay 没覆盖的路径
-    run_contrast_probe_startup_replay_after_trigger() {
-        local ctr_stop_code="$1" # 仅调试用
-        local ctr_arm_ms="$2" # 仅调试用
-        local ctr_wrap_sig54="$3" # 仅调试用
-        local ctr_enabled="${AXS_CONTRAST_PROBE_STARTUP_REPLAY:-1}" # 仅调试用
-        local ctr_max_attempts="${AXS_CONTRAST_PROBE_STARTUP_REPLAY_MAX_ATTEMPTS:-100}" # 仅调试用
-        # 仅调试用: 对照探针 500ms 间隔
-        local ctr_pause_ms="${AXS_CONTRAST_PROBE_STARTUP_REPLAY_PAUSE_MS:-500}" # 仅调试用
-        local ctr_sample_rounds="${AXS_CONTRAST_PROBE_STARTUP_REPLAY_SAMPLE_ROUNDS:-12}" # 仅调试用
-        local ctr_sample_interval_ms="${AXS_CONTRAST_PROBE_STARTUP_REPLAY_SAMPLE_INTERVAL_MS:-5}" # 仅调试用
-        local ctr_rc=0 # 仅调试用
-
-        printf '[init:contrast-startup-replay-enabled=%s,max_attempts=%s]\n' "$ctr_enabled" "$ctr_max_attempts" >&2 # 仅调试用
-        [ "$ctr_enabled" = "1" ] || return 0 # 仅调试用
-
-        echo '[init:contrast-startup-replay-begin]' >&2 # 仅调试用
-        if [ "$ctr_wrap_sig54" = "1" ]; then # 仅调试用
-            /usr/local/bin/axs exec-probe --stop-on-exit-code "$ctr_stop_code" --max-attempts "$ctr_max_attempts" --pause-ms "$ctr_pause_ms" --sample-rounds "$ctr_sample_rounds" --sample-interval-ms "$ctr_sample_interval_ms" --wrap-sig54-probe --arm-ms "$ctr_arm_ms" -- /usr/local/bin/axs startup-replay-probe --signal 54 # 仅调试用
-            ctr_rc=$? # 仅调试用
-        else # 仅调试用
-            /usr/local/bin/axs exec-probe --stop-on-exit-code "$ctr_stop_code" --max-attempts "$ctr_max_attempts" --pause-ms "$ctr_pause_ms" --sample-rounds "$ctr_sample_rounds" --sample-interval-ms "$ctr_sample_interval_ms" -- /usr/local/bin/axs startup-replay-probe --signal 54 # 仅调试用
-            ctr_rc=$? # 仅调试用
-        fi # 仅调试用
-
-        printf '[init:contrast-startup-replay-rc=%s]\n' "$ctr_rc" >&2 # 仅调试用
-        printf '[probe-summary:startup-replay,rc=%s,stop=%s,attempts=%s]\n' "$ctr_rc" "$ctr_stop_code" "$ctr_max_attempts" >> "$_probe_summary_file" # 仅调试用
-        if [ "$ctr_rc" -eq "$ctr_stop_code" ]; then # 仅调试用
-            printf '[init:contrast-startup-replay-TRIGGERED,rc=%s]\n' "$ctr_rc" >&2 # 仅调试用
-        fi # 仅调试用
-        return 0 # 仅调试用
-    }
-
-    printf '[init:auto-exec-probe-enabled=%s,stop=%s,max_attempts=%s,pause_ms=%s,sample_rounds=%s,sample_interval_ms=%s,wrap_sig54=%s,arm_ms=%s,abort_on_trigger=%s]\n' "$auto_probe_enabled" "$auto_probe_stop_code" "$auto_probe_max_attempts" "$auto_probe_pause_ms" "$auto_probe_sample_rounds" "$auto_probe_sample_interval_ms" "$auto_probe_wrap_sig54" "$auto_probe_arm_ms" "$auto_probe_abort_on_trigger" >&2 # 仅调试用
-    if [ "$auto_probe_enabled" != "1" ]; then # 仅调试用
-        return 0 # 仅调试用
-    fi # 仅调试用
-
-    echo '[init:auto-exec-probe-begin,target=bash-minimal]' >&2 # 仅调试用
-    if [ "$auto_probe_wrap_sig54" = "1" ]; then # 仅调试用
-        /usr/local/bin/axs exec-probe --stop-on-exit-code "$auto_probe_stop_code" --max-attempts "$auto_probe_max_attempts" --pause-ms "$auto_probe_pause_ms" --sample-rounds "$auto_probe_sample_rounds" --sample-interval-ms "$auto_probe_sample_interval_ms" --wrap-sig54-probe --arm-ms "$auto_probe_arm_ms" -- bash --noprofile --norc -c 'printf "[init:auto-exec-probe-bash-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' # 仅调试用
-        auto_probe_rc=$? # 仅调试用
-    else # 仅调试用
-        /usr/local/bin/axs exec-probe --stop-on-exit-code "$auto_probe_stop_code" --max-attempts "$auto_probe_max_attempts" --pause-ms "$auto_probe_pause_ms" --sample-rounds "$auto_probe_sample_rounds" --sample-interval-ms "$auto_probe_sample_interval_ms" -- bash --noprofile --norc -c 'printf "[init:auto-exec-probe-bash-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' # 仅调试用
-        auto_probe_rc=$? # 仅调试用
-    fi # 仅调试用
-
-    printf '[init:auto-exec-probe-rc=%s]\n' "$auto_probe_rc" >&2 # 仅调试用
-    # 仅调试用: auto probe 的职责只是先把 182 复现并打点，不应默认替代真实启动链。 # 仅调试用
-    # 仅调试用: 之前命中后立刻 exit，前端只剩“AXS exited”这一层传播结果，bash/PTY # 仅调试用
-    # 仅调试用: 真实会话完全没机会启动，后续证据链被 probe 自己截断。默认继续进入 # 仅调试用
-    # 仅调试用: 真实 AXS 路径，只在显式要求时保留旧的 abort 行为。 # 仅调试用
-    if [ "$auto_probe_rc" -eq "$auto_probe_stop_code" ]; then # 仅调试用
-        run_auto_exec_signal_catcher_probe_after_trigger "$auto_probe_stop_code" "$auto_probe_arm_ms" "$auto_probe_wrap_sig54" # 仅调试用
-        run_auto_exec_stage_wrapper_probe_after_trigger "$auto_probe_stop_code" "$auto_probe_arm_ms" "$auto_probe_wrap_sig54" # 仅调试用
-        # 仅调试用: 对照实验 — 在 bash 触发 182 后立刻用相同 sig54-probe 包装测试其他目标
-        # 如果只有 bash 触发而其他目标全部幸存，就能排除 proot 通用路径
-        run_contrast_probe_busybox_sh_after_trigger "$auto_probe_stop_code" "$auto_probe_arm_ms" "$auto_probe_wrap_sig54" # 仅调试用
-        run_contrast_probe_dynamic_elf_after_trigger "$auto_probe_stop_code" "$auto_probe_arm_ms" "$auto_probe_wrap_sig54" # 仅调试用
-        run_contrast_probe_startup_replay_after_trigger "$auto_probe_stop_code" "$auto_probe_arm_ms" "$auto_probe_wrap_sig54" # 仅调试用
-        # 仅调试用: WS 断连期间中间探针的逐条 stderr 输出可能丢失，在进入 axs 前
-        # 一次性 dump 汇总文件，确保 WS 重连后能看到所有探针结果
-        if [ -s "$_probe_summary_file" ]; then # 仅调试用
-            echo '[init:probe-summary-begin]' >&2 # 仅调试用
-            cat "$_probe_summary_file" >&2 # 仅调试用
-            echo '[init:probe-summary-end]' >&2 # 仅调试用
-        else # 仅调试用
-            echo '[init:probe-summary=<empty>]' >&2 # 仅调试用
-        fi # 仅调试用
-        rm -f "$_probe_summary_file" # 仅调试用
-        if [ "$auto_probe_abort_on_trigger" = "1" ]; then # 仅调试用
-            printf '[init:auto-exec-probe-triggered,rc=%s,abort_on_trigger=1]\n' "$auto_probe_rc" >&2 # 仅调试用
-            exit "$auto_probe_rc" # 仅调试用
-        fi # 仅调试用
-        printf '[init:auto-exec-probe-triggered,rc=%s,abort_on_trigger=0,continuing-to-axs]\n' "$auto_probe_rc" >&2 # 仅调试用
-        return 0 # 仅调试用
-    fi # 仅调试用
-    if [ "$auto_probe_rc" -ne 0 ]; then # 仅调试用
-        printf '[init:auto-exec-probe-failed,rc=%s]\n' "$auto_probe_rc" >&2 # 仅调试用
-        exit "$auto_probe_rc" # 仅调试用
-    fi # 仅调试用
-
-    echo '[init:auto-exec-probe-exhausted,continuing-to-axs]' >&2 # 仅调试用
-}
-
-#actual source
-#everytime a terminal is started initrc will run
+# Stage axs binary inside the rootfs so it can be found by path within proot.
 # A refreshed Alpine rootfs can legitimately miss /usr/local/bin until the first
-# app-managed startup recreates it. The previous copy sequence silently fell
-# through on that missing directory and only surfaced later as a misleading
-# "AXS exited before becoming ready" error even though axs was never launched.
-# Create the target directory explicitly and fail immediately if staging the
-# binary inside the rootfs does not succeed.
-# 仅调试用: proot-rc=1 时 [init:normal] 后无任何中间探针直接退出, 以下三个 || exit 1
-# 是嫌疑人。逐个添加探针定位具体哪一步失败。
-echo "[init:pre-mkdir,target=/usr/local/bin,prefix=$PREFIX]" >&2 # 仅调试用
-ls -ld / /usr /usr/local 2>&1 | sed 's/^/[init:mkdir-path] /' >&2 # 仅调试用
-mkdir_err_file="/tmp/acode-init-mkdir.err.$$" # 仅调试用
-rm -f "$mkdir_err_file" # 仅调试用
-mkdir -p /usr/local/bin 2>"$mkdir_err_file" || { # 仅调试用
-    mkdir_rc=$? # 仅调试用
-    if [ -s "$mkdir_err_file" ]; then sed 's/^/[init:mkdir-stderr] /' "$mkdir_err_file" >&2; else echo "[init:mkdir-stderr=<empty>]" >&2; fi # 仅调试用
-    stat / /usr /usr/local 2>&1 | sed 's/^/[init:mkdir-stat] /' >&2 # 仅调试用
-    echo "[init:mkdir-FAIL,rc=$mkdir_rc]" >&2 # 仅调试用
-    rm -f "$mkdir_err_file" # 仅调试用
-    exit 1 # 仅调试用
-} # 仅调试用
-if [ -s "$mkdir_err_file" ]; then sed 's/^/[init:mkdir-stderr] /' "$mkdir_err_file" >&2; fi # 仅调试用
-rm -f "$mkdir_err_file" # 仅调试用
-ls -ld /usr/local/bin 2>&1 | sed 's/^/[init:mkdir-ok] /' >&2 # 仅调试用
-echo "[init:pre-cp,src=$PREFIX/axs]" >&2 # 仅调试用
-ls -l "$PREFIX/axs" 2>&1 | sed 's/^/[init:axs-ls] /' >&2 # 仅调试用
-ls -l /usr/local/bin/axs 2>&1 | sed 's/^/[init:dst-ls-before] /' >&2 # 仅调试用: cp目标在cp前的状态
-_cp_attempt=0 # 仅调试用: cp有时被signal 54杀，加重试和诊断
-_cp_ok=0 # 仅调试用
-while [ $_cp_attempt -lt 3 ]; do # 仅调试用
-    _cp_attempt=$((_cp_attempt + 1)) # 仅调试用
-    _cp_t0=$(date +%s%N 2>/dev/null || date +%s) # 仅调试用
-    cp -f "$PREFIX/axs" /usr/local/bin/axs 2>/tmp/cp-err.txt # 仅调试用: 分离stderr以保留错误信息
-    _cp_rc=$? # 仅调试用
-    _cp_t1=$(date +%s%N 2>/dev/null || date +%s) # 仅调试用
-    if [ -s /tmp/cp-err.txt ]; then sed 's/^/[init:cp-stderr] /' /tmp/cp-err.txt >&2; fi # 仅调试用
-    if [ $_cp_rc -eq 0 ]; then # 仅调试用
-        echo "[init:cp-ok,attempt=$_cp_attempt,t0=$_cp_t0,t1=$_cp_t1]" >&2 # 仅调试用
-        _cp_ok=1 # 仅调试用
-        break # 仅调试用
-    fi # 仅调试用
-    echo "[init:cp-retry,attempt=$_cp_attempt,rc=$_cp_rc,t0=$_cp_t0,t1=$_cp_t1]" >&2 # 仅调试用
-    ls -l /usr/local/bin/axs "$PREFIX/axs" 2>&1 | sed 's/^/[init:cp-retry-ls] /' >&2 # 仅调试用
-    sleep 0.2 # 仅调试用: 短暂等待让proot稳定
-done # 仅调试用
-if [ $_cp_ok -ne 1 ]; then echo "[init:cp-FAIL,rc=$_cp_rc,attempts=$_cp_attempt]" >&2; exit 1; fi
+# app-managed startup recreates it.
+mkdir -p /usr/local/bin || { printf '[init-alpine:mkdir-failed,rc=%s]\n' "$?" >&2; exit 1; } # 仅调试用: mkdir失败诊断
+cp -f "$PREFIX/axs" /usr/local/bin/axs || { printf '[init-alpine:cp-axs-failed,rc=%s,src=%s,exists=%s]\n' "$?" "$PREFIX/axs" "$(test -f "$PREFIX/axs" && echo y || echo n)" >&2; exit 1; } # 仅调试用: cp失败诊断
 # After a fresh reinstall, proot can expose / as read-only while still leaving
 # the copied axs binary executable with its original mode bits. In that case the
 # chmod syscall fails, but treating that as fatal is wrong because axs was staged
@@ -921,135 +469,41 @@ if [ $_cp_ok -ne 1 ]; then echo "[init:cp-FAIL,rc=$_cp_rc,attempts=$_cp_attempt]
 # executable; otherwise continue.
 if ! chmod 755 /usr/local/bin/axs 2>/dev/null; then
     if [ ! -x /usr/local/bin/axs ]; then
-        echo "[init:chmod-FAIL,not-executable]" >&2 # 仅调试用
+        printf '[init-alpine:axs-not-executable-after-chmod]\n' >&2 # 仅调试用
         exit 1
     fi
 fi
-echo "[init:axs-staged-ok]" >&2 # 仅调试用: axs 已成功部署到 /usr/local/bin
-# Enable axs PTY tracing: Terminal 1 crashes with exit 182 in ~6ms, and axs-side
-# logs (PTY first output, WS replay, pty reader exit) are essential to distinguish
-# whether the PTY link broke vs bash never started. 仅调试用
-export AXS_TERMINAL_LOG=1 # 仅调试用
-export RUST_LOG=warn # 仅调试用
-# Exit 182 currently lands before initrc emits any marker, which means the failure
-# happens earlier than MOTD generation and is likely in bash exec or loader startup
-# under proot. All non-PTY bash probes below succeed (including --rcfile /initrc -i),
-# confirming bash/initrc are NOT broken — the issue is specific to PTY-based spawn
-# through axs. The pure-builtin [initrc:L1] probe added to initrc will disambiguate
-# "exec(bash) failed" from "bash crashed during initialization before rcfile". 仅调试用
-echo "[init:bash-probe-begin]" >&2 # 仅调试用
-printf '[init:bash-probe-path=%s]\n' "$(command -v bash 2>/dev/null || echo missing)" >&2 # 仅调试用
-ls -l /bin/bash 2>&1 | sed 's/^/[init:bash-probe-ls] /' >&2 # 仅调试用
-bash_probe_out_file="/tmp/acode-bash-probe.out" # 仅调试用
-bash_probe_err_file="/tmp/acode-bash-probe.err" # 仅调试用
-rm -f "$bash_probe_out_file" "$bash_probe_err_file" # 仅调试用
-bash --noprofile --norc -c 'printf "[init:bash-probe-ok,pid=%s,ppid=%s,argv0=%q]\n" "$$" "$PPID" "$0"' >"$bash_probe_out_file" 2>"$bash_probe_err_file" # 仅调试用
-bash_probe_rc=$? # 仅调试用
-printf '[init:bash-probe-rc=%s]\n' "$bash_probe_rc" >&2 # 仅调试用
-if [ -s "$bash_probe_out_file" ]; then sed 's/^/[init:bash-probe-stdout] /' "$bash_probe_out_file" >&2; else echo '[init:bash-probe-stdout=<empty>]' >&2; fi # 仅调试用
-if [ -s "$bash_probe_err_file" ]; then sed 's/^/[init:bash-probe-stderr] /' "$bash_probe_err_file" >&2; else echo '[init:bash-probe-stderr=<empty>]' >&2; fi # 仅调试用
-# 现在已经证明 bash 本体和纯交互模式都能起来，但 `--rcfile /initrc -i` 仍然 182 且
-# 连 `shell:initrc-enter` 都没有。下一步先把 `/initrc` 当普通文件验证，避免继续把
-# “文件不可读/不可解析”和“只有 rcfile 机制异常”混在一起。 仅调试用
-ls -l /initrc 2>&1 | sed 's/^/[init:initrc-ls] /' >&2 # 仅调试用
-stat /initrc 2>&1 | sed 's/^/[init:initrc-stat] /' >&2 # 仅调试用
-head -n 6 /initrc 2>&1 | sed 's/^/[init:initrc-head] /' >&2 # 仅调试用
-od -An -tx1 -N 32 /initrc 2>&1 | tr '\n' ' ' | sed 's/^/[init:initrc-hex] /' >&2 # 仅调试用
-printf '\n' >&2 # 仅调试用
-initrc_source_out_file="/tmp/acode-initrc-source.out" # 仅调试用
-initrc_source_err_file="/tmp/acode-initrc-source.err" # 仅调试用
-rm -f "$initrc_source_out_file" "$initrc_source_err_file" # 仅调试用
-bash --noprofile --norc -c '. /initrc; printf "[init:initrc-source-ok,pid=%s,ppid=%s,argv0=%q,flags=%q]\n" "$$" "$PPID" "$0" "$-"' >"$initrc_source_out_file" 2>"$initrc_source_err_file" # 仅调试用
-initrc_source_rc=$? # 仅调试用
-printf '[init:initrc-source-rc=%s]\n' "$initrc_source_rc" >&2 # 仅调试用
-if [ -s "$initrc_source_out_file" ]; then sed 's/^/[init:initrc-source-stdout] /' "$initrc_source_out_file" >&2; else echo '[init:initrc-source-stdout=<empty>]' >&2; fi # 仅调试用
-if [ -s "$initrc_source_err_file" ]; then sed 's/^/[init:initrc-source-stderr] /' "$initrc_source_err_file" >&2; else echo '[init:initrc-source-stderr=<empty>]' >&2; fi # 仅调试用
-# 22:46 的有效复现里最小 bash probe 已经成功，但真正的 `bash --rcfile /initrc -i`
-# 仍然以 182 立即退出且没有 `shell:initrc-enter`。继续把“纯交互 bash 失败”与
-# “只有带 rcfile 的交互 bash 才失败”拆开，否则还会把根因卡在过宽的交互启动区间。 仅调试用
-bash_interactive_out_file="/tmp/acode-bash-interactive.out" # 仅调试用
-bash_interactive_err_file="/tmp/acode-bash-interactive.err" # 仅调试用
-rm -f "$bash_interactive_out_file" "$bash_interactive_err_file" # 仅调试用
-bash --noprofile --norc -i -c 'printf "[init:bash-interactive-ok,pid=%s,ppid=%s,argv0=%q,flags=%q]\n" "$$" "$PPID" "$0" "$-"' >"$bash_interactive_out_file" 2>"$bash_interactive_err_file" # 仅调试用
-bash_interactive_rc=$? # 仅调试用
-printf '[init:bash-interactive-rc=%s]\n' "$bash_interactive_rc" >&2 # 仅调试用
-if [ -s "$bash_interactive_out_file" ]; then sed 's/^/[init:bash-interactive-stdout] /' "$bash_interactive_out_file" >&2; else echo '[init:bash-interactive-stdout=<empty>]' >&2; fi # 仅调试用
-if [ -s "$bash_interactive_err_file" ]; then sed 's/^/[init:bash-interactive-stderr] /' "$bash_interactive_err_file" >&2; else echo '[init:bash-interactive-stderr=<empty>]' >&2; fi # 仅调试用
-bash_rcfile_out_file="/tmp/acode-bash-rcfile.out" # 仅调试用
-bash_rcfile_err_file="/tmp/acode-bash-rcfile.err" # 仅调试用
-rm -f "$bash_rcfile_out_file" "$bash_rcfile_err_file" # 仅调试用
-bash --noprofile --rcfile /initrc -i -c 'printf "[init:bash-rcfile-ok,pid=%s,ppid=%s,argv0=%q,flags=%q]\n" "$$" "$PPID" "$0" "$-"' >"$bash_rcfile_out_file" 2>"$bash_rcfile_err_file" # 仅调试用
-bash_rcfile_rc=$? # 仅调试用
-printf '[init:bash-rcfile-rc=%s]\n' "$bash_rcfile_rc" >&2 # 仅调试用
-if [ -s "$bash_rcfile_out_file" ]; then sed 's/^/[init:bash-rcfile-stdout] /' "$bash_rcfile_out_file" >&2; else echo '[init:bash-rcfile-stdout=<empty>]' >&2; fi # 仅调试用
-if [ -s "$bash_rcfile_err_file" ]; then sed 's/^/[init:bash-rcfile-stderr] /' "$bash_rcfile_err_file" >&2; else echo '[init:bash-rcfile-stderr=<empty>]' >&2; fi # 仅调试用
-if command -v ldd >/dev/null 2>&1; then # 仅调试用
-    bash_ldd_out_file="/tmp/acode-bash-ldd.out" # 仅调试用
-    bash_ldd_err_file="/tmp/acode-bash-ldd.err" # 仅调试用
-    rm -f "$bash_ldd_out_file" "$bash_ldd_err_file" # 仅调试用
-    ldd /bin/bash >"$bash_ldd_out_file" 2>"$bash_ldd_err_file" # 仅调试用
-    bash_ldd_rc=$? # 仅调试用
-    printf '[init:bash-ldd-rc=%s]\n' "$bash_ldd_rc" >&2 # 仅调试用
-    if [ -s "$bash_ldd_out_file" ]; then sed 's/^/[init:bash-ldd-stdout] /' "$bash_ldd_out_file" >&2; else echo '[init:bash-ldd-stdout=<empty>]' >&2; fi # 仅调试用
-    if [ -s "$bash_ldd_err_file" ]; then sed 's/^/[init:bash-ldd-stderr] /' "$bash_ldd_err_file" >&2; else echo '[init:bash-ldd-stderr=<empty>]' >&2; fi # 仅调试用
-else
-    echo '[init:bash-ldd-missing]' >&2 # 仅调试用
-fi
-# 仅调试用: wrapper 脚本方案已验证不可行 — proot ptrace 拦截 execve 时
-# 对 /tmp 内脚本产生 EFAULT (Bad address, os error 14)，导致所有 PTY 创建失败。
-# 这里保留直接 bash 路径作为低扰动基线，继续依赖 pre_exec 中的
-# [axs:tty=y,pgrp=ok] 探针 + initrc 首行 [initrc:L1] 探针定位崩溃阶段。
-# 若要主动抓 signal 54 的 sender，则切换到 axs 内置 sig54-probe 子命令。
-# 之所以做成 axs 原生命令而不是 shell wrapper，是因为前者只增加一次
-# 原生 execve，不会重新触发已验证会在 proot 下报 EFAULT 的脚本解释器链路。 仅调试用
-echo "[init:exec-axs]" >&2 # 仅调试用
-run_auto_exec_probe_before_axs # 仅调试用
-printf '[init:sig54-probe-enabled=%s]\n' "${AXS_SIG54_SENDER_PROBE:-0}" >&2 # 仅调试用
-axs_terminal_command='bash --rcfile /initrc -i' # 仅调试用
-if [ "${AXS_SIG54_SENDER_PROBE:-0}" = "1" ]; then # 仅调试用
-    # 仅调试用: 主动 sender probe 会先在 bash exec 之前用 sigtimedwait 盯一个很短的窗口；
-    # 默认关闭，避免它改变低扰动基线路径。需要抓 sender 时再显式打开。 仅调试用
-    axs_terminal_command='/usr/local/bin/axs sig54-probe --signal 54 --arm-ms 40 -- bash --rcfile /initrc -i' # 仅调试用
-    echo '[init:exec-axs-sig54-probe]' >&2 # 仅调试用
-fi # 仅调试用
-printf '[init:exec-axs-cmd=%s]\n' "$axs_terminal_command" >&2 # 仅调试用
 
 # Signal 54 (SIGRTMIN+20) can kill bash inside proot during startup, causing
 # AXS to exit 182 (128+54) before emitting __ACODE_AXS_READY__. The signal
 # is transient; a simple retry always succeeds within a few attempts.
 _axs_retry=0
+printf '[init-alpine:axs-loop-enter,axs_path=/usr/local/bin/axs,exists=%s,exec=%s]\n' "$(test -f /usr/local/bin/axs && echo y || echo n)" "$(test -x /usr/local/bin/axs && echo y || echo n)" >&2 # 仅调试用
 while true; do
     _axs_retry=$((_axs_retry + 1))
-    printf '[init:axs-attempt=%s]\n' "$_axs_retry" >&2
+    printf '[init-alpine:axs-attempt,retry=%s]\n' "$_axs_retry" >&2 # 仅调试用
 
-    "/usr/local/bin/axs" -c "$axs_terminal_command" &
+    "/usr/local/bin/axs" -c 'bash --rcfile /initrc -i' &
     axs_pid=$!
-    echo "[init:axs-pid=$axs_pid]" >&2 # 仅调试用
     wait_for_axs_ready "$axs_pid"
-    axs_ready_rc=$? # 仅调试用
-    echo "[init:ready-rc=$axs_ready_rc]" >&2 # 仅调试用
+    axs_ready_rc=$?
 
     if [ "$axs_ready_rc" -eq 0 ]; then
+        printf '[init-alpine:axs-ready,pid=%s]\n' "$axs_pid" >&2 # 仅调试用
         # AXS is ready — wait for it to finish normally
-        axs_wait_cmd_preview=$(tr '\000' ' ' < "/proc/$axs_pid/cmdline" 2>/dev/null | head -c 120) # 仅调试用
-        printf '[init:wait-begin,pid=%s,cmd=%s]\n' "$axs_pid" "${axs_wait_cmd_preview:-<unreadable>}" >&2 # 仅调试用
         wait "$axs_pid"
-        echo "[init:wait-rc=$?]" >&2 # 仅调试用
         break
     fi
 
     # AXS died before becoming ready — check if exit code is 182 (signal 54)
     wait "$axs_pid"
     _axs_wait_rc=$?
-    printf '[init:axs-died-before-ready,attempt=%s,wait_rc=%s]\n' "$_axs_retry" "$_axs_wait_rc" >&2
+    printf '[init-alpine:axs-died,rc=%s,retry=%s]\n' "$_axs_wait_rc" "$_axs_retry" >&2 # 仅调试用
 
     if [ "$_axs_wait_rc" -ne 182 ]; then
         # Not signal 54 — propagate the error, do not retry
-        printf '[init:axs-fatal,rc=%s]\n' "$_axs_wait_rc" >&2
         break
     fi
-
-    printf '[init:axs-retry,attempt=%s,rc=182]\n' "$_axs_retry" >&2
 done
 
 else

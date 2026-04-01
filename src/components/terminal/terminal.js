@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Terminal Component using xtermjs
  * Provides a pluggable and customizable terminal interface
  */
@@ -23,185 +23,6 @@ import TerminalTouchSelection from "./terminalTouchSelection";
 
 let terminalEnvironmentGeneration = 0;
 const AXS_READY_MARKER = "__ACODE_AXS_READY__";
-const pushTerminalSessionDebugLog = (event, payload = {}, level = "info") => { // 仅调试用
-	if (typeof window === "undefined" || typeof window.__HDC_DEBUG_PUSH !== "function") return; // 仅调试用
-	window.__HDC_DEBUG_PUSH({ // 仅调试用
-		type: "console", // 仅调试用
-		level, // 仅调试用
-		args: ["[terminal-session]", event, payload], // 仅调试用
-		timestamp: Date.now(), // 仅调试用
-	}); // 仅调试用
-}; // 仅调试用
-
-const sanitizeTerminalDebugPreview = (value) => { // 仅调试用
-	if (typeof value !== "string" || value.length === 0) return ""; // 仅调试用
-	return value // 仅调试用
-		.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "<CSI>") // 仅调试用
-		.replace(/\r/g, "\\r") // 仅调试用
-		.replace(/\n/g, "\\n") // 仅调试用
-		.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, (char) => { // 仅调试用
-			const hex = char.charCodeAt(0).toString(16).padStart(2, "0"); // 仅调试用
-			return `\\x${hex}`; // 仅调试用
-		}); // 仅调试用
-}; // 仅调试用
-
-const summarizeTerminalDebugPreview = (value, limit = 240) => { // 仅调试用
-	const sanitized = sanitizeTerminalDebugPreview(value); // 仅调试用
-	if (sanitized.length <= limit) return sanitized; // 仅调试用
-	return `${sanitized.slice(0, limit)}...`; // 仅调试用
-}; // 仅调试用
-
-const summarizeTerminalBufferLines = (terminal, maxLines = 3) => { // 仅调试用
-	const buffer = terminal?.buffer?.active; // 仅调试用
-	if (!buffer || typeof buffer.length !== "number") return []; // 仅调试用
-	const start = Math.max(0, buffer.length - maxLines); // 仅调试用
-	const lines = []; // 仅调试用
-	for (let index = start; index < buffer.length; index += 1) { // 仅调试用
-		const line = buffer.getLine(index); // 仅调试用
-		const text = line?.translateToString?.(true) || ""; // 仅调试用
-		lines.push({ // 仅调试用
-			index, // 仅调试用
-			text: summarizeTerminalDebugPreview(text, 160), // 仅调试用
-		}); // 仅调试用
-	} // 仅调试用
-	return lines; // 仅调试用
-}; // 仅调试用
-
-const summarizeTerminalBufferWindow = (terminal, start, count = 4) => { // 仅调试用
-	const buffer = terminal?.buffer?.active; // 仅调试用
-	if (!buffer || typeof buffer.length !== "number") return []; // 仅调试用
-	const safeStart = Math.max(0, Math.min(start, Math.max(0, buffer.length - 1))); // 仅调试用
-	const safeEnd = Math.min(buffer.length, safeStart + Math.max(0, count)); // 仅调试用
-	const lines = []; // 仅调试用
-	for (let index = safeStart; index < safeEnd; index += 1) { // 仅调试用
-		const line = buffer.getLine(index); // 仅调试用
-		const text = line?.translateToString?.(true) || ""; // 仅调试用
-		lines.push({ // 仅调试用
-			index, // 仅调试用
-			text: summarizeTerminalDebugPreview(text, 160), // 仅调试用
-		}); // 仅调试用
-	} // 仅调试用
-	return lines; // 仅调试用
-}; // 仅调试用
-
-const collectTerminalMotdSnapshot = (terminal) => { // 仅调试用
-	const buffer = terminal?.buffer?.active; // 仅调试用
-	if (!buffer || typeof buffer.length !== "number") return null; // 仅调试用
-	const matches = []; // 仅调试用
-	for (let index = 0; index < buffer.length; index += 1) { // 仅调试用
-		const line = buffer.getLine(index); // 仅调试用
-		const text = line?.translateToString?.(true) || ""; // 仅调试用
-		if (!/Welcome to Alpine Linux in Acode!|Working with packages|apk add <package>|apk del <package>|apk update && apk upgrade/.test(text)) continue; // 仅调试用
-		matches.push({ // 仅调试用
-			index, // 仅调试用
-			text: summarizeTerminalDebugPreview(text, 160), // 仅调试用
-		}); // 仅调试用
-		if (matches.length >= 8) break; // 仅调试用
-	} // 仅调试用
-	return { // 仅调试用
-		matchCount: matches.length, // 仅调试用
-		matches, // 仅调试用
-	}; // 仅调试用
-}; // 仅调试用
-
-const summarizeTerminalDebugLineTexts = (lines = []) => { // 仅调试用
-	const parts = lines.map((line) => line?.text || "").filter(Boolean); // 仅调试用
-	return parts.length ? parts.join(" | ") : null; // 仅调试用
-}; // 仅调试用
-
-const collectTerminalVisibilitySnapshot = (component, detail = "compact") => { // 仅调试用
-	const container = component?.container; // 仅调试用
-	const terminal = component?.terminal; // 仅调试用
-	const rect = container?.getBoundingClientRect?.() || null; // 仅调试用
-	const buffer = terminal?.buffer?.active; // 仅调试用
-	const viewportY = buffer?.viewportY ?? null; // 仅调试用
-	const rows = terminal?.rows ?? null; // 仅调试用
-	const bufferTail = summarizeTerminalBufferLines(terminal); // 仅调试用
-	const viewportHead = viewportY === null ? [] : summarizeTerminalBufferWindow(terminal, viewportY, 4); // 仅调试用
-	const viewportTail = viewportY === null || rows === null ? [] : summarizeTerminalBufferWindow(terminal, Math.max(0, viewportY + Math.max(0, rows - 4)), 4); // 仅调试用
-	const motd = collectTerminalMotdSnapshot(terminal); // 仅调试用
-	const baseSnapshot = { // 仅调试用
-		hasOffsetParent: !!container?.offsetParent, // 仅调试用
-		containerWidth: rect ? Math.round(rect.width) : null, // 仅调试用
-		containerHeight: rect ? Math.round(rect.height) : null, // 仅调试用
-		rows, // 仅调试用
-		cols: terminal?.cols ?? null, // 仅调试用
-		bufferLength: buffer?.length ?? null, // 仅调试用
-		bufferViewportY: viewportY, // 仅调试用
-		bufferBaseY: buffer?.baseY ?? null, // 仅调试用
-	}; // 仅调试用
-	// Exit-code-182 forensics need whether output materialized, not repeated full buffer dumps; relocation-specific logs keep exact geometry separately. 仅调试用
-	if (detail !== "full") { // 仅调试用
-		return { // 仅调试用
-			...baseSnapshot, // 仅调试用
-			bufferTailPreview: summarizeTerminalDebugLineTexts(bufferTail), // 仅调试用
-			viewportHeadPreview: summarizeTerminalDebugLineTexts(viewportHead), // 仅调试用
-			viewportTailPreview: summarizeTerminalDebugLineTexts(viewportTail), // 仅调试用
-			motdMatchCount: motd?.matchCount ?? 0, // 仅调试用
-		}; // 仅调试用
-	} // 仅调试用
-	return { // 仅调试用
-		...baseSnapshot, // 仅调试用
-		bufferTail, // 仅调试用
-		viewportHead, // 仅调试用
-		viewportTail, // 仅调试用
-		motd, // 仅调试用
-	}; // 仅调试用
-}; // 仅调试用
-
-const collectTerminalRenderSnapshot = (component, detail = "compact") => { // 仅调试用
-	const container = component?.container; // 仅调试用
-	const terminal = component?.terminal; // 仅调试用
-	const xtermElement = container?.querySelector?.(".xterm") || null; // 仅调试用
-	const screenElement = container?.querySelector?.(".xterm-screen") || null; // 仅调试用
-	const viewportElement = container?.querySelector?.(".xterm-viewport") || null; // 仅调试用
-	const canvases = Array.from(screenElement?.querySelectorAll?.("canvas") || []); // 仅调试用
-	const core = terminal?._core || null; // 仅调试用
-	const renderService = core?._renderService || null; // 仅调试用
-	const dimensions = renderService?.dimensions || null; // 仅调试用
-	const xtermRect = xtermElement?.getBoundingClientRect?.() || null; // 仅调试用
-	const screenRect = screenElement?.getBoundingClientRect?.() || null; // 仅调试用
-	const viewportRect = viewportElement?.getBoundingClientRect?.() || null; // 仅调试用
-	const baseSnapshot = { // 仅调试用
-		rendererType: renderService?._renderer?.constructor?.name || null, // 仅调试用
-		xtermWidth: xtermRect ? Math.round(xtermRect.width) : null, // 仅调试用
-		xtermHeight: xtermRect ? Math.round(xtermRect.height) : null, // 仅调试用
-		viewportWidth: viewportRect ? Math.round(viewportRect.width) : null, // 仅调试用
-		viewportHeight: viewportRect ? Math.round(viewportRect.height) : null, // 仅调试用
-		viewportScrollTop: viewportElement?.scrollTop ?? null, // 仅调试用
-		viewportScrollHeight: viewportElement?.scrollHeight ?? null, // 仅调试用
-		bufferBaseY: terminal?.buffer?.active?.baseY ?? null, // 仅调试用
-		bufferCursorY: terminal?.buffer?.active?.cursorY ?? null, // 仅调试用
-		bufferCursorX: terminal?.buffer?.active?.cursorX ?? null, // 仅调试用
-		cssCellWidth: dimensions?.css?.cell?.width ?? null, // 仅调试用
-		cssCellHeight: dimensions?.css?.cell?.height ?? null, // 仅调试用
-		canvasCount: canvases.length, // 仅调试用
-	}; // 仅调试用
-	if (detail !== "full") { // 仅调试用
-		return baseSnapshot; // 仅调试用
-	} // 仅调试用
-	return { // 仅调试用
-		...baseSnapshot, // 仅调试用
-		xtermClientWidth: xtermElement?.clientWidth ?? null, // 仅调试用
-		xtermClientHeight: xtermElement?.clientHeight ?? null, // 仅调试用
-		screenClientWidth: screenElement?.clientWidth ?? null, // 仅调试用
-		screenClientHeight: screenElement?.clientHeight ?? null, // 仅调试用
-		screenWidth: screenRect ? Math.round(screenRect.width) : null, // 仅调试用
-		screenHeight: screenRect ? Math.round(screenRect.height) : null, // 仅调试用
-		viewportClientWidth: viewportElement?.clientWidth ?? null, // 仅调试用
-		viewportClientHeight: viewportElement?.clientHeight ?? null, // 仅调试用
-		cssCanvasWidth: dimensions?.css?.canvas?.width ?? null, // 仅调试用
-		cssCanvasHeight: dimensions?.css?.canvas?.height ?? null, // 仅调试用
-		deviceCanvasWidth: dimensions?.device?.canvas?.width ?? null, // 仅调试用
-		deviceCanvasHeight: dimensions?.device?.canvas?.height ?? null, // 仅调试用
-		canvases: canvases.slice(0, 2).map((canvas) => ({ // 仅调试用
-			width: canvas.width, // 仅调试用
-			height: canvas.height, // 仅调试用
-			clientWidth: canvas.clientWidth, // 仅调试用
-			clientHeight: canvas.clientHeight, // 仅调试用
-		})), // 仅调试用
-	}; // 仅调试用
-}; // 仅调试用
 
 class TerminalSessionStaleError extends Error {
 	constructor(message = "Terminal session attempt became stale") {
@@ -258,16 +79,8 @@ export default class TerminalComponent {
 		this._visibleLayoutSyncTimeout = null;
 		this._focusLayoutSyncTimeout = null;
 		this._visualViewportSyncHandler = null;
-		this._bootstrapFrameLogCount = 0; // 仅调试用
-		this._bootstrapFrameBytesSeen = 0; // 仅调试用
-		this._sessionProcessSnapshotPromise = null; // 仅调试用
-		this._lastVisibleLayoutSyncReason = "init"; // 仅调试用
-		this._layoutSyncSequence = 0; // 仅调试用
-		this._renderEventLogCount = 0; // 仅调试用
-		this._postRefreshStateLogCount = 0; // 仅调试用
 		this._wasVisibleOnLastLayoutSync = false;
 		this._hiddenBootstrapOutputNeedsVisibleAnchor = false;
-		this._webglReactivationRecoveryCount = 0; // 仅调试用
 
 		this.init();
 	}
@@ -324,25 +137,6 @@ export default class TerminalComponent {
 		this.terminal.onBell(() => {
 			this.onBell?.();
 		});
-
-		this.terminal.onRender?.((event) => { // 仅调试用
-			if (this._renderEventLogCount >= 2) { // 仅调试用
-				return; // 仅调试用
-			} // 仅调试用
-			this._renderEventLogCount += 1; // 仅调试用
-			pushTerminalSessionDebugLog( // 仅调试用
-				"xterm-render", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					start: event?.start ?? null, // 仅调试用
-					end: event?.end ?? null, // 仅调试用
-					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-					render: collectTerminalRenderSnapshot(this), // 仅调试用
-				}, // 仅调试用
-				this.container?.offsetParent ? "info" : "warn", // 仅调试用
-			); // 仅调试用
-		}); // 仅调试用
 
 		// Handle copy/paste keybindings
 		this.setupCopyPasteHandlers();
@@ -849,18 +643,6 @@ export default class TerminalComponent {
 			let observedEnvironmentGeneration = terminalEnvironmentGeneration;
 			const ensureAttemptIsStillValid = () => {
 				if (this._isDisposed) {
-					pushTerminalSessionDebugLog( // 仅调试用
-						"session-stale", // 仅调试用
-						{ // 仅调试用
-							name: this.terminalDisplayName || null, // 仅调试用
-							pid: this.pid || null, // 仅调试用
-							initializationAttemptId: this._debugInitializationAttemptId ?? null, // 仅调试用
-							reason: "disposed", // 仅调试用
-							observedEnvironmentGeneration, // 仅调试用
-							currentEnvironmentGeneration: terminalEnvironmentGeneration, // 仅调试用
-						}, // 仅调试用
-						"warn", // 仅调试用
-					); // 仅调试用
 					throw new TerminalSessionStaleError();
 				}
 
@@ -869,35 +651,8 @@ export default class TerminalComponent {
 				// this older async flow must fail fast instead of repairing and
 				// tearing down the newer instance underneath it.
 				if (terminalEnvironmentGeneration !== observedEnvironmentGeneration) {
-					pushTerminalSessionDebugLog( // 仅调试用
-						"session-stale", // 仅调试用
-						{ // 仅调试用
-							name: this.terminalDisplayName || null, // 仅调试用
-							pid: this.pid || null, // 仅调试用
-							initializationAttemptId: this._debugInitializationAttemptId ?? null, // 仅调试用
-							reason: "environment-generation-changed", // 仅调试用
-							observedEnvironmentGeneration, // 仅调试用
-							currentEnvironmentGeneration: terminalEnvironmentGeneration, // 仅调试用
-						}, // 仅调试用
-						"warn", // 仅调试用
-					); // 仅调试用
 					throw new TerminalSessionStaleError();
 				}
-			};
-
-			const markSharedEnvironmentChanged = (reason = "unspecified") => { // 仅调试用
-				terminalEnvironmentGeneration += 1;
-				observedEnvironmentGeneration = terminalEnvironmentGeneration;
-				pushTerminalSessionDebugLog( // 仅调试用
-					"shared-environment-generation-bump", // 仅调试用
-					{ // 仅调试用
-						name: this.terminalDisplayName || null, // 仅调试用
-						pid: this.pid || null, // 仅调试用
-						initializationAttemptId: this._debugInitializationAttemptId ?? null, // 仅调试用
-						reason, // 仅调试用
-						newGeneration: terminalEnvironmentGeneration, // 仅调试用
-					}, // 仅调试用
-				); // 仅调试用
 			};
 
 			// Check if terminal is installed before starting AXS
@@ -1031,55 +786,9 @@ export default class TerminalComponent {
 				}, delayMs);
 			};
 
-			const repairAxsAfterStartupFailure = async () => {
-				// Keep the startup timeout and the follow-up repair inside the same shared
-				// owner flow. Otherwise waiter tabs observe the recoverable ready-timeout as
-				// a terminal-creation failure, show a popup, and remove themselves even
-				// though the owner terminal is still repairing the shared environment.
-				toast("Repairing terminal environment...");
-
-				// Repair tears down and rebuilds the shared runtime. Once repair starts,
-				// any older concurrent createSession flow must become stale instead of
-				// continuing with assumptions from the pre-repair environment.
-				markSharedEnvironmentChanged("repair"); // 仅调试用
-
-				try {
-					ensureAttemptIsStillValid();
-					await Terminal.stopAxs();
-				} catch (_) {
-					/* ignore */
-				}
-
-				const repairOk = await Terminal.startAxs(
-					true,
-					(message) => writeLifecycleLog(message, false),
-					(message) => writeLifecycleLog(message, true),
-				);
-				ensureAttemptIsStillValid();
-				if (!repairOk) {
-					try {
-						ensureAttemptIsStillValid();
-						await Terminal.resetConfigured();
-					} catch (_) {
-						/* ignore */
-					}
-					throw new Error("AXS repair failed");
-				}
-
-				await startAxsAndWaitForReady(false);
-				ensureAttemptIsStillValid();
-
-				if (!(await pollAxs(1))) {
-					ensureAttemptIsStillValid();
-					try {
-						ensureAttemptIsStillValid();
-						await Terminal.resetConfigured();
-					} catch (_) {
-						/* ignore */
-					}
-					throw new Error("Failed to start AXS server after repair attempt");
-				}
-			};
+// repairAxsAfterStartupFailure 已移除：repair 重试机制会在
+			// exec-probe 诊断期间提前触发（15s 超时内探针尚未结束，AXS 还没
+			// 启动），导致"AXS did not emit a ready event"循环出现两次。
 
 			const syncTerminalLayout = async () => {
 				const hasRenderableLayout = () => {
@@ -1176,15 +885,9 @@ export default class TerminalComponent {
 					return startResult;
 				}
 
+				// 不设超时，无限等待 AXS ready 信号。
 				try {
-					await Promise.race([
-						readyPromise,
-						new Promise((_, reject) => {
-							readyTimeoutId = setTimeout(() => {
-								reject(new Error("AXS did not emit a ready event"));
-							}, 15000);
-						}),
-					]);
+					await readyPromise;
 				} finally {
 					clearStartupProgressNoticeTimer();
 				}
@@ -1199,29 +902,7 @@ export default class TerminalComponent {
 						return;
 					}
 
-					// Starting/stopping AXS changes the single shared terminal runtime.
-					// Bump the shared-environment generation here so older attempts
-					// fail fast, while this owner continues on the new generation.
-					markSharedEnvironmentChanged("startup"); // 仅调试用
-					try {
-						await startAxsAndWaitForReady(false);
-					} catch (startupError) {
-						if (
-							startupError?.name === "TerminalSessionStaleError" ||
-							startupError?.sharedEnvironmentInterrupted
-						) {
-							throw startupError;
-						}
-						// AXS can miss the ready marker on the first shared startup while the
-						// environment is still degraded. Repair it here so all waiter tabs keep
-						// following the same shared operation instead of surfacing a false UI failure.
-						writeLifecycleLog(
-							`AXS startup failed: ${startupError.message}`,
-							true,
-						);
-						ensureAttemptIsStillValid();
-						await repairAxsAfterStartupFailure();
-					}
+					await startAxsAndWaitForReady(false);
 				});
 				ensureAttemptIsStillValid();
 			}
@@ -1234,13 +915,8 @@ export default class TerminalComponent {
 			// reachable and force an unnecessary reinstall loop.
 			const initialPollRetries = axsRunning ? 10 : 1;
 			if (!(await pollAxs(initialPollRetries))) {
-				ensureAttemptIsStillValid();
-				await runSharedEnvironmentOperation("repair", async () => {
-					// If HTTP still is not reachable after startup, reuse the same repair path
-					// so every concurrent terminal observes one shared outcome instead of racing.
-					await repairAxsAfterStartupFailure();
-				});
-				ensureAttemptIsStillValid();
+				// repair 重试机制已移除，HTTP 不可达直接报错
+				throw new Error("AXS HTTP endpoint is not reachable after startup");
 			}
 
 			// Session size must be measured after the mounted terminal has had a frame to lay
@@ -1288,23 +964,18 @@ export default class TerminalComponent {
 				}
 
 				const rawData = await response.text();
-				// 仅调试用: parse JSON response to extract PID and launch_detail
-				// (axs now returns {"pid":N,"launch_detail":"..."} for PTY backend diagnostics)
 				let pid = rawData.trim();
-				let launchDetail = null;
 				if (pid.startsWith("{")) {
 					try {
 						const parsed = JSON.parse(pid);
 						if (parsed.pid != null) {
 							pid = String(parsed.pid);
-							launchDetail = parsed.launch_detail || null;
 						}
 					} catch {}
 				}
 				return {
 					data: pid,
 					ptyOpenError: parsePtyOpenError(rawData),
-					launchDetail, // 仅调试用
 				};
 			};
 
@@ -1318,7 +989,6 @@ export default class TerminalComponent {
 				await runSharedEnvironmentOperation("refresh", async () => {
 					// Refresh replaces the shared axs binary/process. Older in-flight
 					// session attempts must stop before they can attach to the old state.
-					markSharedEnvironmentChanged("refresh"); // 仅调试用
 
 					try {
 						ensureAttemptIsStillValid();
@@ -1352,13 +1022,6 @@ export default class TerminalComponent {
 			}
 
 			this.pid = sessionResult.data.trim();
-			if (sessionResult.launchDetail) { // 仅调试用
-				pushTerminalSessionDebugLog("launch-detail", { // 仅调试用
-					name: this.terminalDisplayName, // 仅调试用
-					pid: this.pid, // 仅调试用
-					launchDetail: sessionResult.launchDetail, // 仅调试用
-				}); // 仅调试用
-			} // 仅调试用
 			return this.pid;
 		} catch (error) {
 			if (error?.name === "TerminalSessionStaleError") {
@@ -1388,16 +1051,6 @@ export default class TerminalComponent {
 			}
 		} catch (error) {
 			if (error?.name === "TerminalSessionStaleError") {
-				pushTerminalSessionDebugLog( // 仅调试用
-					"connect-stale-return", // 仅调试用
-					{ // 仅调试用
-						name: this.terminalDisplayName || null, // 仅调试用
-						pid: this.pid || pid || null, // 仅调试用
-						isReconnecting, // 仅调试用
-						initializationAttemptId: this._debugInitializationAttemptId ?? null, // 仅调试用
-					}, // 仅调试用
-					"warn", // 仅调试用
-				); // 仅调试用
 				return;
 			}
 			throw error;
@@ -1417,49 +1070,8 @@ export default class TerminalComponent {
 		const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
 		this._bootstrapOutputSeen = false;
 		this._pendingFocusAfterBootstrap = false;
-		this._bootstrapFrameLogCount = 0; // 仅调试用
-		this._bootstrapFrameBytesSeen = 0; // 仅调试用
-		this._websocketDebugMessageLogCount = 0; // 仅调试用
-		pushTerminalSessionDebugLog( // 仅调试用
-			"connect-begin", // 仅调试用
-			{ // 仅调试用
-				name: this.terminalDisplayName || null, // 仅调试用
-				pid: pid || null, // 仅调试用
-				isReconnecting, // 仅调试用
-				cols: this.terminal?.cols ?? null, // 仅调试用
-				rows: this.terminal?.rows ?? null, // 仅调试用
-				containerWidth: this.container ? Math.round(this.container.getBoundingClientRect().width) : null, // 仅调试用
-				containerHeight: this.container ? Math.round(this.container.getBoundingClientRect().height) : null, // 仅调试用
-			}, // 仅调试用
-		); // 仅调试用
 
 		this.websocket = new WebSocket(wsUrl);
-		pushTerminalSessionDebugLog( // 仅调试用
-			"websocket-created", // 仅调试用
-			{ // 仅调试用
-				name: this.terminalDisplayName || null, // 仅调试用
-				pid: this.pid || null, // 仅调试用
-				url: wsUrl, // 仅调试用
-				readyState: this.websocket?.readyState ?? null, // 仅调试用
-				binaryType: this.websocket?.binaryType ?? null, // 仅调试用
-				constructorName: this.websocket?.constructor?.name || null, // 仅调试用
-			}, // 仅调试用
-		); // 仅调试用
-		setTimeout(() => { // 仅调试用
-			if (this.isConnected || this._bootstrapFrameLogCount > 0) return; // 仅调试用
-			pushTerminalSessionDebugLog( // 仅调试用
-				"websocket-pending-without-open", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					readyState: this.websocket?.readyState ?? null, // 仅调试用
-					hasAttachAddon: !!this.attachAddon, // 仅调试用
-					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-					render: collectTerminalRenderSnapshot(this), // 仅调试用
-				}, // 仅调试用
-				"warn", // 仅调试用
-			); // 仅调试用
-		}, 1200); // 仅调试用
 
 		// The backend replays scrollback immediately after the WebSocket upgrade.
 		// If AttachAddon is only installed in onopen, those first binary frames can
@@ -1473,27 +1085,9 @@ export default class TerminalComponent {
 		this.attachAddon = new AttachAddon(this.websocket);
 		this.terminal.loadAddon(this.attachAddon);
 		this.terminal.unicode.activeVersion = "11";
-		this.websocket.addEventListener("open", () => { // 仅调试用
-			pushTerminalSessionDebugLog( // 仅调试用
-				"websocket-open-event", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					readyState: this.websocket?.readyState ?? null, // 仅调试用
-				}, // 仅调试用
-			); // 仅调试用
-		}); // 仅调试用
 
 		this.websocket.onopen = () => {
 			this.isConnected = true;
-			pushTerminalSessionDebugLog( // 仅调试用
-				"websocket-open", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					readyState: this.websocket?.readyState ?? null, // 仅调试用
-				}, // 仅调试用
-			); // 仅调试用
 			this.onConnect?.();
 
 			// Keep the initial PTY size from the session-create POST. Re-focusing here
@@ -1502,55 +1096,11 @@ export default class TerminalComponent {
 			// Focus is deferred until bootstrap output is actually visible.
 		};
 
-		this.websocket.addEventListener("message", (event) => { // 仅调试用
-			if (this._websocketDebugMessageLogCount >= 3) return; // 仅调试用
-			this._websocketDebugMessageLogCount += 1; // 仅调试用
-			pushTerminalSessionDebugLog( // 仅调试用
-				"websocket-raw-message", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					messageIndex: this._websocketDebugMessageLogCount, // 仅调试用
-					readyState: this.websocket?.readyState ?? null, // 仅调试用
-					dataType: typeof event.data === "string" ? "text" : event.data?.constructor?.name || typeof event.data, // 仅调试用
-					byteLength: typeof event.data === "string"
-						? event.data.length
-						: event.data instanceof ArrayBuffer
-							? event.data.byteLength
-							: event.data instanceof Blob
-								? event.data.size
-								: null, // 仅调试用
-					preview: typeof event.data === "string"
-						? summarizeTerminalDebugPreview(event.data, 180)
-						: "<non-text>", // 仅调试用
-					visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-				}, // 仅调试用
-			); // 仅调试用
-		}); // 仅调试用
-
 		this.websocket.onmessage = (event) => {
-			// Exit events can race with hidden-tab bootstrap. Log the exact client-side
-			// visibility/render state at receipt time so backend exit_code=182 can be
-			// separated from UI materialization timing on the next reproduction. 仅调试用
 			if (typeof event.data === "string") {
 				try {
 					const message = JSON.parse(event.data);
 					if (message.type === "exit") {
-						pushTerminalSessionDebugLog( // 仅调试用
-							"process-exit-received", // 仅调试用
-							{ // 仅调试用
-								name: this.terminalDisplayName || null, // 仅调试用
-								pid: this.pid || null, // 仅调试用
-								exitData: message.data || null, // 仅调试用
-								readyState: this.websocket?.readyState ?? null, // 仅调试用
-								bootstrapFrameLogCount: this._bootstrapFrameLogCount ?? null, // 仅调试用
-								bootstrapFrameBytesSeen: this._bootstrapFrameBytesSeen ?? null, // 仅调试用
-								bootstrapOutputReady: !!this._bootstrapOutputReady, // 仅调试用
-								visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-								render: collectTerminalRenderSnapshot(this), // 仅调试用
-							}, // 仅调试用
-							message.data?.exit_code === 0 ? "info" : "warn", // 仅调试用
-						); // 仅调试用
 						this.onProcessExit?.(message.data);
 						return;
 					}
@@ -1565,8 +1115,7 @@ export default class TerminalComponent {
 			this.markBootstrapOutputReady();
 
 			const MAX_SNIFF_BYTES = 4096;
-			let shouldCapturePostWriteBuffer = false; // 仅调试用
-			const containsBootstrapMarker = /motd|welcome|root@localhost|\[rc:|\[motd:/i; // 仅调试用
+			const containsBootstrapMarker = /motd|welcome|root@localhost|\[rc:|\[motd:/i;
 
 			try {
 				let text = "";
@@ -1597,65 +1146,6 @@ export default class TerminalComponent {
 				if (!this.container?.offsetParent && containsBootstrapMarker.test(text)) {
 					this._hiddenBootstrapOutputNeedsVisibleAnchor = true;
 				}
-
-				if ( // 仅调试用
-					this._bootstrapFrameLogCount < 3 && // 仅调试用
-					this._bootstrapFrameBytesSeen < 768 // 仅调试用
-				) { // 仅调试用
-					this._bootstrapFrameLogCount += 1; // 仅调试用
-					this._bootstrapFrameBytesSeen += text.length; // 仅调试用
-					pushTerminalSessionDebugLog( // 仅调试用
-						"bootstrap-frame", // 仅调试用
-						{ // 仅调试用
-							name: this.terminalDisplayName || null, // 仅调试用
-							pid: this.pid || null, // 仅调试用
-							frameIndex: this._bootstrapFrameLogCount, // 仅调试用
-							byteLength: text.length, // 仅调试用
-							preview: summarizeTerminalDebugPreview(text), // 仅调试用
-							containsPrompt: /root@localhost|[$#]\s*$/.test(text), // 仅调试用
-							containsMotdMarker: /motd|welcome|acode/i.test(text), // 仅调试用
-							dataType: typeof event.data === "string" ? "text" : event.data?.constructor?.name || typeof event.data, // 仅调试用
-						}, // 仅调试用
-					); // 仅调试用
-				} // 仅调试用
-
-				if ( // 仅调试用
-					this._bootstrapFrameLogCount <= 3 || // 仅调试用
-					containsBootstrapMarker.test(text) // 仅调试用
-				) { // 仅调试用
-					shouldCapturePostWriteBuffer = true; // 仅调试用
-					pushTerminalSessionDebugLog( // 仅调试用
-						"bootstrap-visibility", // 仅调试用
-						{ // 仅调试用
-							name: this.terminalDisplayName || null, // 仅调试用
-							pid: this.pid || null, // 仅调试用
-							preview: summarizeTerminalDebugPreview(text, 180), // 仅调试用
-							rawPreview: summarizeTerminalDebugPreview(text, 320), // 仅调试用
-							containsMotdMarker: /motd|welcome|acode/i.test(text), // 仅调试用
-							visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-							render: collectTerminalRenderSnapshot(this), // 仅调试用
-						}, // 仅调试用
-						this.container?.offsetParent ? "info" : "warn", // 仅调试用
-					); // 仅调试用
-				} // 仅调试用
-
-				// post-write-buffer: 仅记录前3次，避免每次 xterm write 都产生大量日志噪音 仅调试用
-				if (shouldCapturePostWriteBuffer && (this._postWriteBufferLogCount || 0) < 3) { // 仅调试用
-					this._postWriteBufferLogCount = (this._postWriteBufferLogCount || 0) + 1; // 仅调试用
-					setTimeout(() => { // 仅调试用
-						pushTerminalSessionDebugLog( // 仅调试用
-							"post-write-buffer", // 仅调试用
-							{ // 仅调试用
-								name: this.terminalDisplayName || null, // 仅调试用
-								pid: this.pid || null, // 仅调试用
-								count: this._postWriteBufferLogCount, // 仅调试用
-								visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-								render: collectTerminalRenderSnapshot(this), // 仅调试用
-							}, // 仅调试用
-							this.container?.offsetParent ? "info" : "warn", // 仅调试用
-						); // 仅调试用
-					}, 0); // 仅调试用
-				} // 仅调试用
 
 				if (this._relocationSniffDisabled) {
 					return;
@@ -1781,31 +1271,9 @@ export default class TerminalComponent {
 			}
 			this.terminal.loadAddon(addon);
 			this.webglAddon = addon;
-			this._webglReactivationRecoveryCount += 1; // 仅调试用
-			pushTerminalSessionDebugLog( // 仅调试用
-				"webgl-reactivation-rebuild", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					reason, // 仅调试用
-					recoveryCount: this._webglReactivationRecoveryCount, // 仅调试用
-					render: collectTerminalRenderSnapshot(this), // 仅调试用
-				}, // 仅调试用
-				"warn", // 仅调试用
-			); // 仅调试用
 			return true;
 		} catch (error) {
 			console.error("Failed to rebuild WebGL renderer:", error);
-			pushTerminalSessionDebugLog( // 仅调试用
-				"webgl-reactivation-rebuild-failed", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					reason, // 仅调试用
-					error: error?.message || String(error), // 仅调试用
-				}, // 仅调试用
-				"error", // 仅调试用
-			); // 仅调试用
 			return false;
 		}
 	}
@@ -1822,17 +1290,6 @@ export default class TerminalComponent {
 	 * Clear terminal
 	 */
 	clear() {
-		pushTerminalSessionDebugLog( // 仅调试用
-			"terminal-clear", // 仅调试用
-			{ // 仅调试用
-				name: this.terminalDisplayName || null, // 仅调试用
-				pid: this.pid || null, // 仅调试用
-				bootstrapOutputSeen: this._bootstrapOutputSeen, // 仅调试用
-				bufferLength: this.terminal?.buffer?.active?.length ?? null, // 仅调试用
-				viewportY: this.terminal?.buffer?.active?.viewportY ?? null, // 仅调试用
-			}, // 仅调试用
-			"warn", // 仅调试用
-		); // 仅调试用
 		this.terminal.clear();
 	}
 
@@ -1850,7 +1307,6 @@ export default class TerminalComponent {
 	}
 
 	scheduleVisibleLayoutSync(reason = "unspecified") {
-		this._lastVisibleLayoutSyncReason = reason; // 仅调试用
 		if (this._visibleLayoutSyncFrame !== null) {
 			cancelAnimationFrame?.(this._visibleLayoutSyncFrame);
 			this._visibleLayoutSyncFrame = null;
@@ -1890,7 +1346,7 @@ export default class TerminalComponent {
 		// what leaves the small non-scrollable black block under Terminal 1, so visible-layout
 		// correction must also listen to visualViewport changes directly.
 		this._visualViewportSyncHandler = (event) => {
-			this.scheduleVisibleLayoutSync(`visual-viewport-${event?.type || "unknown"}`); // 仅调试用
+			this.scheduleVisibleLayoutSync("visual-viewport");
 		};
 
 		window.addEventListener("resize", this._visualViewportSyncHandler, {
@@ -1937,8 +1393,6 @@ export default class TerminalComponent {
 
 		const xtermElement = this.container.querySelector(".xterm");
 		const viewportElement = this.container.querySelector(".xterm-viewport");
-		const xtermRectBefore = xtermElement?.getBoundingClientRect() || null; // 仅调试用
-		const viewportRectBefore = viewportElement?.getBoundingClientRect() || null; // 仅调试用
 		const isCurrentlyVisible = !!this.container.offsetParent;
 		const becameVisible =
 			isCurrentlyVisible && !this._wasVisibleOnLastLayoutSync;
@@ -1946,43 +1400,14 @@ export default class TerminalComponent {
 		const isViewportRelocated =
 			xtermElement &&
 			Math.abs(xtermElement.getBoundingClientRect().top - rect.top) > 4;
-		const syncSequence = ++this._layoutSyncSequence; // 仅调试用
 
 		this.fit();
 		if (becameVisible && this.webglAddon) {
 			this.rebuildWebglRenderer("visible-layout-reactivation");
 		}
 
-		const xtermRectAfter = xtermElement?.getBoundingClientRect() || null; // 仅调试用
-		const viewportRectAfter = viewportElement?.getBoundingClientRect() || null; // 仅调试用
-		const isViewportStillRelocated = // 仅调试用
-			xtermRectAfter && Math.abs(xtermRectAfter.top - rect.top) > 4; // 仅调试用
 		const shouldAnchorHiddenBootstrapViewport =
 			becameVisible && this._hiddenBootstrapOutputNeedsVisibleAnchor;
-
-		if (isViewportRelocated || isViewportStillRelocated) { // 仅调试用
-			pushTerminalSessionDebugLog( // 仅调试用
-				"visible-layout-sync", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
-					syncSequence, // 仅调试用
-					containerTop: Math.round(rect.top), // 仅调试用
-					containerHeight: Math.round(rect.height), // 仅调试用
-					xtermTopBefore: xtermRectBefore ? Math.round(xtermRectBefore.top) : null, // 仅调试用
-					xtermTopAfter: xtermRectAfter ? Math.round(xtermRectAfter.top) : null, // 仅调试用
-					viewportTopBefore: viewportRectBefore ? Math.round(viewportRectBefore.top) : null, // 仅调试用
-					viewportTopAfter: viewportRectAfter ? Math.round(viewportRectAfter.top) : null, // 仅调试用
-					viewportScrollTop: viewportElement?.scrollTop ?? null, // 仅调试用
-					rows: this.terminal?.rows ?? null, // 仅调试用
-					cols: this.terminal?.cols ?? null, // 仅调试用
-					wasRelocated: !!isViewportRelocated, // 仅调试用
-					stillRelocated: !!isViewportStillRelocated, // 仅调试用
-				}, // 仅调试用
-				isViewportStillRelocated ? "warn" : "info", // 仅调试用
-			); // 仅调试用
-		} // 仅调试用
 
 		if (isViewportRelocated || shouldAnchorHiddenBootstrapViewport) {
 			// When a previously hidden terminal is reactivated with the IME already affecting
@@ -1995,7 +1420,6 @@ export default class TerminalComponent {
 			// re-anchor is also required when bootstrap output arrived while the tab was hidden:
 			// otherwise the first visible paint can reuse hidden-tab scrollback and make the
 			// MOTD/prompt region appear missing even though it is already in the buffer.
-			const containerScrollTopBefore = this.container.scrollTop; // 仅调试用
 			// WebView auto-scrolls the nearest scrollable ancestor (even overflow:hidden ones)
 			// to keep the focused xterm textarea visible. This shifts the whole xterm layer
 			// above the container, leaving a black gap at the bottom. Resetting the container's
@@ -2005,60 +1429,12 @@ export default class TerminalComponent {
 			if (viewportElement) {
 				viewportElement.scrollTop = viewportElement.scrollHeight;
 			}
-			const containerScrollTopAfter = this.container.scrollTop; // 仅调试用
-			const xtermRectAfterFix = xtermElement?.getBoundingClientRect() || null; // 仅调试用
 			this._hiddenBootstrapOutputNeedsVisibleAnchor = false;
-			pushTerminalSessionDebugLog( // 仅调试用
-				"visible-layout-relocation-fix", // 仅调试用
-				{ // 仅调试用
-					name: this.terminalDisplayName || null, // 仅调试用
-					pid: this.pid || null, // 仅调试用
-					anchorHiddenBootstrapViewport: shouldAnchorHiddenBootstrapViewport, // 仅调试用
-					containerScrollTopBefore, // 仅调试用
-					containerScrollTopAfter, // 仅调试用
-					xtermTopAfterFix: xtermRectAfterFix ? Math.round(xtermRectAfterFix.top) : null, // 仅调试用
-					containerTop: Math.round(rect.top), // 仅调试用
-					fixedRelocation: xtermRectAfterFix ? Math.abs(xtermRectAfterFix.top - rect.top) <= 4 : null, // 仅调试用
-				}, // 仅调试用
-				"warn", // 仅调试用
-			); // 仅调试用
 		}
 
 		if (this.terminal.rows > 0) {
 			this.terminal.clearTextureAtlas?.();
 			this.terminal.refresh(0, this.terminal.rows - 1);
-			// visible-layout-buffer-snapshot: 仅记录前2次，避免频繁 tab 切换与 steady-state 刷新淹没 182 诊断日志 仅调试用
-			if ((this._visibleLayoutSnapshotLogCount || 0) < 2) { // 仅调试用
-				this._visibleLayoutSnapshotLogCount = (this._visibleLayoutSnapshotLogCount || 0) + 1; // 仅调试用
-				pushTerminalSessionDebugLog( // 仅调试用
-					"visible-layout-buffer-snapshot", // 仅调试用
-					{ // 仅调试用
-						name: this.terminalDisplayName || null, // 仅调试用
-						pid: this.pid || null, // 仅调试用
-						count: this._visibleLayoutSnapshotLogCount, // 仅调试用
-						reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
-						visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-						render: collectTerminalRenderSnapshot(this), // 仅调试用
-					}, // 仅调试用
-					this.container?.offsetParent ? "info" : "warn", // 仅调试用
-				); // 仅调试用
-			} // 仅调试用
-			if (this._postRefreshStateLogCount < 2) { // 仅调试用
-				this._postRefreshStateLogCount += 1; // 仅调试用
-				requestAnimationFrame?.(() => { // 仅调试用
-					pushTerminalSessionDebugLog( // 仅调试用
-						"visible-layout-post-refresh", // 仅调试用
-						{ // 仅调试用
-							name: this.terminalDisplayName || null, // 仅调试用
-							pid: this.pid || null, // 仅调试用
-							reason: this._lastVisibleLayoutSyncReason || null, // 仅调试用
-							visibility: collectTerminalVisibilitySnapshot(this), // 仅调试用
-							render: collectTerminalRenderSnapshot(this), // 仅调试用
-						}, // 仅调试用
-						this.container?.offsetParent ? "info" : "warn", // 仅调试用
-					); // 仅调试用
-				}); // 仅调试用
-			} // 仅调试用
 		}
 	}
 
