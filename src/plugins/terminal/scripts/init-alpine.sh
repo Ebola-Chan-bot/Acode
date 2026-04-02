@@ -79,9 +79,23 @@ repair_script_interpreters() {
 }
 
 run_apk_step() {
+    local _step_label="$1"
+    local _step_repo="$2"
     shift
     shift
-    "$@"
+    printf '[init-alpine:apk-step-begin,label=%s,repo=%s,cmd=%s]\n' "$_step_label" "$_step_repo" "$*" >&2 # 仅调试用
+    "$@" &
+    local _step_pid=$!
+    printf '[init-alpine:apk-step-pid,%s,pid=%s]\n' "$_step_label" "$_step_pid" >&2 # 仅调试用
+    # Watchdog: if apk hangs for 60s (likely DNS/network), kill it and return failure.
+    # The shell's wait is interrupted by the TERM signal from the background kill.
+    ( sleep 60 && kill "$_step_pid" 2>/dev/null && printf '[init-alpine:apk-step-timeout,label=%s,pid=%s]\n' "$_step_label" "$_step_pid" >&2 ) & # 仅调试用
+    local _watchdog_pid=$! # 仅调试用
+    wait "$_step_pid"
+    local _step_rc=$?
+    kill "$_watchdog_pid" 2>/dev/null; wait "$_watchdog_pid" 2>/dev/null # 仅调试用
+    printf '[init-alpine:apk-step-done,label=%s,rc=%s]\n' "$_step_label" "$_step_rc" >&2 # 仅调试用
+    return "$_step_rc"
 }
 
 configure_apk_repositories() {
@@ -140,7 +154,10 @@ if [ -n "$missing_packages" ]; then
 
     install_succeeded="false"
     for repo_mode in official mirror; do
+        printf '[init-alpine:apk-repo-try,mode=%s]\n' "$repo_mode" >&2 # 仅调试用
         configure_apk_repositories "$repo_mode"
+        printf '[init-alpine:apk-repos-content,%s]\n' "$(cat /etc/apk/repositories 2>/dev/null | tr '\n' '|')" >&2 # 仅调试用
+        printf '[init-alpine:resolv-conf,%s]\n' "$(cat /etc/resolv.conf 2>/dev/null | tr '\n' '|')" >&2 # 仅调试用
 
         # In proot, persisting APKINDEX may fail with Operation not permitted;
         # install directly without local index cache writes.
@@ -242,8 +259,11 @@ if [ "$#" -eq 0 ]; then
     echo "$$" > "$PREFIX/pid"
     chmod +x "$PREFIX/axs"
 
+    # Write MOTD via temp file to avoid signal 54 truncating the target.
+    # Retry on rc=182 (signal 54 killing cat inside proot).
     if [ ! -s "$PREFIX/alpine/etc/acode_motd" ]; then
-        cat <<EOF > "$PREFIX/alpine/etc/acode_motd"
+        while true; do
+            cat <<EOF > "$PREFIX/alpine/etc/acode_motd.tmp"
 Welcome to Alpine Linux in Acode!
 
 Working with packages:
@@ -254,6 +274,26 @@ Working with packages:
  - Upgrade: apk update && apk upgrade
 
 EOF
+            _motd_rc=$?
+            if [ "$_motd_rc" -eq 0 ] && [ -s "$PREFIX/alpine/etc/acode_motd.tmp" ]; then
+                # mv is also an external binary intercepted by proot ptrace;
+                # signal 54 can kill mv (rc=182) leaving the file un-moved.
+                mv -f "$PREFIX/alpine/etc/acode_motd.tmp" "$PREFIX/alpine/etc/acode_motd"
+                _motd_mv_rc=$?
+                if [ "$_motd_mv_rc" -ne 0 ]; then
+                    rm -f "$PREFIX/alpine/etc/acode_motd.tmp"
+                    [ "$_motd_mv_rc" -eq 182 ] && { printf '[init-alpine:motd-mv-retry,rc=%s]\n' "$_motd_mv_rc" >&2; continue; } # 仅调试用
+                    printf '[init-alpine:motd-mv-failed,rc=%s]\n' "$_motd_mv_rc" >&2 # 仅调试用
+                    break
+                fi
+                printf '[init-alpine:motd-create,ok,size=%s]\n' "$(wc -c < "$PREFIX/alpine/etc/acode_motd" 2>/dev/null || echo 0)" >&2 # 仅调试用
+                break
+            fi
+            rm -f "$PREFIX/alpine/etc/acode_motd.tmp"
+            [ "$_motd_rc" -eq 182 ] && { printf '[init-alpine:motd-retry,rc=%s]\n' "$_motd_rc" >&2; continue; } # 仅调试用
+            printf '[init-alpine:motd-failed,rc=%s]\n' "$_motd_rc" >&2 # 仅调试用
+            break
+        done
     fi
 
     # Create/update initrc (always overwrite to keep in sync with app updates)
@@ -264,6 +304,8 @@ EOF
     # cat exits with rc=182 and produces 0 bytes. The > redirect truncates the target
     # BEFORE cat runs, so writing directly to initrc would destroy the working copy.
     # Using a temp file preserves the existing initrc on failure.
+    # Retry on rc=182 (signal 54 killing cat inside proot).
+    while true; do
     cat <<'EOF' > "$PREFIX/alpine/initrc.tmp"
 # Source rc files if they exist
 
@@ -417,15 +459,34 @@ acode() {
 }
 
 EOF
-_initrc_heredoc_rc=$?
+    _initrc_heredoc_rc=$?
+    _initrc_tmp_size=$(wc -c < "$PREFIX/alpine/initrc.tmp" 2>/dev/null || echo 0) # 仅调试用
+    printf '[init-alpine:initrc-heredoc,rc=%s,tmp_size=%s]\n' "$_initrc_heredoc_rc" "$_initrc_tmp_size" >&2 # 仅调试用
 
-# Atomically replace initrc only if heredoc succeeded (rc=0 AND non-empty).
-# On failure (signal 54 / rc=182), the existing initrc is preserved intact.
-if [ "$_initrc_heredoc_rc" -eq 0 ] && [ -s "$PREFIX/alpine/initrc.tmp" ]; then
-    mv -f "$PREFIX/alpine/initrc.tmp" "$PREFIX/alpine/initrc"
-else
+    if [ "$_initrc_heredoc_rc" -eq 0 ] && [ -s "$PREFIX/alpine/initrc.tmp" ]; then
+        # mv is also an external binary intercepted by proot ptrace;
+        # signal 54 can kill mv (rc=182) leaving the file un-moved.
+        mv -f "$PREFIX/alpine/initrc.tmp" "$PREFIX/alpine/initrc"
+        _initrc_mv_rc=$?
+        if [ "$_initrc_mv_rc" -ne 0 ]; then
+            rm -f "$PREFIX/alpine/initrc.tmp"
+            [ "$_initrc_mv_rc" -eq 182 ] && { printf '[init-alpine:initrc-mv-retry,rc=%s]\n' "$_initrc_mv_rc" >&2; continue; } # 仅调试用
+            printf '[init-alpine:initrc-mv-failed,rc=%s]\n' "$_initrc_mv_rc" >&2 # 仅调试用
+            break
+        fi
+        printf '[init-alpine:initrc-ok,size=%s]\n' "$(wc -c < "$PREFIX/alpine/initrc" 2>/dev/null || echo 0)" >&2 # 仅调试用
+        break
+    fi
     rm -f "$PREFIX/alpine/initrc.tmp"
-fi
+    # Signal 54 (rc=182) killed the heredoc cat — retry
+    if [ "$_initrc_heredoc_rc" -eq 182 ]; then
+        printf '[init-alpine:initrc-retry,rc=%s]\n' "$_initrc_heredoc_rc" >&2 # 仅调试用
+        continue
+    fi
+    # Other failure — give up, proceed without initrc
+    printf '[init-alpine:initrc-failed,heredoc_rc=%s,tmp_size=%s,old_exists=%s]\n' "$_initrc_heredoc_rc" "$_initrc_tmp_size" "$(test -f "$PREFIX/alpine/initrc" && echo y || echo n)" >&2 # 仅调试用
+    break
+    done
 
 # Add PS1 only if not already present
 if ! grep -q 'PS1=' "$PREFIX/alpine/initrc"; then
@@ -436,57 +497,101 @@ if ! grep -q 'PS1=' "$PREFIX/alpine/initrc"; then
 fi
 chmod +x "$PREFIX/alpine/initrc"
 
+# Wait for AXS to signal readiness via a named pipe (FIFO).
+# AXS writes "READY\n" to AXS_READY_PIPE after successful TCP bind.
+# The shell's `read -t` blocks until that write arrives or times out.
+# This replaces the old wget polling loop: zero HTTP requests, instant
+# notification, and no hang when wget can't reach AXS inside proot.
 wait_for_axs_ready() {
     local axs_pid="$1"
+    local ready_pipe="$2"
+    local ready_line=""
 
-    # Poll AXS HTTP status endpoint until ready (100 x 0.1s = 10s max).
-    # Emits __ACODE_AXS_READY__ on success for the JS frontend to detect.
-    for attempt in $(seq 1 100); do
-        if wget -q -T 1 -O - "http://127.0.0.1:8767/status" >/dev/null 2>&1; then
-            echo "__ACODE_AXS_READY__"
-            return 0
-        fi
+    printf '[init-alpine:wait-axs-enter,axs_pid=%s,pipe=%s]\n' "$axs_pid" "$ready_pipe" >&2 # 仅调试用
 
-        if ! kill -0 "$axs_pid" 2>/dev/null; then
-            return 1
-        fi
+    # read -t 15: block up to 15 seconds for AXS to write "READY" to the FIFO.
+    # If AXS dies before opening the pipe, the shell's read gets EOF immediately
+    # (no other writers). If AXS hangs, the 15s timeout fires.
+    read -t 15 ready_line < "$ready_pipe"
+    _read_rc=$?
 
-        sleep 0.1
-    done
+    if [ "$_read_rc" -eq 0 ] && [ "$ready_line" = "READY" ]; then
+        printf '[init-alpine:wait-axs-ok,method=fifo]\n' >&2 # 仅调试用
+        echo "__ACODE_AXS_READY__"
+        return 0
+    fi
 
+    printf '[init-alpine:wait-axs-fail,read_rc=%s,line=%s,axs_alive=%s]\n' "$_read_rc" "$ready_line" "$(kill -0 "$axs_pid" 2>/dev/null && echo y || echo n)" >&2 # 仅调试用
     return 1
 }
 
 # Stage axs binary inside the rootfs so it can be found by path within proot.
 # A refreshed Alpine rootfs can legitimately miss /usr/local/bin until the first
 # app-managed startup recreates it.
-mkdir -p /usr/local/bin || { printf '[init-alpine:mkdir-failed,rc=%s]\n' "$?" >&2; exit 1; } # 仅调试用: mkdir失败诊断
-cp -f "$PREFIX/axs" /usr/local/bin/axs || { printf '[init-alpine:cp-axs-failed,rc=%s,src=%s,exists=%s]\n' "$?" "$PREFIX/axs" "$(test -f "$PREFIX/axs" && echo y || echo n)" >&2; exit 1; } # 仅调试用: cp失败诊断
+# Signal 54 can kill mkdir/cp inside proot (exit 182). Retry in-place since
+# the signal is transient and the next attempt almost always succeeds.
+while true; do
+    mkdir -p /usr/local/bin 2>/dev/null && break
+    _rc=$?
+    [ "$_rc" -eq 182 ] && { printf '[init-alpine:mkdir-retry,rc=%s]\n' "$_rc" >&2; continue; } # 仅调试用
+    printf '[init-alpine:mkdir-failed,rc=%s]\n' "$_rc" >&2 # 仅调试用
+    exit 1
+done
+while true; do
+    cp -f "$PREFIX/axs" /usr/local/bin/axs 2>/dev/null && break
+    _rc=$?
+    [ "$_rc" -eq 182 ] && { printf '[init-alpine:cp-axs-retry,rc=%s]\n' "$_rc" >&2; continue; } # 仅调试用
+    printf '[init-alpine:cp-axs-failed,rc=%s,src=%s,exists=%s]\n' "$_rc" "$PREFIX/axs" "$(test -f "$PREFIX/axs" && echo y || echo n)" >&2 # 仅调试用
+    exit 1
+done
 # After a fresh reinstall, proot can expose / as read-only while still leaving
 # the copied axs binary executable with its original mode bits. In that case the
 # chmod syscall fails, but treating that as fatal is wrong because axs was staged
 # successfully and can still be launched. Only abort when the final file is not
 # executable; otherwise continue.
-if ! chmod 755 /usr/local/bin/axs 2>/dev/null; then
-    if [ ! -x /usr/local/bin/axs ]; then
-        printf '[init-alpine:axs-not-executable-after-chmod]\n' >&2 # 仅调试用
-        exit 1
+# Signal 54 (exit 182) on chmod is transient — retry in-place.
+while true; do
+    chmod 755 /usr/local/bin/axs 2>/dev/null && break
+    _rc=$?
+    [ "$_rc" -eq 182 ] && { printf '[init-alpine:chmod-retry,rc=%s]\n' "$_rc" >&2; continue; } # 仅调试用
+    # Non-182 chmod failure: tolerate if the file is already executable
+    if [ -x /usr/local/bin/axs ]; then
+        break
     fi
-fi
+    printf '[init-alpine:axs-not-executable-after-chmod]\n' >&2 # 仅调试用
+    exit 1
+done
 
 # Signal 54 (SIGRTMIN+20) can kill bash inside proot during startup, causing
 # AXS to exit 182 (128+54) before emitting __ACODE_AXS_READY__. The signal
 # is transient; a simple retry always succeeds within a few attempts.
 _axs_retry=0
+_axs_hung_warned=0
+_ready_pipe="/tmp/.axs-ready-$$"
 printf '[init-alpine:axs-loop-enter,axs_path=/usr/local/bin/axs,exists=%s,exec=%s]\n' "$(test -f /usr/local/bin/axs && echo y || echo n)" "$(test -x /usr/local/bin/axs && echo y || echo n)" >&2 # 仅调试用
 while true; do
     _axs_retry=$((_axs_retry + 1))
     printf '[init-alpine:axs-attempt,retry=%s]\n' "$_axs_retry" >&2 # 仅调试用
 
+    # Create FIFO for this attempt (remove stale one from previous retry)
+    # mkfifo is also an external binary intercepted by proot ptrace;
+    # signal 54 can kill it (rc=182) leaving no FIFO, which breaks the
+    # ready-notification mechanism entirely. Retry in-place.
+    rm -f "$_ready_pipe"
+    while true; do
+        mkfifo "$_ready_pipe" && break
+        _mkfifo_rc=$?
+        [ "$_mkfifo_rc" -eq 182 ] && { printf '[init-alpine:mkfifo-retry,rc=%s]\n' "$_mkfifo_rc" >&2; continue; } # 仅调试用
+        printf '[init-alpine:mkfifo-failed,rc=%s]\n' "$_mkfifo_rc" >&2 # 仅调试用
+        break
+    done
+    export AXS_READY_PIPE="$_ready_pipe"
+
     "/usr/local/bin/axs" -c 'bash --rcfile /initrc -i' &
     axs_pid=$!
-    wait_for_axs_ready "$axs_pid"
+    wait_for_axs_ready "$axs_pid" "$_ready_pipe"
     axs_ready_rc=$?
+    rm -f "$_ready_pipe"
 
     if [ "$axs_ready_rc" -eq 0 ]; then
         printf '[init-alpine:axs-ready,pid=%s]\n' "$axs_pid" >&2 # 仅调试用
@@ -495,15 +600,44 @@ while true; do
         break
     fi
 
-    # AXS died before becoming ready — check if exit code is 182 (signal 54)
-    wait "$axs_pid"
-    _axs_wait_rc=$?
-    printf '[init-alpine:axs-died,rc=%s,retry=%s]\n' "$_axs_wait_rc" "$_axs_retry" >&2 # 仅调试用
+    # AXS failed to become ready within 15s.
+    # If AXS died (signal 54 / exit 182), retry immediately.
+    # If AXS is still alive but never wrote READY to the FIFO, it is hung.
+    # In the hung case, do NOT kill AXS — instead warn the user and keep
+    # waiting indefinitely. The user can uninstall/reinstall the terminal
+    # if needed; but if they do nothing, the wait continues in case AXS
+    # eventually recovers (e.g. slow DNS resolution during first boot).
+    if ! kill -0 "$axs_pid" 2>/dev/null; then
+        # AXS died — collect exit code and decide whether to retry
+        wait "$axs_pid"
+        _axs_wait_rc=$?
+        printf '[init-alpine:axs-died,rc=%s,retry=%s]\n' "$_axs_wait_rc" "$_axs_retry" >&2 # 仅调试用
 
-    if [ "$_axs_wait_rc" -ne 182 ]; then
-        # Not signal 54 — propagate the error, do not retry
+        if [ "$_axs_wait_rc" -eq 182 ]; then
+            # Signal 54 — transient, retry
+            continue
+        fi
+        # Other fatal error — propagate
         break
     fi
+
+    # AXS is alive but unresponsive — warn user and wait indefinitely
+    printf '[init-alpine:axs-hung,pid=%s,retry=%s]\n' "$axs_pid" "$_axs_retry" >&2 # 仅调试用
+    # Only show warning once; subsequent 182 retries that timeout again stay silent
+    if [ "$_axs_hung_warned" -eq 0 ]; then
+        _axs_hung_warned=1
+        echo -e "\e[33;1m[!]\e[0m AXS 服务启动超时，可能需要在设置中卸载并重新安装终端。\e[0m"
+        echo -e "\e[33;1m[!]\e[0m AXS server startup timed out. You may need to uninstall and reinstall the terminal from Settings.\e[0m"
+    fi
+    wait "$axs_pid"
+    _axs_wait_rc=$?
+    printf '[init-alpine:axs-hung-exited,rc=%s,retry=%s]\n' "$_axs_wait_rc" "$_axs_retry" >&2 # 仅调试用
+    # AXS eventually exited while user was waiting. If signal 54 (exit 182),
+    # retry silently — the next attempt will likely succeed immediately.
+    if [ "$_axs_wait_rc" -eq 182 ]; then
+        continue
+    fi
+    break
 done
 
 else

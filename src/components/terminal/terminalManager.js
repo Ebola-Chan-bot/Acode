@@ -1763,7 +1763,29 @@ class TerminalManager {
 			}
 		};
 
-		terminalComponent.onProcessExit = (exitData) => {
+		terminalComponent.onProcessExit = async (exitData) => {
+			// Exit code 182 = signal 54 (SIGRTMIN+20) killed bash inside proot during
+			// the first few milliseconds of startup. This is a transient proot ptrace
+			// race condition, not an application error. Retry by creating a new terminal
+			// session on the same AXS server — the server is still healthy, only the
+			// individual bash process was killed.
+			if (exitData.exit_code === 182) {
+				console.warn(`Terminal ${terminalId} bash killed by signal 54 (exit 182), retrying session...`);
+				try {
+					if (terminalComponent.websocket) {
+						terminalComponent.websocket.close();
+					}
+					terminalComponent.isConnected = false;
+					terminalComponent.pid = null;
+					terminalComponent.clear();
+					await terminalComponent.connectToSession();
+					return;
+				} catch (retryError) {
+					console.error(`Terminal ${terminalId} signal 54 retry failed:`, retryError);
+					// Fall through to normal exit handling
+				}
+			}
+
 			// Format exit message based on exit code and signal
 			let message;
 			if (exitData.signal) {
