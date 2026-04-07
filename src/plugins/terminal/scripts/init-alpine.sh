@@ -8,6 +8,62 @@ APK_COMMUNITY_REPO="http://dl-cdn.alpinelinux.org/alpine/__ALPINE_BRANCH__/commu
 APK_MIRROR_MAIN_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/main"
 APK_MIRROR_COMMUNITY_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/community"
 
+# 182 policy switch: retry | failfast
+AXS_EXIT_182_POLICY="${AXS_EXIT_182_POLICY:-failfast}"
+
+should_retry_on_182() {
+    local _rc="$1"
+    [ "$_rc" -eq 182 ] || return 1
+    [ "$AXS_EXIT_182_POLICY" = "retry" ] || return 1
+    return 0
+}
+
+handle_182_policy() {
+    local _tag="$1"
+    local _rc="$2"
+    local _retry="$3"
+
+    # Signal 54 transience probe: immediately invoke external binaries (cat,
+    # /bin/true) after a 182 failure. If probes succeed (rc=0), signal 54 was
+    # a one-shot event and retry strategy is viable. If probes also fail,
+    # signal 54 is persistent in this proot session.
+    cat /dev/null > /dev/null 2>&1 # 仅调试用
+    local _probe_cat_rc=$? # 仅调试用
+    /bin/true 2>/dev/null # 仅调试用
+    local _probe_true_rc=$? # 仅调试用
+    printf '[%s-signal54-probe,probe_cat_rc=%s,probe_true_rc=%s,masks=%s,pid=%s]\n' "$_tag" "$_probe_cat_rc" "$_probe_true_rc" "$(_collect_masks)" "$$" >&2 # 仅调试用
+
+    if should_retry_on_182 "$_rc"; then
+        if [ -n "$_retry" ]; then
+            printf '[%s-retry,rc=%s,retry=%s]\n' "$_tag" "$_rc" "$_retry" >&2 # 仅调试用
+        else
+            printf '[%s-retry,rc=%s]\n' "$_tag" "$_rc" >&2 # 仅调试用
+        fi
+        return 0
+    fi
+
+    if [ -n "$_retry" ]; then
+        printf '[%s-failfast-182,rc=%s,retry=%s]\n' "$_tag" "$_rc" "$_retry" >&2 # 仅调试用
+    else
+        printf '[%s-failfast-182,rc=%s]\n' "$_tag" "$_rc" >&2 # 仅调试用
+    fi
+    return 1
+}
+
+# Collect signal masks using only shell builtins (read + case + printf).
+# grep/tr are external commands intercepted by proot ptrace and can themselves
+# be killed by signal 54, producing empty output — as observed in
+# motd-write-error-state masks_after= (empty) logs.
+_collect_masks() { # 仅调试用
+    local _m="" _l="" # 仅调试用
+    while IFS= read -r _l; do # 仅调试用
+        case "$_l" in # 仅调试用
+            Sig*) _m="${_m}${_l}|" ;; # 仅调试用
+        esac # 仅调试用
+    done < /proc/self/status 2>/dev/null # 仅调试用
+    printf '%s' "$_m" # 仅调试用
+} # 仅调试用
+
 extract_shebang_interpreter() {
     local shebang_line="$1"
     local shebang_body=""
@@ -260,9 +316,10 @@ if [ "$#" -eq 0 ]; then
     chmod +x "$PREFIX/axs"
 
     # Write MOTD via temp file to avoid signal 54 truncating the target.
-    # Retry on rc=182 (signal 54 killing cat inside proot).
+    # rc=182 behavior is controlled by AXS_EXIT_182_POLICY.
     if [ ! -s "$PREFIX/alpine/etc/acode_motd" ]; then
         while true; do
+            printf '[init-alpine:motd-pre,dir_exists=%s,dir_writable=%s,tmp_exists=%s,mv_path=%s,mv_exec=%s,masks=%s,pid=%s]\n' "$(test -d "$PREFIX/alpine/etc" && echo y || echo n)" "$(test -w "$PREFIX/alpine/etc" && echo y || echo n)" "$(test -f "$PREFIX/alpine/etc/acode_motd.tmp" && echo y || echo n)" "$(command -v mv 2>/dev/null || echo '<not-found>')" "$(test -x "$(command -v mv 2>/dev/null)" 2>/dev/null && echo y || echo n)" "$(_collect_masks)" "$$" >&2 # 仅调试用
             cat <<EOF > "$PREFIX/alpine/etc/acode_motd.tmp"
 Welcome to Alpine Linux in Acode!
 
@@ -275,14 +332,23 @@ Working with packages:
 
 EOF
             _motd_rc=$?
+            if [ "$_motd_rc" -ne 0 ]; then
+                printf '[init-alpine:motd-write-error-state,rc=%s,tmp_exists_after=%s,tmp_size_after=%s,cat_path=%s,cat_exec=%s,dir_writable_after=%s,masks_after=%s,pid=%s]\n' "$_motd_rc" "$(test -f "$PREFIX/alpine/etc/acode_motd.tmp" && echo y || echo n)" "$(wc -c < "$PREFIX/alpine/etc/acode_motd.tmp" 2>/dev/null || echo -1)" "$(command -v cat 2>/dev/null || echo '<not-found>')" "$(test -x "$(command -v cat 2>/dev/null)" 2>/dev/null && echo y || echo n)" "$(test -w "$PREFIX/alpine/etc" && echo y || echo n)" "$(_collect_masks)" "$$" >&2 # 仅调试用
+            fi
             if [ "$_motd_rc" -eq 0 ] && [ -s "$PREFIX/alpine/etc/acode_motd.tmp" ]; then
                 # mv is also an external binary intercepted by proot ptrace;
                 # signal 54 can kill mv (rc=182) leaving the file un-moved.
                 mv -f "$PREFIX/alpine/etc/acode_motd.tmp" "$PREFIX/alpine/etc/acode_motd"
                 _motd_mv_rc=$?
                 if [ "$_motd_mv_rc" -ne 0 ]; then
+                    printf '[init-alpine:motd-mv-error-state,rc=%s,tmp_exists_after=%s,dst_exists_after=%s,dir_writable_after=%s,masks_after=%s,pid=%s]\n' "$_motd_mv_rc" "$(test -f "$PREFIX/alpine/etc/acode_motd.tmp" && echo y || echo n)" "$(test -f "$PREFIX/alpine/etc/acode_motd" && echo y || echo n)" "$(test -w "$PREFIX/alpine/etc" && echo y || echo n)" "$(_collect_masks)" "$$" >&2 # 仅调试用
                     rm -f "$PREFIX/alpine/etc/acode_motd.tmp"
-                    [ "$_motd_mv_rc" -eq 182 ] && { printf '[init-alpine:motd-mv-retry,rc=%s]\n' "$_motd_mv_rc" >&2; continue; } # 仅调试用
+                    if [ "$_motd_mv_rc" -eq 182 ]; then
+                        if handle_182_policy 'init-alpine:motd-mv' "$_motd_mv_rc" ""; then
+                            continue
+                        fi
+                        exit 182
+                    fi
                     printf '[init-alpine:motd-mv-failed,rc=%s]\n' "$_motd_mv_rc" >&2 # 仅调试用
                     break
                 fi
@@ -290,7 +356,12 @@ EOF
                 break
             fi
             rm -f "$PREFIX/alpine/etc/acode_motd.tmp"
-            [ "$_motd_rc" -eq 182 ] && { printf '[init-alpine:motd-retry,rc=%s]\n' "$_motd_rc" >&2; continue; } # 仅调试用
+            if [ "$_motd_rc" -eq 182 ]; then
+                if handle_182_policy 'init-alpine:motd' "$_motd_rc" ""; then
+                    continue
+                fi
+                exit 182
+            fi
             printf '[init-alpine:motd-failed,rc=%s]\n' "$_motd_rc" >&2 # 仅调试用
             break
         done
@@ -304,7 +375,7 @@ EOF
     # cat exits with rc=182 and produces 0 bytes. The > redirect truncates the target
     # BEFORE cat runs, so writing directly to initrc would destroy the working copy.
     # Using a temp file preserves the existing initrc on failure.
-    # Retry on rc=182 (signal 54 killing cat inside proot).
+    # rc=182 behavior is controlled by AXS_EXIT_182_POLICY.
     while true; do
     cat <<'EOF' > "$PREFIX/alpine/initrc.tmp"
 # Source rc files if they exist
@@ -466,11 +537,22 @@ EOF
     if [ "$_initrc_heredoc_rc" -eq 0 ] && [ -s "$PREFIX/alpine/initrc.tmp" ]; then
         # mv is also an external binary intercepted by proot ptrace;
         # signal 54 can kill mv (rc=182) leaving the file un-moved.
+        _initrc_tmp_exists_before_mv="$(test -e "$PREFIX/alpine/initrc.tmp" && echo y || echo n)" # 仅调试用
+        _initrc_dst_exists_before_mv="$(test -e "$PREFIX/alpine/initrc" && echo y || echo n)" # 仅调试用
+        printf '[init-alpine:initrc-mv-enter,tmp_exists=%s,dst_exists=%s,tmp_size=%s,policy=%s,pid=%s]\n' "$_initrc_tmp_exists_before_mv" "$_initrc_dst_exists_before_mv" "$_initrc_tmp_size" "$AXS_EXIT_182_POLICY" "$$" >&2 # 仅调试用
         mv -f "$PREFIX/alpine/initrc.tmp" "$PREFIX/alpine/initrc"
         _initrc_mv_rc=$?
         if [ "$_initrc_mv_rc" -ne 0 ]; then
+            _initrc_tmp_exists_after_mv_fail="$(test -e "$PREFIX/alpine/initrc.tmp" && echo y || echo n)" # 仅调试用
+            _initrc_dst_exists_after_mv_fail="$(test -e "$PREFIX/alpine/initrc" && echo y || echo n)" # 仅调试用
+            printf '[init-alpine:initrc-mv-error,rc=%s,tmp_exists_after=%s,dst_exists_after=%s,policy=%s,pid=%s]\n' "$_initrc_mv_rc" "$_initrc_tmp_exists_after_mv_fail" "$_initrc_dst_exists_after_mv_fail" "$AXS_EXIT_182_POLICY" "$$" >&2 # 仅调试用
             rm -f "$PREFIX/alpine/initrc.tmp"
-            [ "$_initrc_mv_rc" -eq 182 ] && { printf '[init-alpine:initrc-mv-retry,rc=%s]\n' "$_initrc_mv_rc" >&2; continue; } # 仅调试用
+            if [ "$_initrc_mv_rc" -eq 182 ]; then
+                if handle_182_policy 'init-alpine:initrc-mv' "$_initrc_mv_rc" ""; then
+                    continue
+                fi
+                exit 182
+            fi
             printf '[init-alpine:initrc-mv-failed,rc=%s]\n' "$_initrc_mv_rc" >&2 # 仅调试用
             break
         fi
@@ -478,10 +560,12 @@ EOF
         break
     fi
     rm -f "$PREFIX/alpine/initrc.tmp"
-    # Signal 54 (rc=182) killed the heredoc cat — retry
+    # Signal 54 (rc=182) policy is controlled by AXS_EXIT_182_POLICY.
     if [ "$_initrc_heredoc_rc" -eq 182 ]; then
-        printf '[init-alpine:initrc-retry,rc=%s]\n' "$_initrc_heredoc_rc" >&2 # 仅调试用
-        continue
+        if handle_182_policy 'init-alpine:initrc' "$_initrc_heredoc_rc" ""; then
+            continue
+        fi
+        exit 182
     fi
     # Other failure — give up, proceed without initrc
     printf '[init-alpine:initrc-failed,heredoc_rc=%s,tmp_size=%s,old_exists=%s]\n' "$_initrc_heredoc_rc" "$_initrc_tmp_size" "$(test -f "$PREFIX/alpine/initrc" && echo y || echo n)" >&2 # 仅调试用
@@ -528,19 +612,40 @@ wait_for_axs_ready() {
 # Stage axs binary inside the rootfs so it can be found by path within proot.
 # A refreshed Alpine rootfs can legitimately miss /usr/local/bin until the first
 # app-managed startup recreates it.
-# Signal 54 can kill mkdir/cp inside proot (exit 182). Retry in-place since
-# the signal is transient and the next attempt almost always succeeds.
+# Signal 54 can kill mkdir/cp inside proot (exit 182).
+# rc=182 behavior is controlled by AXS_EXIT_182_POLICY.
+# Log signal masks here (before any external binary) so we capture state even
+# when mkdir itself is the first victim of signal 54.
+printf '[init-alpine:pre-mkdir-sigmasks,pid=%s,masks=%s]\n' "$$" "$(_collect_masks)" >&2 # 仅调试用
 while true; do
+    printf '[init-alpine:mkdir-enter,usr_local_exists=%s,usr_local_bin_exists=%s,policy=%s,pid=%s]\n' "$(test -d /usr/local && echo y || echo n)" "$(test -d /usr/local/bin && echo y || echo n)" "$AXS_EXIT_182_POLICY" "$$" >&2 # 仅调试用
+    printf '[init-alpine:mkdir-pre-state,mkdir_path=%s,mkdir_exec=%s,usr_local_mode=%s,usr_local_bin_mode=%s,masks=%s,pid=%s]\n' "$(command -v mkdir 2>/dev/null || echo '<not-found>')" "$(test -x "$(command -v mkdir 2>/dev/null)" 2>/dev/null && echo y || echo n)" "$(ls -ld /usr/local 2>/dev/null | awk '{print $1":"$3":"$4}' || echo '<na>')" "$(ls -ld /usr/local/bin 2>/dev/null | awk '{print $1":"$3":"$4}' || echo '<na>')" "$(_collect_masks)" "$$" >&2 # 仅调试用
     mkdir -p /usr/local/bin 2>/dev/null && break
     _rc=$?
-    [ "$_rc" -eq 182 ] && { printf '[init-alpine:mkdir-retry,rc=%s]\n' "$_rc" >&2; continue; } # 仅调试用
+    printf '[init-alpine:mkdir-error,rc=%s,usr_local_bin_exists_after=%s,policy=%s,pid=%s]\n' "$_rc" "$(test -d /usr/local/bin && echo y || echo n)" "$AXS_EXIT_182_POLICY" "$$" >&2 # 仅调试用
+    printf '[init-alpine:mkdir-error-state,rc=%s,mkdir_path=%s,usr_local_mode_after=%s,usr_local_bin_mode_after=%s,masks_after=%s,pid=%s]\n' "$_rc" "$(command -v mkdir 2>/dev/null || echo '<not-found>')" "$(ls -ld /usr/local 2>/dev/null | awk '{print $1":"$3":"$4}' || echo '<na>')" "$(ls -ld /usr/local/bin 2>/dev/null | awk '{print $1":"$3":"$4}' || echo '<na>')" "$(_collect_masks)" "$$" >&2 # 仅调试用
+    if [ "$_rc" -eq 182 ]; then
+        if handle_182_policy 'init-alpine:mkdir' "$_rc" ""; then
+            continue
+        fi
+        exit 182
+    fi
     printf '[init-alpine:mkdir-failed,rc=%s]\n' "$_rc" >&2 # 仅调试用
     exit 1
 done
 while true; do
+    printf '[init-alpine:cp-axs-enter,src=%s,src_exists=%s,src_exec=%s,dst_dir_exists=%s,dst_dir_writable=%s,policy=%s,pid=%s]\n' "$PREFIX/axs" "$(test -f "$PREFIX/axs" && echo y || echo n)" "$(test -x "$PREFIX/axs" && echo y || echo n)" "$(test -d /usr/local/bin && echo y || echo n)" "$(test -w /usr/local/bin && echo y || echo n)" "$AXS_EXIT_182_POLICY" "$$" >&2 # 仅调试用
+    printf '[init-alpine:cp-axs-pre,src_size=%s,src_mtime=%s,usr_local_writable=%s,usr_local_bin_writable=%s,masks=%s,pid=%s]\n' "$(wc -c < "$PREFIX/axs" 2>/dev/null || echo -1)" "$(ls -ln "$PREFIX/axs" 2>/dev/null | awk '{print $6" "$7" "$8}' || echo '<na>')" "$(test -w /usr/local && echo y || echo n)" "$(test -w /usr/local/bin && echo y || echo n)" "$(_collect_masks)" "$$" >&2 # 仅调试用
     cp -f "$PREFIX/axs" /usr/local/bin/axs 2>/dev/null && break
     _rc=$?
-    [ "$_rc" -eq 182 ] && { printf '[init-alpine:cp-axs-retry,rc=%s]\n' "$_rc" >&2; continue; } # 仅调试用
+    printf '[init-alpine:cp-axs-error,rc=%s,dst_exists_after=%s,dst_exec_after=%s,policy=%s,pid=%s]\n' "$_rc" "$(test -f /usr/local/bin/axs && echo y || echo n)" "$(test -x /usr/local/bin/axs && echo y || echo n)" "$AXS_EXIT_182_POLICY" "$$" >&2 # 仅调试用
+    printf '[init-alpine:cp-axs-error-state,rc=%s,src_exists_after=%s,src_exec_after=%s,usr_local_bin_writable_after=%s,masks_after=%s,pid=%s]\n' "$_rc" "$(test -f "$PREFIX/axs" && echo y || echo n)" "$(test -x "$PREFIX/axs" && echo y || echo n)" "$(test -w /usr/local/bin && echo y || echo n)" "$(_collect_masks)" "$$" >&2 # 仅调试用
+    if [ "$_rc" -eq 182 ]; then
+        if handle_182_policy 'init-alpine:cp-axs' "$_rc" ""; then
+            continue
+        fi
+        exit 182
+    fi
     printf '[init-alpine:cp-axs-failed,rc=%s,src=%s,exists=%s]\n' "$_rc" "$PREFIX/axs" "$(test -f "$PREFIX/axs" && echo y || echo n)" >&2 # 仅调试用
     exit 1
 done
@@ -549,11 +654,16 @@ done
 # chmod syscall fails, but treating that as fatal is wrong because axs was staged
 # successfully and can still be launched. Only abort when the final file is not
 # executable; otherwise continue.
-# Signal 54 (exit 182) on chmod is transient — retry in-place.
+# Signal 54 (exit 182) behavior is controlled by AXS_EXIT_182_POLICY.
 while true; do
     chmod 755 /usr/local/bin/axs 2>/dev/null && break
     _rc=$?
-    [ "$_rc" -eq 182 ] && { printf '[init-alpine:chmod-retry,rc=%s]\n' "$_rc" >&2; continue; } # 仅调试用
+    if [ "$_rc" -eq 182 ]; then
+        if handle_182_policy 'init-alpine:chmod' "$_rc" ""; then
+            continue
+        fi
+        exit 182
+    fi
     # Non-182 chmod failure: tolerate if the file is already executable
     if [ -x /usr/local/bin/axs ]; then
         break
@@ -563,8 +673,8 @@ while true; do
 done
 
 # Signal 54 (SIGRTMIN+20) can kill bash inside proot during startup, causing
-# AXS to exit 182 (128+54) before emitting __ACODE_AXS_READY__. The signal
-# is transient; a simple retry always succeeds within a few attempts.
+# AXS to exit 182 (128+54) before emitting __ACODE_AXS_READY__.
+# rc=182 behavior is controlled by AXS_EXIT_182_POLICY.
 _axs_retry=0
 _axs_hung_warned=0
 _ready_pipe="/tmp/.axs-ready-$$"
@@ -572,16 +682,27 @@ printf '[init-alpine:axs-loop-enter,axs_path=/usr/local/bin/axs,exists=%s,exec=%
 while true; do
     _axs_retry=$((_axs_retry + 1))
     printf '[init-alpine:axs-attempt,retry=%s]\n' "$_axs_retry" >&2 # 仅调试用
+    printf '[init-alpine:mkfifo-pre,pipe=%s,pipe_exists=%s,tmp_exists=%s,tmp_writable=%s,policy=%s,pid=%s,retry=%s]\n' "$_ready_pipe" "$(test -e "$_ready_pipe" && echo y || echo n)" "$(test -d /tmp && echo y || echo n)" "$(test -w /tmp && echo y || echo n)" "$AXS_EXIT_182_POLICY" "$$" "$_axs_retry" >&2 # 仅调试用
+    printf '[init-alpine:mkfifo-pre-state,mkfifo_path=%s,mkfifo_exec=%s,tmp_mode=%s,tmp_owner=%s,masks=%s,pid=%s,retry=%s]\n' "$(command -v mkfifo 2>/dev/null || echo '<not-found>')" "$(test -x "$(command -v mkfifo 2>/dev/null)" 2>/dev/null && echo y || echo n)" "$(ls -ld /tmp 2>/dev/null | awk '{print $1}' || echo '<na>')" "$(ls -ld /tmp 2>/dev/null | awk '{print $3":"$4}' || echo '<na>')" "$(_collect_masks)" "$$" "$_axs_retry" >&2 # 仅调试用
 
     # Create FIFO for this attempt (remove stale one from previous retry)
     # mkfifo is also an external binary intercepted by proot ptrace;
     # signal 54 can kill it (rc=182) leaving no FIFO, which breaks the
-    # ready-notification mechanism entirely. Retry in-place.
+    # ready-notification mechanism entirely.
     rm -f "$_ready_pipe"
+    printf '[init-alpine:mkfifo-post-rm,pipe_exists=%s,pid=%s,retry=%s]\n' "$(test -e "$_ready_pipe" && echo y || echo n)" "$$" "$_axs_retry" >&2 # 仅调试用
     while true; do
+        printf '[init-alpine:mkfifo-call,pipe=%s,pid=%s,retry=%s]\n' "$_ready_pipe" "$$" "$_axs_retry" >&2 # 仅调试用
         mkfifo "$_ready_pipe" && break
         _mkfifo_rc=$?
-        [ "$_mkfifo_rc" -eq 182 ] && { printf '[init-alpine:mkfifo-retry,rc=%s]\n' "$_mkfifo_rc" >&2; continue; } # 仅调试用
+        printf '[init-alpine:mkfifo-error,rc=%s,pipe_exists_after=%s,tmp_writable=%s,policy=%s,pid=%s,retry=%s]\n' "$_mkfifo_rc" "$(test -e "$_ready_pipe" && echo y || echo n)" "$(test -w /tmp && echo y || echo n)" "$AXS_EXIT_182_POLICY" "$$" "$_axs_retry" >&2 # 仅调试用
+        printf '[init-alpine:mkfifo-error-state,rc=%s,mkfifo_path=%s,tmp_mode=%s,tmp_owner=%s,masks=%s,pid=%s,retry=%s]\n' "$_mkfifo_rc" "$(command -v mkfifo 2>/dev/null || echo '<not-found>')" "$(ls -ld /tmp 2>/dev/null | awk '{print $1}' || echo '<na>')" "$(ls -ld /tmp 2>/dev/null | awk '{print $3":"$4}' || echo '<na>')" "$(_collect_masks)" "$$" "$_axs_retry" >&2 # 仅调试用
+        if [ "$_mkfifo_rc" -eq 182 ]; then
+            if handle_182_policy 'init-alpine:mkfifo' "$_mkfifo_rc" ""; then
+                continue
+            fi
+            exit 182
+        fi
         printf '[init-alpine:mkfifo-failed,rc=%s]\n' "$_mkfifo_rc" >&2 # 仅调试用
         break
     done
@@ -601,7 +722,7 @@ while true; do
     fi
 
     # AXS failed to become ready within 15s.
-    # If AXS died (signal 54 / exit 182), retry immediately.
+    # If AXS died (signal 54 / exit 182), follow policy.
     # If AXS is still alive but never wrote READY to the FIFO, it is hung.
     # In the hung case, do NOT kill AXS — instead warn the user and keep
     # waiting indefinitely. The user can uninstall/reinstall the terminal
@@ -614,8 +735,10 @@ while true; do
         printf '[init-alpine:axs-died,rc=%s,retry=%s]\n' "$_axs_wait_rc" "$_axs_retry" >&2 # 仅调试用
 
         if [ "$_axs_wait_rc" -eq 182 ]; then
-            # Signal 54 — transient, retry
-            continue
+            if handle_182_policy 'init-alpine:axs-died' "$_axs_wait_rc" "$_axs_retry"; then
+                continue
+            fi
+            exit 182
         fi
         # Other fatal error — propagate
         break
@@ -633,9 +756,12 @@ while true; do
     _axs_wait_rc=$?
     printf '[init-alpine:axs-hung-exited,rc=%s,retry=%s]\n' "$_axs_wait_rc" "$_axs_retry" >&2 # 仅调试用
     # AXS eventually exited while user was waiting. If signal 54 (exit 182),
-    # retry silently — the next attempt will likely succeed immediately.
+    # follow policy.
     if [ "$_axs_wait_rc" -eq 182 ]; then
-        continue
+        if handle_182_policy 'init-alpine:axs-hung-exited' "$_axs_wait_rc" "$_axs_retry"; then
+            continue
+        fi
+        exit 182
     fi
     break
 done

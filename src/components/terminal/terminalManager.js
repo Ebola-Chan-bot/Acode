@@ -1769,6 +1769,9 @@ class TerminalManager {
 			// race condition, not an application error. Retry by creating a new terminal
 			// session on the same AXS server — the server is still healthy, only the
 			// individual bash process was killed.
+			// TEMPORARILY DISABLED: debugging exit 182 root cause — need the error
+			// to propagate instead of being silently retried.
+			/*
 			if (exitData.exit_code === 182) {
 				console.warn(`Terminal ${terminalId} bash killed by signal 54 (exit 182), retrying session...`);
 				try {
@@ -1785,6 +1788,7 @@ class TerminalManager {
 					// Fall through to normal exit handling
 				}
 			}
+			*/
 
 			// Format exit message based on exit code and signal
 			let message;

@@ -6,6 +6,29 @@ mkdir -p "$PREFIX/public"
 
 export PROOT_TMP_DIR=$PREFIX/tmp
 
+# 182 policy switch: set to retry to auto-retry on SIGRT54, or failfast to
+# stop immediately for debugging.
+AXS_EXIT_182_POLICY="${AXS_EXIT_182_POLICY:-failfast}"
+
+should_retry_on_182() {
+    local _rc="$1"
+    [ "$_rc" -eq 182 ] || return 1
+    [ "$AXS_EXIT_182_POLICY" = "retry" ] || return 1
+    return 0
+}
+
+# Collect signal masks using only shell builtins (read + case + printf).
+# grep/tr are external commands that may be unreliable under proot ptrace.
+_collect_masks() { # 仅调试用
+    local _m="" _l="" # 仅调试用
+    while IFS= read -r _l; do # 仅调试用
+        case "$_l" in # 仅调试用
+            Sig*) _m="${_m}${_l}|" ;; # 仅调试用
+        esac # 仅调试用
+    done < /proc/self/status 2>/dev/null # 仅调试用
+    printf '%s' "$_m" # 仅调试用
+} # 仅调试用
+
 # Disable seccomp filter in proot to avoid SIGSEGV/SIGBUS on kernels
 # with strict seccomp policies.
 # Impact: may slightly reduce syscall-level sandboxing on permissive kernels.
@@ -127,16 +150,22 @@ while true; do
     rm -rf "$PROOT_TMP_DIR"/*
 
     printf '[sandbox:proot-launch,retry=%s,args=%s]\n' "$_proot_retry" "$*" >&2 # 仅调试用
+    printf '[sandbox:proot-pre,retry=%s,proot_exists=%s,proot_exec=%s,sh_exists=%s,sh_exec=%s,init_exists=%s,init_exec=%s,tmp_writable=%s,masks=%s]\n' "$_proot_retry" "$(test -f "$PROOT" && echo y || echo n)" "$(test -x "$PROOT" && echo y || echo n)" "$(test -f /bin/sh && echo y || echo n)" "$(test -x /bin/sh && echo y || echo n)" "$(test -f "$PREFIX/init-alpine.sh" && echo y || echo n)" "$(test -x "$PREFIX/init-alpine.sh" && echo y || echo n)" "$(test -w "$PROOT_TMP_DIR" && echo y || echo n)" "$(_collect_masks)" >&2 # 仅调试用
     $PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@" &
     proot_pid=$!
     wait "$proot_pid"
     proot_rc=$?
     printf '[sandbox:proot-exited,rc=%s,retry=%s]\n' "$proot_rc" "$_proot_retry" >&2 # 仅调试用
+    printf '[sandbox:proot-post,rc=%s,retry=%s,inferred_signal=%s,init_exists_after=%s,tmp_writable_after=%s,masks_after=%s]\n' "$proot_rc" "$_proot_retry" "$( [ "$proot_rc" -ge 128 ] && echo $((proot_rc - 128)) || echo '<none>' )" "$(test -f "$PREFIX/init-alpine.sh" && echo y || echo n)" "$(test -w "$PROOT_TMP_DIR" && echo y || echo n)" "$(_collect_masks)" >&2 # 仅调试用
 
-    # Exit code 182 = signal 54 killed proot or its tracee; retry immediately.
-    # Any other exit code (including 0) breaks out of the retry loop.
+    # Exit code 182 policy is controlled by AXS_EXIT_182_POLICY.
     if [ "$proot_rc" -eq 182 ]; then
-        continue
+        if should_retry_on_182 "$proot_rc"; then
+            printf '[sandbox:proot-retry,rc=%s,retry=%s]\n' "$proot_rc" "$_proot_retry" >&2 # 仅调试用
+            continue
+        fi
+        printf '[sandbox:proot-failfast-182,rc=%s,retry=%s]\n' "$proot_rc" "$_proot_retry" >&2 # 仅调试用
+        break
     fi
 
     break
