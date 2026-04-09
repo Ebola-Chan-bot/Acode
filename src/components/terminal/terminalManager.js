@@ -1764,31 +1764,32 @@ class TerminalManager {
 		};
 
 		terminalComponent.onProcessExit = async (exitData) => {
-			// Exit code 182 = signal 54 (SIGRTMIN+20) killed bash inside proot during
-			// the first few milliseconds of startup. This is a transient proot ptrace
-			// race condition, not an application error. Retry by creating a new terminal
-			// session on the same AXS server — the server is still healthy, only the
-			// individual bash process was killed.
-			// TEMPORARILY DISABLED: debugging exit 182 root cause — need the error
-			// to propagate instead of being silently retried.
-			/*
+			// Exit 182 = proot loader FATAL (MAP_FIXED failed on an occupied address).
+			// The root cause has been fixed in proot (fixup_load_addresses relocates PIE
+			// binaries away from occupied regions).  If 182 still appears, it is
+			// unexpected and must NOT be silently retried or ignored — stop immediately
+			// and surface full diagnostics so the remaining trigger can be identified.
 			if (exitData.exit_code === 182) {
-				console.warn(`Terminal ${terminalId} bash killed by signal 54 (exit 182), retrying session...`);
-				try {
-					if (terminalComponent.websocket) {
-						terminalComponent.websocket.close();
-					}
-					terminalComponent.isConnected = false;
-					terminalComponent.pid = null;
-					terminalComponent.clear();
-					await terminalComponent.connectToSession();
-					return;
-				} catch (retryError) {
-					console.error(`Terminal ${terminalId} signal 54 retry failed:`, retryError);
-					// Fall through to normal exit handling
+				const diagMsg = `[FATAL] Terminal ${terminalId} exit 182 (proot loader address conflict) — this should no longer happen after the fixup_load_addresses fix. Full exit data: ${JSON.stringify(exitData)}`;
+				console.error(diagMsg);
+
+				// Kill the AXS server-side session to avoid orphaned processes
+				if (terminalComponent.websocket) {
+					terminalComponent.websocket.close();
 				}
+				terminalComponent.isConnected = false;
+
+				// Surface the raw diagnostics in the terminal so the user can report them
+				terminalComponent.write(
+					`\r\n\x1b[1;31m${diagMsg}\x1b[0m\r\n`,
+				);
+
+				this.closeTerminal(terminalId);
+				terminalFile._skipTerminalCloseConfirm = true;
+				terminalFile.remove(true);
+				toast(`Exit 182: unexpected proot loader failure — see console log`);
+				return;
 			}
-			*/
 
 			// Format exit message based on exit code and signal
 			let message;
