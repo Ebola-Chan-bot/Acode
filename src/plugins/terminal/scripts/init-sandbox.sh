@@ -17,18 +17,6 @@ should_retry_on_182() {
     return 0
 }
 
-# Collect signal masks using only shell builtins (read + case + printf).
-# grep/tr are external commands that may be unreliable under proot ptrace.
-_collect_masks() { # 仅调试用
-    local _m="" _l="" # 仅调试用
-    while IFS= read -r _l; do # 仅调试用
-        case "$_l" in # 仅调试用
-            Sig*) _m="${_m}${_l}|" ;; # 仅调试用
-        esac # 仅调试用
-    done < /proc/self/status 2>/dev/null # 仅调试用
-    printf '%s' "$_m" # 仅调试用
-} # 仅调试用
-
 # Disable seccomp filter in proot to avoid SIGSEGV/SIGBUS on kernels
 # with strict seccomp policies.
 # Impact: may slightly reduce syscall-level sandboxing on permissive kernels.
@@ -114,10 +102,6 @@ ARGS="$ARGS --link2symlink"
 ARGS="$ARGS -L"
 
 # Kill lingering proot from previous session before starting a new one.
-# NOTE: Log analysis of 5 sessions showed sandbox:ps=<none> every time — no
-# concurrent proot was ever alive. Signal 54 still killed proot as sole instance.
-# Concurrent-proot theory was DISPROVEN. This cleanup is kept as defensive
-# measure. Root cause of signal 54 is still under investigation.
 # Using PID file for precision (not pkill) to avoid killing unrelated processes.
 _old_pid=$(cat "$PREFIX/pid" 2>/dev/null)
 if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
@@ -137,11 +121,10 @@ if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
 fi
 # Clear stale ptrace tracking files
 rm -rf "$PROOT_TMP_DIR"/*
-printf '[sandbox:enter,PREFIX=%s,PROOT=%s]\n' "$PREFIX" "$PROOT" >&2 # 仅调试用
 
-# Signal 54 (SIGRTMIN+20) kills proot or its tracee unpredictably during startup,
-# producing exit code 182 (128+54). The signal is transient and a simple retry
-# always succeeds within a few attempts.
+# Exit code 182 from proot's loader means mmap(MAP_FIXED) failed; this was
+# caused by EXEC_PIC_ADDRESS falling in Huawei's vdso protection zone and is
+# now fixed in the loader.  The retry loop is kept as a safety net.
 _proot_retry=0
 while true; do
     _proot_retry=$((_proot_retry + 1))
@@ -149,22 +132,16 @@ while true; do
     # Clear stale ptrace tracking files from previous failed attempt
     rm -rf "$PROOT_TMP_DIR"/*
 
-    printf '[sandbox:proot-launch,retry=%s,args=%s]\n' "$_proot_retry" "$*" >&2 # 仅调试用
-    printf '[sandbox:proot-pre,retry=%s,proot_exists=%s,proot_exec=%s,sh_exists=%s,sh_exec=%s,init_exists=%s,init_exec=%s,tmp_writable=%s,masks=%s]\n' "$_proot_retry" "$(test -f "$PROOT" && echo y || echo n)" "$(test -x "$PROOT" && echo y || echo n)" "$(test -f /bin/sh && echo y || echo n)" "$(test -x /bin/sh && echo y || echo n)" "$(test -f "$PREFIX/init-alpine.sh" && echo y || echo n)" "$(test -x "$PREFIX/init-alpine.sh" && echo y || echo n)" "$(test -w "$PROOT_TMP_DIR" && echo y || echo n)" "$(_collect_masks)" >&2 # 仅调试用
     $PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@" &
     proot_pid=$!
     wait "$proot_pid"
     proot_rc=$?
-    printf '[sandbox:proot-exited,rc=%s,retry=%s]\n' "$proot_rc" "$_proot_retry" >&2 # 仅调试用
-    printf '[sandbox:proot-post,rc=%s,retry=%s,inferred_signal=%s,init_exists_after=%s,tmp_writable_after=%s,masks_after=%s]\n' "$proot_rc" "$_proot_retry" "$( [ "$proot_rc" -ge 128 ] && echo $((proot_rc - 128)) || echo '<none>' )" "$(test -f "$PREFIX/init-alpine.sh" && echo y || echo n)" "$(test -w "$PROOT_TMP_DIR" && echo y || echo n)" "$(_collect_masks)" >&2 # 仅调试用
 
     # Exit code 182 policy is controlled by AXS_EXIT_182_POLICY.
     if [ "$proot_rc" -eq 182 ]; then
         if should_retry_on_182 "$proot_rc"; then
-            printf '[sandbox:proot-retry,rc=%s,retry=%s]\n' "$proot_rc" "$_proot_retry" >&2 # 仅调试用
             continue
         fi
-        printf '[sandbox:proot-failfast-182,rc=%s,retry=%s]\n' "$proot_rc" "$_proot_retry" >&2 # 仅调试用
         break
     fi
 

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Terminal Manager
  * Handles terminal session creation and management
  */
@@ -17,21 +17,7 @@ import appSettings from "lib/settings";
 import helpers from "utils/helpers";
 
 const TERMINAL_SESSION_STORAGE_KEY = "acodeTerminalSessions";
-const pushTerminalRestoreDebugLog = (event, payload = {}, level = "info") => { // 仅调试用
-	if (typeof window === "undefined" || typeof window.__HDC_DEBUG_PUSH !== "function") return; // 仅调试用
-	window.__HDC_DEBUG_PUSH({ // 仅调试用
-		type: "console", // 仅调试用
-		level, // 仅调试用
-		args: ["[terminal-restore]", event, payload], // 仅调试用
-		timestamp: Date.now(), // 仅调试用
-	}); // 仅调试用
-}; // 仅调试用
 
-const consumeTerminalCloseTrigger = (terminalFile) => { // 仅调试用
-	const trigger = terminalFile?._terminalCloseTrigger || null; // 仅调试用
-	if (terminalFile) terminalFile._terminalCloseTrigger = null; // 仅调试用
-	return trigger; // 仅调试用
-}; // 仅调试用
 
 class TerminalManager {
 	constructor() {
@@ -40,7 +26,6 @@ class TerminalManager {
 		this.sharedEnvironmentOperation = null;
 		this.reservedTerminalNumbers = new Set();
 		this.nextSharedEnvironmentOperationId = 1;
-		this.nextInitializationAttemptId = 1; // 仅调试用
 		this.lastAlertedSharedEnvironmentInterruptionId = null;
 		this.lastAlertedSharedEnvironmentFailureId = null;
 		this.lastHandledSharedEnvironmentFailureId = null;
@@ -161,17 +146,6 @@ class TerminalManager {
 		if (!failureAlreadyHandled) {
 			this.lastHandledSharedEnvironmentFailureId =
 				operationId ?? this.lastHandledSharedEnvironmentFailureId;
-			pushTerminalRestoreDebugLog( // 仅调试用
-				"shared-environment-failure", // 仅调试用
-				{ // 仅调试用
-					terminalId, // 仅调试用
-					terminalName, // 仅调试用
-					operationId: operationId ?? null, // 仅调试用
-					operationType: error?.sharedEnvironmentOperationType || null, // 仅调试用
-					message: error?.message || null, // 仅调试用
-				}, // 仅调试用
-				"error", // 仅调试用
-			); // 仅调试用
 
 			// A download/configure failure belongs to the shared terminal environment,
 			// not to a single tab. Closing every terminal immediately prevents the UI
@@ -208,7 +182,6 @@ class TerminalManager {
 		type,
 		ownerName,
 		ownerTerminalId = null,
-		ownerInitializationAttemptId = null, // 仅调试用
 		progressTerminal = null,
 		run,
 	}) {
@@ -220,26 +193,6 @@ class TerminalManager {
 			const activeTitle = this.getSharedEnvironmentOperationTitle(
 				activeOperation.type,
 			);
-			pushTerminalRestoreDebugLog( // 仅调试用
-				"shared-environment-join", // 仅调试用
-				{ // 仅调试用
-					requestedType: type, // 仅调试用
-					requestedOwnerName: ownerName || null, // 仅调试用
-					requestedOwnerTerminalId: ownerTerminalId || null, // 仅调试用
-					requestedOwnerInitializationAttemptId: ownerInitializationAttemptId, // 仅调试用
-					activeOperationId: activeOperation.id, // 仅调试用
-					activeOperationType: activeOperation.type, // 仅调试用
-					activeOperationOwnerName: activeOperation.ownerName || null, // 仅调试用
-					activeOperationOwnerTerminalId: activeOperation.ownerTerminalId || null, // 仅调试用
-					activeOperationOwnerInitializationAttemptId:
-						activeOperation.ownerInitializationAttemptId ?? null, // 仅调试用
-					progressTerminalId: progressTerminal?.terminalId || null, // 仅调试用
-					progressDisplayName: progressComponent?.terminalDisplayName || null, // 仅调试用
-					progressInitializationAttemptId:
-						progressComponent?._debugInitializationAttemptId ?? null, // 仅调试用
-					activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-				}, // 仅调试用
-			); // 仅调试用
 			if (progressComponent) {
 				this.writeSharedEnvironmentNotice(
 					progressComponent,
@@ -250,20 +203,6 @@ class TerminalManager {
 			try {
 				await activeOperation.promise;
 				if (progressComponent && !progressComponent.isConnected) {
-					pushTerminalRestoreDebugLog( // 仅调试用
-						"shared-environment-waiter-clear-buffer", // 仅调试用
-						{ // 仅调试用
-							requestedType: type, // 仅调试用
-							requestedOwnerTerminalId: ownerTerminalId || null, // 仅调试用
-							requestedOwnerInitializationAttemptId: ownerInitializationAttemptId, // 仅调试用
-							activeOperationId: activeOperation.id, // 仅调试用
-							progressDisplayName: progressComponent.terminalDisplayName || null, // 仅调试用
-							isConnected: !!progressComponent.isConnected, // 仅调试用
-							progressInitializationAttemptId:
-								progressComponent._debugInitializationAttemptId ?? null, // 仅调试用
-							activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-						}, // 仅调试用
-					); // 仅调试用
 					// Waiter terminals are still empty at this point: they only contain the shared
 					// "Waiting..." / "Rechecking..." notices. Keeping those lines makes the tab look
 					// stuck even after the local re-check creates and connects a fresh PTY, because
@@ -276,20 +215,6 @@ class TerminalManager {
 				// Reusing the owner's resolved promise skips the waiter's local re-checks,
 				// which can leave that terminal stuck showing the wait message even though
 				// the shared install/startup already completed successfully.
-				pushTerminalRestoreDebugLog( // 仅调试用
-					"shared-environment-resume", // 仅调试用
-					{ // 仅调试用
-						requestedType: type, // 仅调试用
-						requestedOwnerName: ownerName || null, // 仅调试用
-						requestedOwnerTerminalId: ownerTerminalId || null, // 仅调试用
-						requestedOwnerInitializationAttemptId: ownerInitializationAttemptId, // 仅调试用
-						activeOperationId: activeOperation.id, // 仅调试用
-						progressDisplayName: progressComponent?.terminalDisplayName || null, // 仅调试用
-						progressInitializationAttemptId:
-							progressComponent?._debugInitializationAttemptId ?? null, // 仅调试用
-						activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-					}, // 仅调试用
-				); // 仅调试用
 				return run();
 			} catch (error) {
 				const failureMessage = error?.sharedEnvironmentInterrupted
@@ -311,7 +236,6 @@ class TerminalManager {
 			type,
 			ownerName: ownerName || "Terminal maintenance",
 			ownerTerminalId,
-			ownerInitializationAttemptId, // 仅调试用
 			interrupted: false,
 			settled: false,
 			interrupt: null,
@@ -348,20 +272,6 @@ class TerminalManager {
 				return;
 			}
 
-			pushTerminalRestoreDebugLog( // 仅调试用
-				"shared-environment-interrupt", // 仅调试用
-				{ // 仅调试用
-					operationId: operation.id, // 仅调试用
-					operationType: operation.type, // 仅调试用
-					ownerName: operation.ownerName || null, // 仅调试用
-					ownerTerminalId: operation.ownerTerminalId || null, // 仅调试用
-					ownerInitializationAttemptId:
-						operation.ownerInitializationAttemptId ?? null, // 仅调试用
-					errorMessage: error?.message || null, // 仅调试用
-					interrupted: true, // 仅调试用
-				}, // 仅调试用
-				"warn", // 仅调试用
-			); // 仅调试用
 			operation.interrupted = true;
 			rejectInterruptedOperation(error);
 		};
@@ -376,37 +286,9 @@ class TerminalManager {
 				if (this.sharedEnvironmentOperation === operation) {
 					this.sharedEnvironmentOperation = null;
 				}
-				pushTerminalRestoreDebugLog( // 仅调试用
-					"shared-environment-settled", // 仅调试用
-					{ // 仅调试用
-						operationId: operation.id, // 仅调试用
-						operationType: operation.type, // 仅调试用
-						ownerName: operation.ownerName || null, // 仅调试用
-						ownerTerminalId: operation.ownerTerminalId || null, // 仅调试用
-						ownerInitializationAttemptId:
-							operation.ownerInitializationAttemptId ?? null, // 仅调试用
-						interrupted: !!operation.interrupted, // 仅调试用
-						settled: !!operation.settled, // 仅调试用
-					}, // 仅调试用
-				); // 仅调试用
 			}
 		});
 
-		pushTerminalRestoreDebugLog( // 仅调试用
-			"shared-environment-start", // 仅调试用
-			{ // 仅调试用
-				operationId: operation.id, // 仅调试用
-				operationType: operation.type, // 仅调试用
-				ownerName: operation.ownerName || null, // 仅调试用
-				ownerTerminalId: operation.ownerTerminalId || null, // 仅调试用
-				ownerInitializationAttemptId: operation.ownerInitializationAttemptId ?? null, // 仅调试用
-				progressTerminalId: progressTerminal?.terminalId || null, // 仅调试用
-				progressDisplayName: progressComponent?.terminalDisplayName || null, // 仅调试用
-				progressInitializationAttemptId:
-					progressComponent?._debugInitializationAttemptId ?? null, // 仅调试用
-				activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-			}, // 仅调试用
-		); // 仅调试用
 		this.sharedEnvironmentOperation = operation;
 		return operation.promise;
 	}
@@ -722,8 +604,6 @@ class TerminalManager {
 						type,
 						ownerName: terminalName,
 						ownerTerminalId: terminalId,
-						ownerInitializationAttemptId:
-							terminalComponent._debugInitializationAttemptId ?? null, // 仅调试用
 						progressTerminal: { component: terminalComponent },
 						run,
 					}),
@@ -763,15 +643,6 @@ class TerminalManager {
 				});
 			};
 			terminalFile.onclose = () => {
-				pushTerminalRestoreDebugLog( // 仅调试用
-					"tab-onclose", // 仅调试用
-					{ // 仅调试用
-						terminalId, // 仅调试用
-						terminalName, // 仅调试用
-						trigger: consumeTerminalCloseTrigger(terminalFile), // 仅调试用
-					}, // 仅调试用
-					"warn", // 仅调试用
-				); // 仅调试用
 				this.interruptSharedEnvironmentOperationForTerminal(
 					terminalId,
 					terminalName,
@@ -781,52 +652,14 @@ class TerminalManager {
 					terminalComponent.dispose();
 				} catch {}
 			};
-			terminalFile._skipTerminalCloseConfirm = false; // 仅调试用
-			const originalRemove = terminalFile.remove.bind(terminalFile); // 仅调试用
-			terminalFile.remove = async (force = false) => { // 仅调试用
-				terminalFile._terminalCloseTrigger = { // 仅调试用
-					type: "remove", // 仅调试用
-					force, // 仅调试用
-					skipConfirm: !!terminalFile._skipTerminalCloseConfirm, // 仅调试用
-					activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-				}; // 仅调试用
-				pushTerminalRestoreDebugLog( // 仅调试用
-					"tab-remove-request", // 仅调试用
-					{ // 仅调试用
-						terminalId, // 仅调试用
-						terminalName, // 仅调试用
-						trigger: terminalFile._terminalCloseTrigger, // 仅调试用
-					}, // 仅调试用
-					"warn", // 仅调试用
-				); // 仅调试用
-				terminalFile._skipTerminalCloseConfirm = false; // 仅调试用
-				return originalRemove(force); // 仅调试用
-			}; // 仅调试用
 
 			// Wait for tab creation and setup
 			return await new Promise((resolve, reject) => {
 				setTimeout(async () => {
 					try {
 						const initializeTerminalSession = async () => {
-							const initializationAttemptId =
-								this.nextInitializationAttemptId++; // 仅调试用
-							terminalComponent._debugInitializationAttemptId =
-								initializationAttemptId; // 仅调试用
 							const activeFile = window.editorManager?.activeFile;
 							const isActiveTerminalTab = activeFile?.id === terminalFile.id;
-							pushTerminalRestoreDebugLog( // 仅调试用
-								"initialize-entry", // 仅调试用
-								{ // 仅调试用
-									initializationAttemptId, // 仅调试用
-									terminalId, // 仅调试用
-									terminalName, // 仅调试用
-									pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
-									activeFileId: activeFile?.id || null, // 仅调试用
-									terminalFileId: terminalFile.id, // 仅调试用
-									isActiveTerminalTab, // 仅调试用
-									hasDeferredPromise: !!terminalComponent._deferredInitializationPromise, // 仅调试用
-								}, // 仅调试用
-							); // 仅调试用
 
 							// Hidden restored terminals must never mount or reconnect until their tab is
 							// actually active. Runtime logs proved that startup could still initialize
@@ -841,17 +674,6 @@ class TerminalManager {
 								!terminalComponent._deferredInitializationPromise &&
 								!isActiveTerminalTab
 							) {
-								pushTerminalRestoreDebugLog( // 仅调试用
-									"defer-hidden-reconnect", // 仅调试用
-									{ // 仅调试用
-										initializationAttemptId, // 仅调试用
-										terminalId, // 仅调试用
-										terminalName, // 仅调试用
-										pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
-										activeFileId: activeFile?.id || null, // 仅调试用
-										terminalFileId: terminalFile.id, // 仅调试用
-									}, // 仅调试用
-								); // 仅调试用
 								return null;
 							}
 
@@ -861,17 +683,6 @@ class TerminalManager {
 							// initial "root@localhost" prompt is hard-wrapped before the tab is
 							// ever shown. Hidden restored sessions must wait until first focus.
 							if (terminalComponent._deferredInitializationPromise) {
-								pushTerminalRestoreDebugLog( // 仅调试用
-									"reuse-deferred-promise", // 仅调试用
-									{ // 仅调试用
-										initializationAttemptId, // 仅调试用
-										existingInitializationAttemptId:
-											terminalComponent._debugInitializationAttemptId ?? null, // 仅调试用
-										terminalId, // 仅调试用
-										terminalName, // 仅调试用
-										pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
-									}, // 仅调试用
-								); // 仅调试用
 								return terminalComponent._deferredInitializationPromise;
 							}
 
@@ -898,21 +709,6 @@ class TerminalManager {
 								},
 								{ ownerTerminalId: terminalId, ownerName: terminalName },
 							);
-							pushTerminalRestoreDebugLog( // 仅调试用
-								"install-finished-before-connect", // 仅调试用
-								{ // 仅调试用
-										initializationAttemptId, // 仅调试用
-									terminalId, // 仅调试用
-									terminalName, // 仅调试用
-									terminalFileId: terminalFile.id, // 仅调试用
-									activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-									installationSuccess: !!installationResult.success, // 仅调试用
-									componentPid: terminalComponent.pid || null, // 仅调试用
-									isConnected: !!terminalComponent.isConnected, // 仅调试用
-									bufferBaseY: terminalComponent.terminal?.buffer?.active?.baseY ?? null, // 仅调试用
-									bufferCursorY: terminalComponent.terminal?.buffer?.active?.cursorY ?? null, // 仅调试用
-								}, // 仅调试用
-							); // 仅调试用
 							if (!installationResult.success) {
 								throw new Error(installationResult.error);
 							}
@@ -925,29 +721,7 @@ class TerminalManager {
 							terminalComponent,
 							terminalId,
 						);
-						pushTerminalRestoreDebugLog( // 仅调试用
-							"layout-ready", // 仅调试用
-							{ // 仅调试用
-								initializationAttemptId, // 仅调试用
-								terminalId, // 仅调试用
-								terminalName, // 仅调试用
-								pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
-								cols: terminalComponent.terminal?.cols ?? null, // 仅调试用
-								rows: terminalComponent.terminal?.rows ?? null, // 仅调试用
-							}, // 仅调试用
-						); // 仅调试用
 							await terminalComponent.connectToSession(terminalOptions.pid);
-						pushTerminalRestoreDebugLog( // 仅调试用
-							"connect-resolved", // 仅调试用
-							{ // 仅调试用
-								initializationAttemptId, // 仅调试用
-								terminalId, // 仅调试用
-								terminalName, // 仅调试用
-								pid: terminalComponent.pid || null, // 仅调试用
-								isConnected: !!terminalComponent.isConnected, // 仅调试用
-								isReconnecting, // 仅调试用
-							}, // 仅调试用
-						); // 仅调试用
 							// Track whether this is a restored (reconnected) session so onProcessExit
 							// can distinguish unexpected exits from a stale previous session vs.
 							// the user intentionally running `exit` in a fresh shell.
@@ -998,43 +772,9 @@ class TerminalManager {
 							terminalFile.onfocus = async () => {
 								try {
 									if (!terminalComponent._restoreInitializationArmed) {
-										pushTerminalRestoreDebugLog( // 仅调试用
-											"onfocus-blocked-until-restore-settled", // 仅调试用
-											{ // 仅调试用
-												terminalId, // 仅调试用
-												terminalName, // 仅调试用
-												pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
-												initializationAttemptId:
-													terminalComponent._debugInitializationAttemptId ?? null, // 仅调试用
-											}, // 仅调试用
-										); // 仅调试用
 										return;
 									}
-									pushTerminalRestoreDebugLog( // 仅调试用
-										"onfocus-begin", // 仅调试用
-										{ // 仅调试用
-											terminalId, // 仅调试用
-											terminalName, // 仅调试用
-											pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
-											hasDeferredPromise: !!terminalComponent._deferredInitializationPromise, // 仅调试用
-											initializationAttemptId:
-												terminalComponent._debugInitializationAttemptId ?? null, // 仅调试用
-										}, // 仅调试用
-									); // 仅调试用
 									const initializedId = await initializeTerminalSession();
-									pushTerminalRestoreDebugLog( // 仅调试用
-										"onfocus-result", // 仅调试用
-										{ // 仅调试用
-											terminalId, // 仅调试用
-											terminalName, // 仅调试用
-											initializedId: initializedId || null, // 仅调试用
-											pid: terminalComponent.pid || terminalOptions.pid || null, // 仅调试用
-											isConnected: !!terminalComponent.isConnected, // 仅调试用
-											initializationAttemptId:
-												terminalComponent._debugInitializationAttemptId ?? null, // 仅调试用
-										}, // 仅调试用
-										initializedId ? "info" : "warn", // 仅调试用
-									); // 仅调试用
 									if (!initializedId) {
 										return;
 									}
@@ -1205,16 +945,6 @@ class TerminalManager {
 			try {
 				// Check if terminal is already installed
 				const isInstalled = await Terminal.isInstalled();
-				pushTerminalRestoreDebugLog( // 仅调试用
-					"install-check-installed", // 仅调试用
-					{ // 仅调试用
-						forceReinstall, // 仅调试用
-						isInstalled, // 仅调试用
-						ownerName: ownerName || null, // 仅调试用
-						ownerTerminalId: options.ownerTerminalId || progressTerminal?.terminalId || null, // 仅调试用
-						progressDisplayName: progressTerminal?.component?.terminalDisplayName || null, // 仅调试用
-					}, // 仅调试用
-				); // 仅调试用
 				if (isInstalled && !forceReinstall) {
 					return { success: true };
 				}
@@ -1231,18 +961,6 @@ class TerminalManager {
 				// Create installation progress terminal (or reuse current one)
 				const installTerminal =
 					progressTerminal || (await this.createInstallationTerminal());
-				pushTerminalRestoreDebugLog( // 仅调试用
-					"install-progress-terminal", // 仅调试用
-					{ // 仅调试用
-						forceReinstall, // 仅调试用
-						ownerName: ownerName || null, // 仅调试用
-						ownerTerminalId: options.ownerTerminalId || progressTerminal?.terminalId || null, // 仅调试用
-						progressTerminalId: progressTerminal?.terminalId || null, // 仅调试用
-						reusedProgressTerminal: !!progressTerminal, // 仅调试用
-						installDisplayName: installTerminal?.component?.terminalDisplayName || null, // 仅调试用
-						installPid: installTerminal?.component?.pid || null, // 仅调试用
-					}, // 仅调试用
-				); // 仅调试用
 				if (progressTerminal?.component) {
 					installTerminal.component.write(
 						"\x1b[33mInstalling terminal environment...\x1b[0m\r\n",
@@ -1267,36 +985,12 @@ class TerminalManager {
 
 				// Only return success if Terminal.install() indicates success (exit code 0)
 				if (installResult === true || installResult?.success === true) {
-					pushTerminalRestoreDebugLog( // 仅调试用
-						"install-success", // 仅调试用
-						{ // 仅调试用
-							forceReinstall, // 仅调试用
-							ownerName: ownerName || null, // 仅调试用
-							ownerTerminalId: options.ownerTerminalId || progressTerminal?.terminalId || null, // 仅调试用
-							progressTerminalId: progressTerminal?.terminalId || null, // 仅调试用
-							progressDisplayName: installTerminal?.component?.terminalDisplayName || null, // 仅调试用
-							progressPid: installTerminal?.component?.pid || null, // 仅调试用
-							installResultType: typeof installResult, // 仅调试用
-						}, // 仅调试用
-					); // 仅调试用
 					return { success: true };
 				} else {
 					const installError =
 						typeof installResult === "object" && installResult
 							? installResult.error
 							: null;
-					pushTerminalRestoreDebugLog( // 仅调试用
-						"install-result-failure", // 仅调试用
-						{ // 仅调试用
-							forceReinstall, // 仅调试用
-							ownerName: ownerName || null, // 仅调试用
-							ownerTerminalId: options.ownerTerminalId || progressTerminal?.terminalId || null, // 仅调试用
-							progressTerminalId: progressTerminal?.terminalId || null, // 仅调试用
-							installError: installError || null, // 仅调试用
-							installResultType: typeof installResult, // 仅调试用
-						}, // 仅调试用
-						"warn", // 仅调试用
-					); // 仅调试用
 					return {
 						success: false,
 						error:
@@ -1305,17 +999,6 @@ class TerminalManager {
 					};
 				}
 			} catch (error) {
-				pushTerminalRestoreDebugLog( // 仅调试用
-					"install-exception", // 仅调试用
-					{ // 仅调试用
-						forceReinstall, // 仅调试用
-						ownerName: ownerName || null, // 仅调试用
-						ownerTerminalId: options.ownerTerminalId || progressTerminal?.terminalId || null, // 仅调试用
-						progressTerminalId: progressTerminal?.terminalId || null, // 仅调试用
-						errorMessage: error?.message || String(error), // 仅调试用
-					}, // 仅调试用
-					"error", // 仅调试用
-				); // 仅调试用
 				console.error("Terminal installation failed:", error);
 				return {
 					success: false,
@@ -1667,36 +1350,12 @@ class TerminalManager {
 
 		// Handle tab close
 		terminalFile.onclose = () => {
-			pushTerminalRestoreDebugLog( // 仅调试用
-				"tab-onclose", // 仅调试用
-				{ // 仅调试用
-					terminalId, // 仅调试用
-					terminalName: terminalDisplayName, // 仅调试用
-					trigger: consumeTerminalCloseTrigger(terminalFile), // 仅调试用
-				}, // 仅调试用
-				"warn", // 仅调试用
-			); // 仅调试用
 			this.closeTerminal(terminalId);
 		};
 
 		terminalFile._skipTerminalCloseConfirm = false;
 		const originalRemove = terminalFile.remove.bind(terminalFile);
 		terminalFile.remove = async (force = false) => {
-			terminalFile._terminalCloseTrigger = { // 仅调试用
-				type: "remove", // 仅调试用
-				force, // 仅调试用
-				skipConfirm: !!terminalFile._skipTerminalCloseConfirm, // 仅调试用
-				activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-			}; // 仅调试用
-			pushTerminalRestoreDebugLog( // 仅调试用
-				"tab-remove-request", // 仅调试用
-				{ // 仅调试用
-					terminalId, // 仅调试用
-					terminalName: terminalDisplayName, // 仅调试用
-					trigger: terminalFile._terminalCloseTrigger, // 仅调试用
-				}, // 仅调试用
-				"warn", // 仅调试用
-			); // 仅调试用
 			if (
 				!terminalFile._skipTerminalCloseConfirm &&
 				this.shouldConfirmTerminalClose()
@@ -1720,15 +1379,6 @@ class TerminalManager {
 		};
 
 		terminalComponent.onError = (error) => {
-			pushTerminalRestoreDebugLog( // 仅调试用
-				"component-error", // 仅调试用
-				{ // 仅调试用
-					terminalId, // 仅调试用
-					terminalName: terminalDisplayName, // 仅调试用
-					errorMessage: error?.message || String(error), // 仅调试用
-				}, // 仅调试用
-				"error", // 仅调试用
-			); // 仅调试用
 			console.error(`Terminal ${terminalId} error:`, error);
 
 			// Close the terminal and remove the tab
@@ -1943,18 +1593,6 @@ class TerminalManager {
 		if (!terminal) return;
 
 		try {
-			pushTerminalRestoreDebugLog( // 仅调试用
-				"close-terminal", // 仅调试用
-				{ // 仅调试用
-					terminalId, // 仅调试用
-					terminalName: terminal.name, // 仅调试用
-					removeTab, // 仅调试用
-					pid: terminal.component?.pid || null, // 仅调试用
-					trigger: consumeTerminalCloseTrigger(terminal.file), // 仅调试用
-					activeFileId: window.editorManager?.activeFile?.id || null, // 仅调试用
-				}, // 仅调试用
-				"warn", // 仅调试用
-			); // 仅调试用
 			if (terminal.component.serverMode && terminal.component.pid) {
 				this.removePersistedSession(terminal.component.pid);
 			}
