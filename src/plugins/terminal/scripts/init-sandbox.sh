@@ -6,17 +6,6 @@ mkdir -p "$PREFIX/public"
 
 export PROOT_TMP_DIR=$PREFIX/tmp
 
-# 182 policy switch: set to retry to auto-retry on SIGRT54, or failfast to
-# stop immediately for debugging.
-AXS_EXIT_182_POLICY="${AXS_EXIT_182_POLICY:-failfast}"
-
-should_retry_on_182() {
-    local _rc="$1"
-    [ "$_rc" -eq 182 ] || return 1
-    [ "$AXS_EXIT_182_POLICY" = "retry" ] || return 1
-    return 0
-}
-
 # Disable seccomp filter in proot to avoid SIGSEGV/SIGBUS on kernels
 # with strict seccomp policies.
 # Impact: may slightly reduce syscall-level sandboxing on permissive kernels.
@@ -24,6 +13,12 @@ should_retry_on_182() {
 # boundary; disabling it universally is the only way to prevent hard crashes on
 # affected devices, with negligible downside on unaffected ones.
 export PROOT_NO_SECCOMP=1
+
+# Suppress proot INFO/WARNING diagnostic messages (e.g. vdso guard zone,
+# PIE relocation, root tracee exit status). Only ERROR is preserved.
+# Root cause: proot's note() prints to stderr at verbose>=0 by default,
+# flooding the terminal lifecycle output with internal diagnostics.
+export PROOT_VERBOSE=-1
 
 if [ "$FDROID" = "true" ]; then
 
@@ -105,7 +100,6 @@ ARGS="$ARGS -L"
 # Using PID file for precision (not pkill) to avoid killing unrelated processes.
 _old_pid=$(cat "$PREFIX/pid" 2>/dev/null)
 if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
-    printf '[sandbox:cleanup,old_pid=%s,sending=TERM]\n' "$_old_pid" >&2
     kill -TERM "$_old_pid" 2>/dev/null
     _wait_i=0
     while [ "$_wait_i" -lt 20 ] && kill -0 "$_old_pid" 2>/dev/null; do
@@ -113,39 +107,14 @@ if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
         _wait_i=$((_wait_i + 1))
     done
     if kill -0 "$_old_pid" 2>/dev/null; then
-        printf '[sandbox:cleanup,old_pid=%s,TERM-timeout,sending=KILL]\n' "$_old_pid" >&2
         kill -KILL "$_old_pid" 2>/dev/null
         sleep 0.2
     fi
-    printf '[sandbox:cleanup,old_pid=%s,done,still_alive=%s]\n' "$_old_pid" "$(kill -0 "$_old_pid" 2>/dev/null && echo y || echo n)" >&2
 fi
 # Clear stale ptrace tracking files
 rm -rf "$PROOT_TMP_DIR"/*
 
-# Exit code 182 from proot's loader means mmap(MAP_FIXED) failed; this was
-# caused by EXEC_PIC_ADDRESS falling in Huawei's vdso protection zone and is
-# now fixed in the loader.  The retry loop is kept as a safety net.
-_proot_retry=0
-while true; do
-    _proot_retry=$((_proot_retry + 1))
-
-    # Clear stale ptrace tracking files from previous failed attempt
-    rm -rf "$PROOT_TMP_DIR"/*
-
-    $PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@" &
-    proot_pid=$!
-    wait "$proot_pid"
-    proot_rc=$?
-
-    # Exit code 182 policy is controlled by AXS_EXIT_182_POLICY.
-    if [ "$proot_rc" -eq 182 ]; then
-        if should_retry_on_182 "$proot_rc"; then
-            continue
-        fi
-        break
-    fi
-
-    break
-done
-
-exit "$proot_rc"
+$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@" &
+proot_pid=$!
+wait "$proot_pid"
+exit $?

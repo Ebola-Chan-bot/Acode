@@ -237,6 +237,11 @@ const Terminal = {
         if (installing) {
             return new Promise((resolve) => {
                 (async () => {
+                    // Ensure alpine/bin/ exists: a previous interrupted uninstall may have
+                    // partially removed the rootfs while leaving the .extracted marker,
+                    // causing the install flow to skip extraction but land on a missing
+                    // directory when trying to write the rm wrapper.
+                    await Executor.execute(`mkdir -p "${filesDir}/alpine/bin"`);
                     await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
                     await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
                     await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
@@ -283,6 +288,7 @@ const Terminal = {
                 });
             });
         } else {
+            await Executor.execute(`mkdir -p "${filesDir}/alpine/bin"`); // same guard as the installing path
             await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
             await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
             await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
@@ -411,6 +417,17 @@ const Terminal = {
         let alreadyDownloaded = await fileExists(`${filesDir}/.downloaded`);
         let alreadyExtracted = await fileExists(`${filesDir}/.extracted`);
         let alreadyConfigured = await fileExists(`${filesDir}/.configured`);
+
+        // An interrupted uninstall can leave the .extracted marker while the
+        // rootfs is partially deleted (e.g. alpine/bin/sh missing).  Detect
+        // this inconsistency and force a re-extraction so proot finds a valid
+        // rootfs.
+        if (alreadyExtracted && !(await fileExists(`${filesDir}/alpine/bin/sh`))) {
+            await Executor.execute(`rm -rf "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine"`).catch(() => {});
+            alreadyExtracted = false;
+            alreadyConfigured = false;
+        }
+
         const hasPidFile = await fileExists(`${filesDir}/pid`);
         try {
             const {
@@ -739,60 +756,61 @@ const Terminal = {
      * @returns {Promise<string>} Promise that resolves to "ok" when uninstallation completes successfully
      * @throws {string} Rejects with command output if uninstallation fails
      */
-    uninstall() {
-        return new Promise(async (resolve, reject) => {
-            if (await this.isAxsRunning()) {
-                await this.stopAxs();
-            }
+    // Fixed: was `new Promise(async (resolve, reject) => ...)` which is an antipattern —
+    // if `await Executor.execute()` rejects, the rejection becomes unhandled and the
+    // outer Promise stays pending forever, causing the shared environment operation to
+    // never settle and all subsequent terminals to hang on "Waiting for ...".
+    async uninstall() {
+        if (await this.isAxsRunning()) {
+            await this.stopAxs();
+        }
 
-            // Remove rootfs and markers, but keep downloaded files as cache
-            // (alpine.tar.gz, axs binary, libproot*.so, libtalloc.so.2)
-            const cmd = `
-            set -e
+        // Remove rootfs and markers, but keep downloaded files as cache
+        // (alpine.tar.gz, axs binary, libproot*.so, libtalloc.so.2)
+        // No `set -e`: rm -rf can fail when proot child processes from a
+        // preempted install are still writing files (race: rmdir sees a
+        // newly created file → "Directory not empty").  Best-effort removal
+        // is acceptable — the next install overwrites everything.
+        const cmd = `
+        INCLUDE_FILES="$PREFIX/alpine $PREFIX/.downloaded $PREFIX/.extracted $PREFIX/.configured"
 
-            INCLUDE_FILES="$PREFIX/alpine $PREFIX/.downloaded $PREFIX/.extracted $PREFIX/.configured"
+        for item in $INCLUDE_FILES; do
+            rm -rf -- "$item" 2>/dev/null
+        done
 
-            for item in $INCLUDE_FILES; do
-                rm -rf -- "$item"
-            done
-
-            echo "ok"
-            `;
-            const result = await Executor.execute(cmd);
-            if (result === "ok") {
-                resolve(result);
-            } else {
-                reject(result);
-            }
-        });
+        echo "ok"
+        `;
+        const result = await Executor.execute(cmd);
+        if (result === "ok") {
+            return result;
+        }
+        throw new Error(result);
     },
 
     /**
      * Fully uninstalls Alpine including download cache.
      * @returns {Promise<string>} Resolves to "ok" when complete.
      */
-    uninstallFull() {
-        return new Promise(async (resolve, reject) => {
-            if (await this.isAxsRunning()) {
-                await this.stopAxs();
-            }
+    // Same antipattern fix as uninstall() above.
+    async uninstallFull() {
+        if (await this.isAxsRunning()) {
+            await this.stopAxs();
+        }
 
-            const filesDir = await new Promise((resolve, reject) => {
-                system.getFilesDir(resolve, reject);
-            });
-
-            const cmd = `
-            set -e
-            rm -rf "${filesDir}/alpine" "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/axs" "${filesDir}/libproot-xed.so" "${filesDir}/libtalloc.so.2" "${filesDir}/libproot.so" "${filesDir}/libproot32.so" "${filesDir}/.download-manifest"
-            echo "ok"
-            `;
-            const result = await Executor.execute(cmd);
-            if (result === "ok") {
-                resolve(result);
-            } else {
-                reject(result);
-            }
+        const filesDir = await new Promise((resolve, reject) => {
+            system.getFilesDir(resolve, reject);
         });
+
+        // No `set -e`: same race condition as uninstall() — see comment there.
+        const cmd = `
+        rm -rf "${filesDir}/alpine" "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/axs" "${filesDir}/libproot-xed.so" "${filesDir}/libtalloc.so.2" "${filesDir}/libproot.so" "${filesDir}/libproot32.so" "${filesDir}/.download-manifest" 2>/dev/null
+        echo "ok"
+        `;
+        const result = await Executor.execute(cmd);
+        if (result === "ok") {
+            return result;
+        }
+        throw new Error(result);
     }
 };
 

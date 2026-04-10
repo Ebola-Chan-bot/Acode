@@ -4,7 +4,7 @@
  */
 
 import EditorFile from "lib/editorFile";
-import TerminalComponent from "./terminal";
+import TerminalComponent, { invalidateTerminalEnvironment, getTerminalEnvironmentGeneration } from "./terminal";
 import TerminalTouchSelection from "./terminalTouchSelection";
 import "@xterm/xterm/css/xterm.css";
 import quickTools from "components/quickTools";
@@ -346,6 +346,12 @@ class TerminalManager {
 	}
 
 	closeAllTerminals(noticeMessage = null) {
+		// Bump the environment generation so that in-flight createSessionInternal()
+		// calls throw TerminalSessionStaleError at their next ensureAttemptIsStillValid()
+		// checkpoint.  This covers terminals still initializing (not yet in this.terminals)
+		// which dispose() alone cannot reach.
+		invalidateTerminalEnvironment();
+
 		const terminals = Array.from(this.terminals.entries());
 
 		for (const [terminalId, terminal] of terminals) {
@@ -358,6 +364,24 @@ class TerminalManager {
 			}
 
 			this.closeTerminal(terminalId, true);
+		}
+
+		// Terminals stuck in waitForTerminalLayoutReady (waiting for
+		// _activationReadyPromise) are not yet registered in this.terminals,
+		// so closeTerminal above cannot reach them.  Find them via
+		// editorManager.files and force-close them so uninstall does not
+		// leave orphaned terminal tabs behind.
+		const allFiles = window.editorManager?.files;
+		if (Array.isArray(allFiles)) {
+			const terminalFiles = allFiles.filter(
+				(f) => f.type === "terminal",
+			);
+			for (const f of terminalFiles) {
+				try {
+					f._skipTerminalCloseConfirm = true;
+					f.remove(true);
+				} catch {}
+			}
 		}
 	}
 
@@ -539,9 +563,8 @@ class TerminalManager {
 
 		// Restored terminal tabs transiently steal editor focus while openFile creates
 		// them. If we trust manager.activeFile here, the last created terminal becomes
-		// the implicit "active" tab and its hidden onfocus reconnect runs immediately,
-		// which is exactly how Terminal 1/2 were restored against a 0x0 container and
-		// how Terminal 3 kept winning focus after restore.
+		// the implicit "active" tab and its hidden onfocus reconnect runs immediately
+		// against a 0x0 container, corrupting the restored layout.
 		for (const restoredTerminal of restoredTerminals) {
 			restoredTerminal.armDeferredInitialization?.();
 		}
@@ -662,9 +685,8 @@ class TerminalManager {
 							const isActiveTerminalTab = activeFile?.id === terminalFile.id;
 
 							// Hidden restored terminals must never mount or reconnect until their tab is
-							// actually active. Runtime logs proved that startup could still initialize
-							// background tabs here, which opened fresh PTYs for Terminal 2/3 while
-							// Terminal 1 remained selected and later caused mismatched restored state.
+							// actually active. Startup could otherwise initialize background tabs here,
+							// opening fresh PTYs on invisible grids and causing mismatched restored state.
 							// NOTE: hasVisibleLayout (offsetParent) is intentionally NOT checked here.
 							// onfocus fires synchronously inside makeActive() before the DOM applies
 							// the new active-tab CSS, so offsetParent is always null at this point
@@ -696,6 +718,17 @@ class TerminalManager {
 						);
 
 						if (terminalComponent.serverMode) {
+							// Snapshot the environment generation BEFORE entering the shared
+							// install operation.  Waiters may block here for the full duration
+							// of an install; if an uninstall fires right after install settles,
+							// the generation bump happens before createSessionInternal() starts
+							// and would be invisible to its own fresh snapshot.  Passing the
+							// pre-install value lets createSessionInternal detect the stale
+							// environment and throw TerminalSessionStaleError instead of the
+							// non-silent "Terminal not installed" error.
+							terminalComponent._preInstallEnvironmentGeneration =
+								getTerminalEnvironmentGeneration();
+
 							// Run install check after mount so install logs can stream into this
 							// exact terminal tab (via progressTerminal.component), instead of
 							// opening a separate "Terminal Installation" tab. Keeping it inside
@@ -1219,8 +1252,8 @@ class TerminalManager {
 
 					// Active tab selection fires before WebView finishes applying the new
 					// tab CSS and xterm's own container catches up. Waiting for the actual
-					// mounted xterm box prevents connectToSession from still seeing 0x0 and
-					// opening Terminal 2/3 on an invisible grid that later paints as black.
+					// mounted xterm box prevents connectToSession from seeing 0x0 and
+					// opening a PTY on an invisible grid that later paints as black.
 					if (Date.now() - startTime >= 4000) {
 						reject(
 							new Error(
@@ -1371,11 +1404,12 @@ class TerminalManager {
 
 		// Terminal event handlers
 		terminalComponent.onConnect = () => {
-			console.log(`Terminal ${terminalId} connected`);
+			// Intentionally no console output: connection lifecycle is expected and
+			// high-frequency; logging it pollutes remote diagnostics without adding signal.
 		};
 
 		terminalComponent.onDisconnect = () => {
-			console.log(`Terminal ${terminalId} disconnected`);
+			// Keep silent for the same reason as onConnect.
 		};
 
 		terminalComponent.onError = (error) => {
@@ -1414,33 +1448,6 @@ class TerminalManager {
 		};
 
 		terminalComponent.onProcessExit = async (exitData) => {
-			// Exit 182 = proot loader FATAL (MAP_FIXED failed on an occupied address).
-			// The root cause has been fixed in proot (fixup_load_addresses relocates PIE
-			// binaries away from occupied regions).  If 182 still appears, it is
-			// unexpected and must NOT be silently retried or ignored — stop immediately
-			// and surface full diagnostics so the remaining trigger can be identified.
-			if (exitData.exit_code === 182) {
-				const diagMsg = `[FATAL] Terminal ${terminalId} exit 182 (proot loader address conflict) — this should no longer happen after the fixup_load_addresses fix. Full exit data: ${JSON.stringify(exitData)}`;
-				console.error(diagMsg);
-
-				// Kill the AXS server-side session to avoid orphaned processes
-				if (terminalComponent.websocket) {
-					terminalComponent.websocket.close();
-				}
-				terminalComponent.isConnected = false;
-
-				// Surface the raw diagnostics in the terminal so the user can report them
-				terminalComponent.write(
-					`\r\n\x1b[1;31m${diagMsg}\x1b[0m\r\n`,
-				);
-
-				this.closeTerminal(terminalId);
-				terminalFile._skipTerminalCloseConfirm = true;
-				terminalFile.remove(true);
-				toast(`Exit 182: unexpected proot loader failure — see console log`);
-				return;
-			}
-
 			// Format exit message based on exit code and signal
 			let message;
 			if (exitData.signal) {
@@ -1632,8 +1639,6 @@ class TerminalManager {
 			if (this.getAllTerminals().size <= 0) {
 				Executor.stopService();
 			}
-
-			console.log(`Terminal ${terminalId} closed`);
 		} catch (error) {
 			console.error(`Error closing terminal ${terminalId}:`, error);
 		}

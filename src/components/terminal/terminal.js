@@ -24,6 +24,19 @@ import TerminalTouchSelection from "./terminalTouchSelection";
 let terminalEnvironmentGeneration = 0;
 const AXS_READY_MARKER = "__ACODE_AXS_READY__";
 
+// Bump the generation counter to invalidate all in-flight createSessionInternal() calls.
+// Used by terminalManager.closeAllTerminals() to cancel startup code for terminals not yet
+// registered in the terminals map (so dispose() alone cannot reach them).
+export function invalidateTerminalEnvironment() {
+	terminalEnvironmentGeneration++;
+}
+
+// Expose the current generation so callers can snapshot it before an await
+// boundary and later detect invalidations that occurred during the wait.
+export function getTerminalEnvironmentGeneration() {
+	return terminalEnvironmentGeneration;
+}
+
 class TerminalSessionStaleError extends Error {
 	constructor(message = "Terminal session attempt became stale") {
 		super(message);
@@ -275,12 +288,10 @@ export default class TerminalComponent {
 							this.terminal.scrollToLine(targetScroll);
 						}
 					} else if (wasNearBottomBeforeResize) {
-						// Terminal 1's black block came from restoring a stale viewportY after a
-						// hidden-tab/IME height change while the prompt was already at the bottom.
-						// Preserving the old line index in that state replays a scroll offset that no
-						// longer matches the new viewport height, so xterm keeps the DOM layer shifted
-						// above its container. If we were already at the live bottom, re-anchor to the
-						// live bottom instead of replaying the stale viewportY.
+						// Restoring a stale viewportY after a hidden-tab/IME height change while
+						// the prompt is at the bottom replays a scroll offset that no longer matches
+						// the new viewport height, causing xterm to shift the DOM layer above its
+						// container. If we were already at the live bottom, re-anchor there.
 						this.terminal.scrollToBottom();
 					} else {
 						// Regular resize away from the prompt - preserve the user-visible viewport.
@@ -294,13 +305,11 @@ export default class TerminalComponent {
 					// Mark resize as complete
 					isResizing = false;
 
-					// The remaining Terminal 1 black block happens after the tab is already visible:
-					// IME animation shrinks the viewport, xterm recomputes rows, and only then does
-					// WebView reapply a stale focused-textarea scroll offset that pushes the entire
-					// .xterm layer above the container again. Running the visible-layout correction
-					// once more after the debounced resize settles fixes that late relocation, and
-					// also makes hidden terminals that received MOTD while inactive repaint correctly
-					// when they become the active tab.
+					// IME animation can shrink the viewport after the tab is visible, causing
+					// WebView to reapply a stale scroll offset that pushes the .xterm layer above
+					// the container. Running visible-layout correction after the debounced resize
+					// settles fixes that late relocation, and also makes hidden terminals that
+					// received MOTD while inactive repaint correctly when they become active.
 					this.scheduleVisibleLayoutSync("resize-settled");
 
 					// Notify touch selection if it exists
@@ -589,7 +598,7 @@ export default class TerminalComponent {
 			// First render pass: schedule a fit once the frame is ready.
 			// Auto-focusing here opens the soft keyboard before MOTD/prompt arrives and
 			// can shrink the viewport while restored tabs are still computing their first
-			// PTY size, which is why Terminal 2/3 still hard-wrap on first paint.
+			// PTY size, causing hard-wrapped output on first paint.
 			if (typeof requestAnimationFrame === "function") {
 				requestAnimationFrame(() => {
 					this.fitAddon.fit();
@@ -640,7 +649,13 @@ export default class TerminalComponent {
 
 	async createSessionInternal() {
 		try {
-			let observedEnvironmentGeneration = terminalEnvironmentGeneration;
+			// Use the pre-install generation snapshot if available.  Waiters capture
+		// this BEFORE the shared install operation so that an uninstall that
+		// happens between install completion and createSessionInternal entry
+		// (which bumps the generation) is detected as stale.
+		let observedEnvironmentGeneration =
+			this._preInstallEnvironmentGeneration ?? terminalEnvironmentGeneration;
+		delete this._preInstallEnvironmentGeneration;
 			const ensureAttemptIsStillValid = () => {
 				if (this._isDisposed) {
 					throw new TerminalSessionStaleError();
@@ -701,7 +716,12 @@ export default class TerminalComponent {
 
 			const pollAxs = async (maxRetries = 30, intervalMs = 1000) => {
 				for (let i = 0; i < maxRetries; i++) {
+					// Exit early when the terminal was disposed or the environment was
+					// invalidated (e.g. uninstall called closeAllTerminals while this
+					// terminal was still initializing and not yet in the terminals map).
+					ensureAttemptIsStillValid();
 					await new Promise((r) => setTimeout(r, intervalMs));
+					ensureAttemptIsStillValid();
 					try {
 						const resp = await fetchWithTimeout(
 							`http://localhost:${this.options.port}/`,
@@ -727,11 +747,14 @@ export default class TerminalComponent {
 					this.terminal.write(
 						`${isError ? "\x1b[31m" : ""}${cleanMessage}\x1b[0m\r\n`,
 					);
-				}
-				if (isError) {
-					console.error(message);
-				} else {
-					console.log(message);
+					// Forward to console so the debug client can observe lifecycle events.
+					// Noise from proot (INFO/WARNING) is suppressed at source via
+					// PROOT_VERBOSE=-1 in init-sandbox.sh; only real messages reach here.
+					if (isError) {
+						console.error(cleanMessage);
+					} else {
+						console.log(cleanMessage);
+					}
 				}
 			};
 
@@ -786,10 +809,6 @@ export default class TerminalComponent {
 				}, delayMs);
 			};
 
-// repairAxsAfterStartupFailure 已移除：repair 重试机制会在
-			// exec-probe 诊断期间提前触发（15s 超时内探针尚未结束，AXS 还没
-			// 启动），导致"AXS did not emit a ready event"循环出现两次。
-
 			const syncTerminalLayout = async () => {
 				const hasRenderableLayout = () => {
 					if (!this.container) {
@@ -803,9 +822,8 @@ export default class TerminalComponent {
 				const runFit = () => {
 					// Shared startup waiters can resume after their tab has already moved to the
 					// background. Fitting xterm while the container is hidden collapses cols to a
-					// bogus tiny value, and the subsequent POST /terminals creates a PTY that
-					// hard-wraps root@localhost on Terminal 2/3 before any later resize can fix it.
-					// Only pre-fit when the terminal currently has a real renderable layout.
+					// bogus tiny value, and the subsequent POST /terminals creates a PTY with an
+					// incorrect grid size. Only pre-fit when the terminal has a real renderable layout.
 					if (!hasRenderableLayout()) {
 						return;
 					}
@@ -915,6 +933,11 @@ export default class TerminalComponent {
 			// reachable and force an unnecessary reinstall loop.
 			const initialPollRetries = axsRunning ? 10 : 1;
 			if (!(await pollAxs(initialPollRetries))) {
+				// pollAxs may have returned false because uninstall invalidated the
+				// environment rather than a genuine startup failure.  Throw stale error
+				// instead of the generic "not reachable" message so the caller cleans up
+				// the tab silently.
+				ensureAttemptIsStillValid();
 				// repair 重试机制已移除，HTTP 不可达直接报错
 				throw new Error("AXS HTTP endpoint is not reachable after startup");
 			}
@@ -1137,12 +1160,11 @@ export default class TerminalComponent {
 					return;
 				}
 
-				// Terminal 1's missing-MOTD repro showed the shell finishing bootstrap while the
-				// tab was hidden by an automatic tab switch. When that happens, xterm keeps the
-				// hidden-tab viewport state and the first visible paint can reopen on stale
-				// scrollback instead of the live prompt/MOTD region. Remember that hidden
-				// bootstrap arrived so the next visible-layout sync can explicitly re-anchor the
-				// viewport once the tab becomes visible again.
+				// If the shell finishes bootstrap while the tab is hidden (e.g. automatic
+				// tab switch), xterm keeps the hidden-tab viewport state and the first visible
+				// paint can show stale scrollback instead of the live prompt/MOTD region.
+				// Remember that hidden bootstrap arrived so the next visible-layout sync can
+				// explicitly re-anchor the viewport once the tab becomes visible again.
 				if (!this.container?.offsetParent && containsBootstrapMarker.test(text)) {
 					this._hiddenBootstrapOutputNeedsVisibleAnchor = true;
 				}
@@ -1191,8 +1213,7 @@ export default class TerminalComponent {
 		// Waiting only for ResizeObserver proves the tab has dimensions, but it does not
 		// guarantee the corresponding POST /resize has already reached the backend. When
 		// reconnect races ahead of that resize, the restored prompt can replay with the
-		// previous narrow grid, which is why Terminal 2/3 still showed split prompt text
-		// and Terminal 1 could render a blank first frame after the keyboard resized it.
+		// previous narrow grid, causing split prompt text or a blank first frame.
 		this.fit();
 		if (this.terminal.cols > 0 && this.terminal.rows > 0) {
 			await this.resizeTerminal(this.terminal.cols, this.terminal.rows);
@@ -1257,13 +1278,10 @@ export default class TerminalComponent {
 		}
 
 		try {
-			// Runtime traces showed Terminal 3 reaching a fully visible state with a populated
-			// xterm buffer and a live prompt while the screen still stayed blank. The common factor
-			// is that the tab had just transitioned from hidden to visible under Android WebView,
-			// which can leave the WebGL renderer bound to stale hidden-tab surfaces even after a
-			// normal fit/refresh cycle. Rebuilding the renderer at that exact visibility boundary
-			// keeps the same session and buffer but forces xterm to bind fresh canvases to the live
-			// viewport, which targets the observed root cause directly instead of retrying startup.
+			// When a tab transitions from hidden to visible under Android WebView, the WebGL
+			// renderer can remain bound to stale hidden-tab surfaces even after a normal
+			// fit/refresh cycle. Rebuilding the renderer at that visibility boundary forces
+			// xterm to bind fresh canvases to the live viewport.
 			this.webglAddon.dispose();
 			const addon = new WebglAddon();
 			if (typeof addon.onContextLoss === "function") {
@@ -1342,9 +1360,9 @@ export default class TerminalComponent {
 		}
 
 		// ResizeObserver covers the terminal container itself, but Android WebView can apply
-		// an extra visualViewport scroll after the IME animation settles. That late shift is
-		// what leaves the small non-scrollable black block under Terminal 1, so visible-layout
-		// correction must also listen to visualViewport changes directly.
+		// an extra visualViewport scroll after the IME animation settles. That late shift can
+		// leave a non-scrollable black block, so visible-layout correction must also listen
+		// to visualViewport changes directly.
 		this._visualViewportSyncHandler = (event) => {
 			this.scheduleVisibleLayoutSync("visual-viewport");
 		};
@@ -1411,19 +1429,11 @@ export default class TerminalComponent {
 
 		if (isViewportRelocated || shouldAnchorHiddenBootstrapViewport) {
 			// When a previously hidden terminal is reactivated with the IME already affecting
-			// layout, WebView/xterm can restore the old internal viewport scroll offset before
-			// the new visible height is applied. The runtime trace captured that as xterm.top < 0
-			// while the terminal container itself stayed in place, which is exactly the large
-			// black non-scrollable area the user still sees on Terminal 1. Re-anchor both xterm's
-			// logical viewport and the DOM scroller to the live bottom row as soon as the tab is
-			// visible so the rendered layer snaps back into the container immediately. The same
-			// re-anchor is also required when bootstrap output arrived while the tab was hidden:
-			// otherwise the first visible paint can reuse hidden-tab scrollback and make the
-			// MOTD/prompt region appear missing even though it is already in the buffer.
-			// WebView auto-scrolls the nearest scrollable ancestor (even overflow:hidden ones)
-			// to keep the focused xterm textarea visible. This shifts the whole xterm layer
-			// above the container, leaving a black gap at the bottom. Resetting the container's
-			// own scrollTop to 0 snaps the content back into its correct position.
+			// layout, WebView/xterm can restore a stale internal viewport scroll offset, causing
+			// xterm.top to go negative and leaving a black gap. Re-anchor both xterm's logical
+			// viewport and the DOM scroller to the live bottom row as soon as the tab is visible.
+			// The same re-anchor is required when bootstrap output arrived while the tab was
+			// hidden: otherwise the first visible paint can show stale scrollback.
 			this.container.scrollTop = 0;
 			this.terminal.scrollToBottom();
 			if (viewportElement) {
@@ -1440,11 +1450,10 @@ export default class TerminalComponent {
 
 	focusTerminalTextareaWithoutScroll() {
 		// When reactivating a terminal while the IME is already open, WebView may
-		// auto-scroll the focused xterm textarea using stale hidden-tab geometry.
-		// That shifts the whole xterm layer above the visible container, which is
-		// exactly what the runtime diagnostics captured with a negative top value.
-		// Focusing the textarea without viewport scrolling keeps input active while
-		// leaving layout ownership to the existing fit/resize path.
+		// auto-scroll the focused xterm textarea using stale hidden-tab geometry,
+		// shifting the xterm layer above the visible container. Focusing without
+		// viewport scrolling keeps input active while leaving layout ownership to
+		// the existing fit/resize path.
 		this.terminal.textarea.focus({ preventScroll: true });
 	}
 
@@ -1482,8 +1491,8 @@ export default class TerminalComponent {
 		}
 		// Android WebView can apply one more IME-driven viewport shift after the
 		// textarea is already focused. Re-running the visible-layout sync slightly
-		// later catches that final relocation and pulls Terminal 1 back from the
-		// negative top position that leaves the black block at the bottom.
+		// later catches that final relocation and corrects the negative top position
+		// that leaves a black block at the bottom.
 		this._focusLayoutSyncTimeout = setTimeout(() => {
 			this._focusLayoutSyncTimeout = null;
 			this.scheduleVisibleLayoutSync("focus-delayed");

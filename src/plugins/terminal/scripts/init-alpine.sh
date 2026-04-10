@@ -7,28 +7,6 @@ APK_COMMUNITY_REPO="http://dl-cdn.alpinelinux.org/alpine/__ALPINE_BRANCH__/commu
 APK_MIRROR_MAIN_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/main"
 APK_MIRROR_COMMUNITY_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/community"
 
-# 182 policy switch: retry | failfast
-AXS_EXIT_182_POLICY="${AXS_EXIT_182_POLICY:-failfast}"
-
-should_retry_on_182() {
-    local _rc="$1"
-    [ "$_rc" -eq 182 ] || return 1
-    [ "$AXS_EXIT_182_POLICY" = "retry" ] || return 1
-    return 0
-}
-
-handle_182_policy() {
-    local _tag="$1"
-    local _rc="$2"
-    local _retry="$3"
-
-    if should_retry_on_182 "$_rc"; then
-        return 0
-    fi
-
-    return 1
-}
-
 extract_shebang_interpreter() {
     local shebang_line="$1"
     local shebang_body=""
@@ -265,11 +243,9 @@ if [ "$#" -eq 0 ]; then
     echo "$$" > "$PREFIX/pid"
     chmod +x "$PREFIX/axs"
 
-    # Write MOTD via temp file to avoid signal 54 truncating the target.
-    # rc=182 behavior is controlled by AXS_EXIT_182_POLICY.
+    # Write MOTD via temp file to avoid truncation on write failure.
     if [ ! -s "$PREFIX/alpine/etc/acode_motd" ]; then
-        while true; do
-            cat <<EOF > "$PREFIX/alpine/etc/acode_motd.tmp"
+        cat <<EOF > "$PREFIX/alpine/etc/acode_motd.tmp"
 Welcome to Alpine Linux in Acode!
 
 Working with packages:
@@ -280,48 +256,16 @@ Working with packages:
  - Upgrade: apk update && apk upgrade
 
 EOF
-            _motd_rc=$?
-            if [ "$_motd_rc" -ne 0 ]; then
-                : # cat failed; fall through to error handling
-            fi
-            if [ "$_motd_rc" -eq 0 ] && [ -s "$PREFIX/alpine/etc/acode_motd.tmp" ]; then
-                # mv is also an external binary intercepted by proot ptrace;
-                # signal 54 can kill mv (rc=182) leaving the file un-moved.
-                mv -f "$PREFIX/alpine/etc/acode_motd.tmp" "$PREFIX/alpine/etc/acode_motd"
-                _motd_mv_rc=$?
-                if [ "$_motd_mv_rc" -ne 0 ]; then
-                    rm -f "$PREFIX/alpine/etc/acode_motd.tmp"
-                    if [ "$_motd_mv_rc" -eq 182 ]; then
-                        if handle_182_policy 'init-alpine:motd-mv' "$_motd_mv_rc" ""; then
-                            continue
-                        fi
-                        exit 182
-                    fi
-                    break
-                fi
-                break
-            fi
+        if [ $? -eq 0 ] && [ -s "$PREFIX/alpine/etc/acode_motd.tmp" ]; then
+            mv -f "$PREFIX/alpine/etc/acode_motd.tmp" "$PREFIX/alpine/etc/acode_motd" || rm -f "$PREFIX/alpine/etc/acode_motd.tmp"
+        else
             rm -f "$PREFIX/alpine/etc/acode_motd.tmp"
-            if [ "$_motd_rc" -eq 182 ]; then
-                if handle_182_policy 'init-alpine:motd' "$_motd_rc" ""; then
-                    continue
-                fi
-                exit 182
-            fi
-            break
-        done
+        fi
     fi
 
     # Create/update initrc (always overwrite to keep in sync with app updates)
     # Cost: ~3KB heredoc write per startup, sub-millisecond — negligible.
-    #initrc runs in bash so we can use bash features
-    # Write to temp file first, then mv to final path. cat is an external binary
-    # intercepted by proot ptrace; when concurrent terminal sessions cause signal 54,
-    # cat exits with rc=182 and produces 0 bytes. The > redirect truncates the target
-    # BEFORE cat runs, so writing directly to initrc would destroy the working copy.
-    # Using a temp file preserves the existing initrc on failure.
-    # rc=182 behavior is controlled by AXS_EXIT_182_POLICY.
-    while true; do
+    # Write to temp file first, then mv — avoids destroying existing initrc on failure.
     cat <<'EOF' > "$PREFIX/alpine/initrc.tmp"
 # Source rc files if they exist
 
@@ -391,9 +335,7 @@ fi
 # Display MOTD
 # Use shell builtins (read+printf) instead of cat to output MOTD.
 # In proot, external binaries like cat need execve which proot intercepts via ptrace.
-# When a second terminal instance runs concurrently, cat writing to the PTY fd fails
-# with rc=182 (empty stderr). Shell builtins run in-process without execve, bypassing
-# the proot ptrace issue entirely.
+# Shell builtins run in-process without execve, bypassing proot's ptrace interception.
 if [ -s /etc/acode_motd ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         printf '%s\n' "$line"
@@ -476,35 +418,11 @@ acode() {
 
 EOF
     _initrc_heredoc_rc=$?
-
     if [ "$_initrc_heredoc_rc" -eq 0 ] && [ -s "$PREFIX/alpine/initrc.tmp" ]; then
-        # mv is also an external binary intercepted by proot ptrace;
-        # signal 54 can kill mv (rc=182) leaving the file un-moved.
-        mv -f "$PREFIX/alpine/initrc.tmp" "$PREFIX/alpine/initrc"
-        _initrc_mv_rc=$?
-        if [ "$_initrc_mv_rc" -ne 0 ]; then
-            rm -f "$PREFIX/alpine/initrc.tmp"
-            if [ "$_initrc_mv_rc" -eq 182 ]; then
-                if handle_182_policy 'init-alpine:initrc-mv' "$_initrc_mv_rc" ""; then
-                    continue
-                fi
-                exit 182
-            fi
-            break
-        fi
-        break
+        mv -f "$PREFIX/alpine/initrc.tmp" "$PREFIX/alpine/initrc" || rm -f "$PREFIX/alpine/initrc.tmp"
+    else
+        rm -f "$PREFIX/alpine/initrc.tmp"
     fi
-    rm -f "$PREFIX/alpine/initrc.tmp"
-    # Signal 54 (rc=182) policy is controlled by AXS_EXIT_182_POLICY.
-    if [ "$_initrc_heredoc_rc" -eq 182 ]; then
-        if handle_182_policy 'init-alpine:initrc' "$_initrc_heredoc_rc" ""; then
-            continue
-        fi
-        exit 182
-    fi
-    # Other failure — give up, proceed without initrc
-    break
-    done
 
 # Add PS1 only if not already present
 if ! grep -q 'PS1=' "$PREFIX/alpine/initrc"; then
@@ -543,132 +461,46 @@ wait_for_axs_ready() {
 # Stage axs binary inside the rootfs so it can be found by path within proot.
 # A refreshed Alpine rootfs can legitimately miss /usr/local/bin until the first
 # app-managed startup recreates it.
-# Signal 54 can kill mkdir/cp inside proot (exit 182).
-# rc=182 behavior is controlled by AXS_EXIT_182_POLICY.
-while true; do
-    mkdir -p /usr/local/bin 2>/dev/null && break
-    _rc=$?
-    if [ "$_rc" -eq 182 ]; then
-        if handle_182_policy 'init-alpine:mkdir' "$_rc" ""; then
-            continue
-        fi
-        exit 182
-    fi
-    exit 1
-done
-while true; do
-    cp -f "$PREFIX/axs" /usr/local/bin/axs 2>/dev/null && break
-    _rc=$?
-    if [ "$_rc" -eq 182 ]; then
-        if handle_182_policy 'init-alpine:cp-axs' "$_rc" ""; then
-            continue
-        fi
-        exit 182
-    fi
-    exit 1
-done
+mkdir -p /usr/local/bin || exit 1
+cp -f "$PREFIX/axs" /usr/local/bin/axs || exit 1
 # After a fresh reinstall, proot can expose / as read-only while still leaving
 # the copied axs binary executable with its original mode bits. In that case the
 # chmod syscall fails, but treating that as fatal is wrong because axs was staged
 # successfully and can still be launched. Only abort when the final file is not
 # executable; otherwise continue.
-# Signal 54 (exit 182) behavior is controlled by AXS_EXIT_182_POLICY.
-while true; do
-    chmod 755 /usr/local/bin/axs 2>/dev/null && break
-    _rc=$?
-    if [ "$_rc" -eq 182 ]; then
-        if handle_182_policy 'init-alpine:chmod' "$_rc" ""; then
-            continue
-        fi
-        exit 182
-    fi
-    # Non-182 chmod failure: tolerate if the file is already executable
-    if [ -x /usr/local/bin/axs ]; then
-        break
-    fi
-    exit 1
-done
+chmod 755 /usr/local/bin/axs 2>/dev/null || {
+    [ -x /usr/local/bin/axs ] || exit 1
+}
 
-# Signal 54 (SIGRTMIN+20) can kill bash inside proot during startup, causing
-# AXS to exit 182 (128+54) before emitting __ACODE_AXS_READY__.
-# rc=182 behavior is controlled by AXS_EXIT_182_POLICY.
-_axs_retry=0
-_axs_hung_warned=0
 _ready_pipe="/tmp/.axs-ready-$$"
-while true; do
-    _axs_retry=$((_axs_retry + 1))
+rm -f "$_ready_pipe"
+mkfifo "$_ready_pipe" || exit 1
+export AXS_READY_PIPE="$_ready_pipe"
 
-    # Create FIFO for this attempt (remove stale one from previous retry)
-    # mkfifo is also an external binary intercepted by proot ptrace;
-    # signal 54 can kill it (rc=182) leaving no FIFO, which breaks the
-    # ready-notification mechanism entirely.
-    rm -f "$_ready_pipe"
-    while true; do
-        mkfifo "$_ready_pipe" && break
-        _mkfifo_rc=$?
-        if [ "$_mkfifo_rc" -eq 182 ]; then
-            if handle_182_policy 'init-alpine:mkfifo' "$_mkfifo_rc" ""; then
-                continue
-            fi
-            exit 182
-        fi
-        break
-    done
-    export AXS_READY_PIPE="$_ready_pipe"
+"/usr/local/bin/axs" -c 'bash --rcfile /initrc -i' &
+axs_pid=$!
+wait_for_axs_ready "$axs_pid" "$_ready_pipe"
+axs_ready_rc=$?
+rm -f "$_ready_pipe"
 
-    "/usr/local/bin/axs" -c 'bash --rcfile /initrc -i' &
-    axs_pid=$!
-    wait_for_axs_ready "$axs_pid" "$_ready_pipe"
-    axs_ready_rc=$?
-    rm -f "$_ready_pipe"
-
-    if [ "$axs_ready_rc" -eq 0 ]; then
-        # AXS is ready — wait for it to finish normally
-        wait "$axs_pid"
-        break
-    fi
-
+if [ "$axs_ready_rc" -eq 0 ]; then
+    # AXS is ready — wait for it to finish normally
+    wait "$axs_pid"
+else
     # AXS failed to become ready within 15s.
-    # If AXS died (signal 54 / exit 182), follow policy.
-    # If AXS is still alive but never wrote READY to the FIFO, it is hung.
-    # In the hung case, do NOT kill AXS — instead warn the user and keep
-    # waiting indefinitely. The user can uninstall/reinstall the terminal
-    # if needed; but if they do nothing, the wait continues in case AXS
-    # eventually recovers (e.g. slow DNS resolution during first boot).
     if ! kill -0 "$axs_pid" 2>/dev/null; then
-        # AXS died — collect exit code and decide whether to retry
+        # AXS died — propagate exit code
         wait "$axs_pid"
-        _axs_wait_rc=$?
-
-        if [ "$_axs_wait_rc" -eq 182 ]; then
-            if handle_182_policy 'init-alpine:axs-died' "$_axs_wait_rc" "$_axs_retry"; then
-                continue
-            fi
-            exit 182
-        fi
-        # Other fatal error — propagate
-        break
-    fi
-
-    # AXS is alive but unresponsive — warn user and wait indefinitely
-    # Only show warning once; subsequent 182 retries that timeout again stay silent
-    if [ "$_axs_hung_warned" -eq 0 ]; then
-        _axs_hung_warned=1
+    else
+        # AXS is alive but unresponsive — warn user and wait indefinitely.
+        # The user can uninstall/reinstall the terminal if needed; but if they
+        # do nothing, the wait continues in case AXS eventually recovers
+        # (e.g. slow DNS resolution during first boot).
         echo -e "\e[33;1m[!]\e[0m AXS 服务启动超时，可能需要在设置中卸载并重新安装终端。\e[0m"
         echo -e "\e[33;1m[!]\e[0m AXS server startup timed out. You may need to uninstall and reinstall the terminal from Settings.\e[0m"
+        wait "$axs_pid"
     fi
-    wait "$axs_pid"
-    _axs_wait_rc=$?
-    # AXS eventually exited while user was waiting. If signal 54 (exit 182),
-    # follow policy.
-    if [ "$_axs_wait_rc" -eq 182 ]; then
-        if handle_182_policy 'init-alpine:axs-hung-exited' "$_axs_wait_rc" "$_axs_retry"; then
-            continue
-        fi
-        exit 182
-    fi
-    break
-done
+fi
 
 else
     exec "$@"
