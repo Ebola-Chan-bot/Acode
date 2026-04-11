@@ -1050,7 +1050,14 @@ export default class TerminalComponent {
 			if (error?.name === "TerminalSessionStaleError") {
 				throw error;
 			}
-			console.error("Failed to create terminal session:", error);
+			// User-initiated tab close during shared environment startup is not an
+			// error — it produces a sharedEnvironmentInterrupted exception that the
+			// caller already handles gracefully.
+			if (error?.sharedEnvironmentInterrupted) {
+				console.log("Terminal session cancelled by user:", error.message);
+			} else {
+				console.error("Failed to create terminal session:", error);
+			}
 			throw error;
 		}
 	}

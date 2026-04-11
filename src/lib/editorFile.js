@@ -1439,6 +1439,11 @@ export default class EditorFile {
 	}
 
 	#destroy() {
+		// Guard: #destroy() can be called twice when a terminal tab is closed during
+		// shared environment startup — the user's close triggers #destroy(), which
+		// interrupts the pending shared-env operation, whose error handler also calls
+		// remove() on the same file. The second call finds #tab already null.
+		if (!this.#tab) return;
 		this.#emit("close", createFileEvent(this));
 		appSettings.off("update:openFileListPos", this.#onFilePosChange);
 		if (this.type === "editor") {
