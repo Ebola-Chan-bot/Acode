@@ -476,6 +476,7 @@ _ready_pipe="/tmp/.axs-ready-$$"
 rm -f "$_ready_pipe"
 mkfifo "$_ready_pipe" || exit 1
 export AXS_READY_PIPE="$_ready_pipe"
+export RUST_LOG=error
 
 "/usr/local/bin/axs" -c 'bash --rcfile /initrc -i' &
 axs_pid=$!
