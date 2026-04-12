@@ -28,12 +28,6 @@ export {
 	lspDiagnosticsExtension,
 	lspDiagnosticsUiExtension,
 } from "./diagnostics";
-export type { DocumentHighlightsConfig } from "./documentHighlights";
-export {
-	documentHighlightsClientExtension,
-	documentHighlightsEditorExtension,
-	documentHighlightsExtension,
-} from "./documentHighlights";
 export type {
 	DocumentSymbolsResult,
 	FlatSymbol,
@@ -72,6 +66,11 @@ export {
 	stopManagedServer,
 } from "./serverLauncher";
 export { default as serverRegistry } from "./serverRegistry";
+export {
+	nextSignature,
+	prevSignature,
+	showSignatureHelp,
+} from "./tooltipExtensions";
 export { createTransport } from "./transport";
 
 export type {
@@ -79,6 +78,7 @@ export type {
 	ClientManagerOptions,
 	ClientState,
 	DiagnosticRelatedInformation,
+	DocumentUriContext,
 	FileMetadata,
 	FormattingOptions,
 	LSPClientWithWorkspace,

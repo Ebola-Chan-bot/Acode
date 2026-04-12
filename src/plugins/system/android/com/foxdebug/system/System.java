@@ -107,6 +107,10 @@ import android.os.Build;
 import android.graphics.ImageDecoder;
 
 
+import java.security.MessageDigest;
+import java.security.MessageDigest;
+
+
 
 public class System extends CordovaPlugin {
     private static final String TAG = "SystemPlugin";
@@ -133,7 +137,7 @@ public class System extends CordovaPlugin {
             new Runnable() {
                 @Override
                 public void run() {
-                    setNativeContextMenuDisabled(true);
+                    setNativeContextMenuDisabled(false);
                 }
             }
         );
@@ -179,6 +183,7 @@ public class System extends CordovaPlugin {
         switch (action) {
             case "get-webkit-info":
             case "file-action":
+            case "checksumText":
             case "is-powersave-mode":
             case "get-app-info":
             case "add-shortcut":
@@ -582,7 +587,7 @@ public class System extends CordovaPlugin {
                                 openInBrowser(arg1, callbackContext);
                                 break;
                             case "launch-app":
-                                launchApp(arg1, arg2, arg3, callbackContext);
+                                launchApp(arg1, arg2, args.optJSONObject(2), callbackContext);
                                 break;
                             case "get-global-setting":
                                 getGlobalSetting(arg1, callbackContext);
@@ -601,6 +606,33 @@ public class System extends CordovaPlugin {
                                 break;
                             case "compare-texts":
                                 compareTexts(arg1, arg2, callbackContext);
+                                break;
+                            case "checksumText":
+                            
+                                cordova.getThreadPool().execute(() -> {
+                                    try {
+                                        
+                                        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+
+                                        byte[] hash = digest.digest(args.getString(0).getBytes("UTF-8"));
+
+                                        StringBuilder hexString = new StringBuilder();
+
+                                        for (byte b : hash) {
+                                            String hex = Integer.toHexString(0xff & b);
+
+                                            if (hex.length() == 1) hexString.append('0');
+
+                                            hexString.append(hex);
+                                        }
+
+
+                                        callbackContext.success(hexString.toString());
+                                    } catch (Exception e) {
+                                        callbackContext.error(e.getMessage());
+                                    }
+                                });
+
                                 break;
                             default:
                                 break;
@@ -1573,7 +1605,7 @@ public class System extends CordovaPlugin {
     private void launchApp(
         String appId,
         String className,
-        String data,
+        JSONObject extras,
         CallbackContext callback
     ) {
         if (appId == null || appId.equals("")) {
@@ -1591,20 +1623,37 @@ public class System extends CordovaPlugin {
             intent.addCategory(Intent.CATEGORY_LAUNCHER);
             intent.setPackage(appId);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            intent.setClassName(appId, className);
 
-            if (data != null && !data.equals("")) {
-                intent.putExtra("acode_data", data);
+            if (extras != null) {
+                Iterator<String> keys = extras.keys();
+
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    Object value = extras.get(key);
+
+                    if (value instanceof Integer) {
+                        intent.putExtra(key, (Integer) value);
+                    } else if (value instanceof Boolean) {
+                        intent.putExtra(key, (Boolean) value);
+                    } else if (value instanceof Double) {
+                        intent.putExtra(key, (Double) value);
+                    } else if (value instanceof Long) {
+                        intent.putExtra(key, (Long) value);
+                    } else if (value instanceof String) {
+                        intent.putExtra(key, (String) value);
+                    } else {
+                        intent.putExtra(key, value.toString());
+                    }
+                }
             }
 
-            intent.setClassName(appId, className);
             activity.startActivity(intent);
             callback.success("Launched " + appId);
+
         } catch (Exception e) {
             callback.error(e.toString());
-            return;
         }
-
-
 
     }
 
@@ -1695,54 +1744,55 @@ public class System extends CordovaPlugin {
     }
 
     private void setUiTheme(
-        final String systemBarColor,
-        final JSONObject scheme,
-        final CallbackContext callback
+            final String systemBarColor,
+            final JSONObject scheme,
+            final CallbackContext callback
     ) {
-        this.systemBarColor = Color.parseColor(systemBarColor);
-        this.theme = new Theme(scheme);
-
-        final Window window = activity.getWindow();
-        // Method and constants not available on all SDKs but we want to be able to compile this code with any SDK
-        window.clearFlags(0x04000000); // SDK 19: WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS);
-        window.addFlags(0x80000000); // SDK 21: WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         try {
-            // Using reflection makes sure any 5.0+ device will work without having to compile with SDK level 21
+            this.systemBarColor = Color.parseColor(systemBarColor);
+            this.theme = new Theme(scheme);
 
-            window
-                .getClass()
-                .getMethod("setNavigationBarColor", int.class)
-                .invoke(window, this.systemBarColor);
+            preferences.set("BackgroundColor", this.systemBarColor);
+            webView.getPluginManager().postMessage("updateSystemBars", null);
+            applySystemBarTheme();
 
-            window
-                .getClass()
-                .getMethod("setStatusBarColor", int.class)
-                .invoke(window, this.systemBarColor);
-
-            window.getDecorView().setBackgroundColor(this.systemBarColor);
-
-            if (Build.VERSION.SDK_INT < 30) {
-                setStatusBarStyle(window);
-                setNavigationBarStyle(window);
-            } else {
-                String themeType = theme.getType();
-                WindowInsetsController controller = window.getInsetsController();
-                int appearance =
-                    WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS |
-                    WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
-
-                if (themeType.equals("light")) {
-                    controller.setSystemBarsAppearance(appearance, appearance);
-                } else {
-                    controller.setSystemBarsAppearance(0, appearance);
-                }
-            }
-            callback.success("OK");
-        } catch (IllegalArgumentException error) {
-            callback.error(error.toString());
-        } catch (Exception error) {
-            callback.error(error.toString());
+            callback.success();
+        } catch (IllegalArgumentException e) {
+            callback.error("Invalid color: " + systemBarColor);
+        } catch (Exception e) {
+            callback.error(e.toString());
         }
+    }
+
+    private void applySystemBarTheme() {
+        final Window window = activity.getWindow();
+        final View decorView = window.getDecorView();
+
+        // Keep Cordova's BackgroundColor flow for API 36+, but also apply the
+        // window colors directly so OEM variants do not leave stale system-bar
+        // colors behind after a theme switch.
+        window.clearFlags(0x04000000 | 0x08000000); // FLAG_TRANSLUCENT_STATUS | FLAG_TRANSLUCENT_NAVIGATION
+        window.addFlags(0x80000000); // FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.setNavigationBarContrastEnforced(false);
+            window.setStatusBarContrastEnforced(false);
+        }
+
+        decorView.setBackgroundColor(this.systemBarColor);
+
+        View rootView = activity.findViewById(android.R.id.content);
+        if (rootView != null) {
+            rootView.setBackgroundColor(this.systemBarColor);
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            window.setStatusBarColor(this.systemBarColor);
+            window.setNavigationBarColor(this.systemBarColor);
+        }
+
+        setStatusBarStyle(window);
+        setNavigationBarStyle(window);
     }
 
     private void setStatusBarStyle(final Window window) {
@@ -1778,22 +1828,22 @@ public class System extends CordovaPlugin {
         String themeType = theme.getType();
         View decorView = window.getDecorView();
         int uiOptions;
+        int lightNavigationBar;
 
         if (SDK_INT <= 30) {
             uiOptions = getDeprecatedSystemUiVisibility(decorView);
-            // 0x80000000 FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
-            // 0x00000010 SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            lightNavigationBar = View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
 
             if (themeType.equals("light")) {
-                setDeprecatedSystemUiVisibility(decorView, uiOptions | 0x80000000 | 0x00000010);
+                setDeprecatedSystemUiVisibility(decorView, uiOptions | lightNavigationBar);
                 return;
             }
-            setDeprecatedSystemUiVisibility(decorView, uiOptions | (0x80000000 & ~0x00000010));
+            setDeprecatedSystemUiVisibility(decorView, uiOptions & ~lightNavigationBar);
             return;
         }
 
         uiOptions = Objects.requireNonNull(decorView.getWindowInsetsController()).getSystemBarsAppearance();
-        int lightNavigationBar = WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+        lightNavigationBar = WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
 
         if (themeType.equals("light")) {
             decorView.getWindowInsetsController().setSystemBarsAppearance(uiOptions | lightNavigationBar, lightNavigationBar);
@@ -2092,28 +2142,9 @@ public class System extends CordovaPlugin {
     }
 
     private void setNativeContextMenuDisabled(boolean disabled) {
-        View webViewView = webView == null ? null : webView.getView();
-        if (webViewView == null) {
+        if (webView == null) {
             return;
         }
-
-        webViewView.setLongClickable(!disabled);
-        webViewView.setHapticFeedbackEnabled(!disabled);
-        if (disabled) {
-            webViewView.setOnLongClickListener(v -> true);
-        } else {
-            webViewView.setOnLongClickListener(null);
-        }
-
-        try {
-            Method method = webViewView
-                .getClass()
-                .getMethod("setNativeContextMenuDisabled", boolean.class);
-            method.invoke(webViewView, disabled);
-        } catch (NoSuchMethodException ignored) {
-            // Fallback above keeps long-press context disabled even without CordovaLib patch.
-        } catch (IllegalAccessException | InvocationTargetException e) {
-            Log.w("System", "Failed to toggle native context menu state", e);
-        }
+        webView.setNativeContextMenuDisabled(disabled);
     }
 }

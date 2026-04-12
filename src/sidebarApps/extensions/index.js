@@ -48,7 +48,11 @@ const $header = (
 				<button type="button" className="icon-button" onclick={filterPlugins}>
 					<span className="icon tune" />
 				</button>
-				<button type="button" className="icon-button" onclick={addSource}>
+				<button
+					type="button"
+					className="icon-button"
+					onclick={() => addSource()}
+				>
 					<span className="icon add" />
 				</button>
 			</div>
@@ -362,17 +366,19 @@ async function filterPlugins() {
 	}
 }
 
-async function addSource() {
-	const sourceOption = [
-		["remote", strings.remote],
-		["local", strings.local],
-	];
-	const sourceType = await select("Select Source", sourceOption);
+async function addSource(sourceType, value = "https://") {
+	if (!sourceType) {
+		const sourceOption = [
+			["remote", strings.remote],
+			["local", strings.local],
+		];
+		sourceType = await select("Select Source", sourceOption);
+	}
 
 	if (!sourceType) return;
 	let source;
 	if (sourceType === "remote") {
-		source = await prompt("Enter plugin source", "https://", "url");
+		source = await prompt("Enter plugin source", value, "url");
 	} else {
 		source = (await FileBrowser("file", "Select plugin source")).url;
 	}
@@ -435,6 +441,7 @@ async function loadExplore() {
 		currentPage++;
 		updateHeight($explore);
 	} catch (error) {
+		console.error("Failed to load plugins in sidebar explore:", error);
 		$explore.$ul.content = <span className="error">{strings.error}</span>;
 	} finally {
 		stopLoading($explore);
@@ -445,15 +452,36 @@ async function listInstalledPlugins() {
 	const plugins = await Promise.all(
 		(await fsOperation(PLUGIN_DIR).lsDir()).map(async (item) => {
 			const id = Url.basename(item.url);
-			const url = Url.join(item.url, "plugin.json");
-			const plugin = await fsOperation(url).readFile("json");
-			const iconUrl = getLocalRes(id, plugin.icon);
-			plugin.icon = await helpers.toInternalUri(iconUrl);
-			plugin.installed = true;
-			return plugin;
+
+			try {
+				const url = Url.join(item.url, "plugin.json");
+				const plugin = await fsOperation(url).readFile("json");
+
+				if (plugin.icon) {
+					const iconUrl = getLocalRes(id, plugin.icon);
+					try {
+						plugin.icon = await helpers.toInternalUri(iconUrl);
+					} catch (error) {
+						console.warn(
+							`Failed to resolve plugin icon for "${id}" in sidebar.`,
+							error,
+						);
+					}
+				}
+
+				plugin.installed = true;
+				return plugin;
+			} catch (error) {
+				console.warn(
+					`Skipping unreadable installed plugin "${id}" in sidebar.`,
+					error,
+				);
+				return null;
+			}
 		}),
 	);
-	return plugins;
+
+	return plugins.filter(Boolean);
 }
 
 async function getFilteredPlugins(filterState) {
@@ -701,20 +729,22 @@ function ListItem({ icon, name, id, version, downloads, installed, source }) {
 			>
 				{name}
 			</span>
-			{installed
-				? <>
-						{source
-							? <span className="icon replay" data-action="rebuild-plugin" />
-							: null}
-						<span className="icon more_vert" data-action="more-plugin-action" />
-					</>
-				: <button
-						type="button"
-						className="install-btn"
-						data-action="install-plugin"
-					>
-						<span className="icon file_downloadget_app" />
-					</button>}
+			{installed ? (
+				<>
+					{source ? (
+						<span className="icon replay" data-action="rebuild-plugin" />
+					) : null}
+					<span className="icon more_vert" data-action="more-plugin-action" />
+				</>
+			) : (
+				<button
+					type="button"
+					className="install-btn"
+					data-action="install-plugin"
+				>
+					<span className="icon file_downloadget_app" />
+				</button>
+			)}
 		</div>
 	);
 

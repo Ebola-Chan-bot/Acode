@@ -440,31 +440,116 @@ class TerminalManager {
 		return nextNumber;
 	}
 
+	normalizePersistedSessions(stored) {
+		if (!Array.isArray(stored)) {
+			return {
+				sessions: [],
+				changed: stored != null,
+			};
+		}
+
+		const sessions = [];
+		const uniqueSessions = [];
+		const seenPids = new Set();
+		let changed = false;
+
+		for (const entry of stored) {
+			if (!entry) {
+				changed = true;
+				continue;
+			}
+
+			if (typeof entry === "string") {
+				sessions.push({
+					pid: entry,
+					name: `Terminal ${entry}`,
+					pinned: false,
+				});
+				changed = true;
+				continue;
+			}
+
+			if (typeof entry !== "object" || !entry.pid) {
+				changed = true;
+				continue;
+			}
+
+			const pid = String(entry.pid);
+			const name =
+				typeof entry.name === "string" && entry.name.trim()
+					? entry.name.trim()
+					: `Terminal ${pid}`;
+			const pinned = entry.pinned === true;
+
+			if (entry.pid !== pid || entry.name !== name || entry.pinned !== pinned) {
+				changed = true;
+			}
+
+			sessions.push({ pid, name, pinned });
+		}
+
+		for (const session of sessions) {
+			const pid = String(session.pid);
+			if (seenPids.has(pid)) {
+				changed = true;
+				continue;
+			}
+			seenPids.add(pid);
+			uniqueSessions.push({
+				pid,
+				name:
+					typeof session.name === "string" && session.name.trim()
+						? session.name.trim()
+						: `Terminal ${pid}`,
+				pinned: session.pinned === true,
+			});
+		}
+
+		if (uniqueSessions.length !== stored.length) {
+			changed = true;
+		}
+
+		return {
+			sessions: uniqueSessions,
+			changed,
+		};
+	}
+
+	readPersistedSessions() {
+		try {
+			return this.normalizePersistedSessions(
+				helpers.parseJSON(localStorage.getItem(TERMINAL_SESSION_STORAGE_KEY)),
+			);
+		} catch (error) {
+			console.error("Failed to read persisted terminal sessions:", error);
+			return {
+				sessions: [],
+				changed: false,
+			};
+		}
+	}
+
 	async getPersistedSessions() {
 		try {
-			const stored = helpers.parseJSON(
-				localStorage.getItem(TERMINAL_SESSION_STORAGE_KEY),
-			);
-			if (!Array.isArray(stored)) return [];
-			if (!(await Terminal.isAxsRunning())) {
+			const { sessions, changed } = this.readPersistedSessions();
+			if (!sessions.length) {
+				if (changed) {
+					this.savePersistedSessions([]);
+				}
 				return [];
 			}
-			return stored
-				.map((entry) => {
-					if (!entry) return null;
-					if (typeof entry === "string") {
-						return { pid: entry, name: `Terminal ${entry}` };
-					}
-					if (typeof entry === "object" && entry.pid) {
-						const pid = String(entry.pid);
-						return {
-							pid,
-							name: entry.name || `Terminal ${pid}`,
-						};
-					}
-					return null;
-				})
-				.filter(Boolean);
+
+			if (!(await Terminal.isAxsRunning())) {
+				// Once the backend is gone, previously persisted PIDs are invalid.
+				this.savePersistedSessions([]);
+				return [];
+			}
+
+			if (changed) {
+				this.savePersistedSessions(sessions);
+			}
+
+			return sessions;
 		} catch (error) {
 			console.error("Failed to read persisted terminal sessions:", error);
 			return [];
@@ -482,17 +567,18 @@ class TerminalManager {
 		}
 	}
 
-	async persistTerminalSession(pid, name) {
+	async persistTerminalSession(pid, name, pinned = false) {
 		if (!pid) return;
 
 		const pidStr = String(pid);
-		const sessions = await this.getPersistedSessions();
+		const { sessions } = this.readPersistedSessions();
 		const existingIndex = sessions.findIndex(
 			(session) => session.pid === pidStr,
 		);
 		const sessionData = {
 			pid: pidStr,
 			name: name || `Terminal ${pidStr}`,
+			pinned: pinned === true,
 		};
 
 		if (existingIndex >= 0) {
@@ -511,7 +597,7 @@ class TerminalManager {
 		if (!pid) return;
 
 		const pidStr = String(pid);
-		const sessions = await this.getPersistedSessions();
+		const { sessions } = this.readPersistedSessions();
 		const nextSessions = sessions.filter((session) => session.pid !== pidStr);
 
 		if (nextSessions.length !== sessions.length) {
@@ -537,6 +623,7 @@ class TerminalManager {
 				const instance = await this.createServerTerminal({
 					pid: session.pid,
 					name: session.name,
+					pinned: session.pinned === true,
 					reconnecting: true,
 					render: false,
 					deferInitialRestoreActivation: true,
@@ -548,17 +635,17 @@ class TerminalManager {
 					error,
 				);
 				failedSessions.push(session.name || session.pid);
-				this.removePersistedSession(session.pid);
+				await this.removePersistedSession(session.pid);
 			}
 		}
 
-		// Show alert for failed sessions (don't await to not block UI)
+		// Stale session entries are expected after force-closes; keep startup quiet.
 		if (failedSessions.length > 0) {
 			const message =
 				failedSessions.length === 1
-					? `Failed to restore terminal: ${failedSessions[0]}`
-					: `Failed to restore ${failedSessions.length} terminals: ${failedSessions.join(", ")}`;
-			alert(strings["error"], message);
+					? `Skipped unavailable terminal: ${failedSessions[0]}`
+					: `Skipped ${failedSessions.length} unavailable terminals`;
+			toast(message);
 		}
 
 		// Restored terminal tabs transiently steal editor focus while openFile creates
@@ -586,10 +673,11 @@ class TerminalManager {
 	 */
 	async createTerminal(options = {}) {
 		try {
-			const { render, serverMode, ...terminalOptions } = options;
+			const { render, serverMode, reconnecting, pinned, ...terminalOptions } =
+				options;
 			const shouldRender = render !== false;
 			const isServerMode = serverMode !== false;
-			const isReconnecting = terminalOptions.reconnecting === true;
+			const isReconnecting = reconnecting === true;
 			const shouldDeferHiddenReconnect =
 				!shouldRender && isServerMode && isReconnecting && !!terminalOptions.pid;
 			const shouldArmDeferredRestoreInitialization =
@@ -652,7 +740,8 @@ class TerminalManager {
 			const terminalFile = new EditorFile(terminalName, {
 				type: "terminal",
 				content: terminalContainer,
-				tabIcon: "licons terminal",
+				tabIcon: "icon square-terminal",
+				pinned,
 				render: shouldRender,
 			});
 			terminalFile.onfocus = () => {
@@ -870,6 +959,7 @@ class TerminalManager {
 							await this.persistTerminalSession(
 								terminalComponent.pid,
 								terminalName,
+								terminalFile.pinned,
 							);
 						}
 						if (Number.isInteger(terminalNumber) && terminalNumber > 0) {
@@ -936,17 +1026,19 @@ class TerminalManager {
 						try {
 							// Force remove the tab without confirmation
 							terminalFile._skipTerminalCloseConfirm = true;
-							terminalFile.remove(true);
+							terminalFile.remove(true, { ignorePinned: true });
 						} catch (removeError) {
 							console.error("Error removing terminal tab:", removeError);
 						}
 
 						// Show alert for terminal creation failure
-						const errorMessage = error?.message || "Unknown error";
-						alert(
-							strings["error"],
-							`Failed to create terminal: ${errorMessage}`,
-						);
+						if (!isReconnecting) {
+							const errorMessage = error?.message || "Unknown error";
+							alert(
+								strings["error"],
+								`Failed to create terminal: ${errorMessage}`,
+							);
+						}
 
 						reject(error);
 					}
@@ -1385,10 +1477,22 @@ class TerminalManager {
 		terminalFile.onclose = () => {
 			this.closeTerminal(terminalId);
 		};
+		terminalFile.onpinstatechange = (pinned) => {
+			if (!terminalComponent.serverMode || !terminalComponent.pid) return;
+			void this.persistTerminalSession(
+				terminalComponent.pid,
+				terminalFile.filename,
+				pinned,
+			);
+		};
 
 		terminalFile._skipTerminalCloseConfirm = false;
 		const originalRemove = terminalFile.remove.bind(terminalFile);
-		terminalFile.remove = async (force = false) => {
+		terminalFile.remove = async (force = false, options = {}) => {
+			if (terminalFile.pinned && !options?.ignorePinned) {
+				return originalRemove(force, options);
+			}
+
 			if (
 				!terminalFile._skipTerminalCloseConfirm &&
 				this.shouldConfirmTerminalClose()
@@ -1399,7 +1503,7 @@ class TerminalManager {
 			}
 
 			terminalFile._skipTerminalCloseConfirm = false;
-			return originalRemove(force);
+			return originalRemove(force, options);
 		};
 
 		// Terminal event handlers
@@ -1433,6 +1537,7 @@ class TerminalManager {
 					await this.persistTerminalSession(
 						terminalComponent.pid,
 						formattedTitle,
+						terminalFile.pinned,
 					);
 				}
 
@@ -1474,7 +1579,7 @@ class TerminalManager {
 
 			this.closeTerminal(terminalId);
 			terminalFile._skipTerminalCloseConfirm = true;
-			terminalFile.remove(true);
+			terminalFile.remove(true, { ignorePinned: true });
 			toast(message);
 		};
 
@@ -1630,7 +1735,7 @@ class TerminalManager {
 			if (removeTab && terminal.file) {
 				try {
 					terminal.file._skipTerminalCloseConfirm = true;
-					terminal.file.remove(true);
+					terminal.file.remove(true, { ignorePinned: true });
 				} catch (removeError) {
 					console.error("Error removing terminal tab:", removeError);
 				}

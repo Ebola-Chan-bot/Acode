@@ -137,6 +137,7 @@ class Settings {
 			openFileListPos: this.OPEN_FILE_LIST_POS_HEADER,
 			quickTools: this.#IS_TABLET ? 0 : 1,
 			quickToolsTriggerMode: this.QUICKTOOLS_TRIGGER_MODE_TOUCH,
+			appFont: "",
 			editorFont: "Roboto Mono",
 			vibrateOnTap: true,
 			fullscreen: false,
@@ -158,8 +159,6 @@ class Settings {
 			rememberFolders: true,
 			diagonalScrolling: false,
 			reverseScrolling: false,
-			teardropTimeout: 3000,
-			teardropSize: 30,
 			scrollSpeed: constants.SCROLL_SPEED_NORMAL,
 			customTheme: this.#customTheme,
 			relativeLineNumbers: false,
@@ -179,6 +178,7 @@ class Settings {
 			showSponsorSidebarApp: true,
 			showAnnotations: false,
 			lintGutter: true,
+			indentGuides: true,
 			rainbowBrackets: true,
 			pluginsDisabled: {}, // pluginId: true/false
 			lsp: {

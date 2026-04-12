@@ -11,10 +11,13 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as Xterm } from "@xterm/xterm";
+import {
+	getResolvedKeyBindings,
+	getResolvedKeyBindingsVersion,
+} from "cm/commandRegistry";
 import toast from "components/toast";
 import confirm from "dialogs/confirm";
 import fonts from "lib/fonts";
-import keyBindings from "lib/keyBindings";
 import appSettings from "lib/settings";
 import LigaturesAddon from "./ligatures";
 import { getTerminalSettings } from "./terminalDefaults";
@@ -84,6 +87,8 @@ export default class TerminalComponent {
 		this.isConnected = false;
 		this.serverMode = options.serverMode !== false; // Default true
 		this.touchSelection = null;
+		this.parsedAppKeybindings = [];
+		this.parsedAppKeybindingsVersion = -1;
 		this._isDisposed = false;
 		this._sessionCreationPromise = null;
 		this._bootstrapOutputSeen = false;
@@ -382,9 +387,14 @@ export default class TerminalComponent {
 	 * Parse app keybindings into a format usable by the keyboard handler
 	 */
 	parseAppKeybindings() {
+		const version = getResolvedKeyBindingsVersion();
+		if (this.parsedAppKeybindingsVersion === version) {
+			return this.parsedAppKeybindings;
+		}
+
 		const parsedBindings = [];
 
-		Object.values(keyBindings).forEach((binding) => {
+		Object.values(getResolvedKeyBindings()).forEach((binding) => {
 			if (!binding.key) return;
 
 			// Skip editor-only keybindings in terminal
@@ -415,7 +425,7 @@ export default class TerminalComponent {
 						parsed.meta = true;
 					} else {
 						// This is the actual key
-						parsed.key = part;
+						parsed.key = part.toLowerCase();
 					}
 				});
 
@@ -425,7 +435,10 @@ export default class TerminalComponent {
 			});
 		});
 
-		return parsedBindings;
+		this.parsedAppKeybindings = parsedBindings;
+		this.parsedAppKeybindingsVersion = version;
+
+		return this.parsedAppKeybindings;
 	}
 
 	/**
@@ -479,7 +492,7 @@ export default class TerminalComponent {
 						binding.shift === event.shiftKey &&
 						binding.alt === event.altKey &&
 						binding.meta === event.metaKey &&
-						binding.key === event.key,
+						binding.key === event.key.toLowerCase(),
 				);
 
 				if (isAppKeybinding) {
@@ -1101,109 +1114,154 @@ export default class TerminalComponent {
 		this._bootstrapOutputSeen = false;
 		this._pendingFocusAfterBootstrap = false;
 
-		this.websocket = new WebSocket(wsUrl);
+		await new Promise((resolve, reject) => {
+			const websocket = new WebSocket(wsUrl);
+			const CONNECT_TIMEOUT = 5000;
+			let settled = false;
+			let hasOpened = false;
 
-		// The backend replays scrollback immediately after the WebSocket upgrade.
-		// If AttachAddon is only installed in onopen, those first binary frames can
-		// arrive before xterm is listening and the initial MOTD/prompt is lost.
-		if (this.attachAddon) {
-			try {
-				this.attachAddon.dispose();
-			} catch (_) {}
-			this.attachAddon = null;
-		}
-		this.attachAddon = new AttachAddon(this.websocket);
-		this.terminal.loadAddon(this.attachAddon);
-		this.terminal.unicode.activeVersion = "11";
+			this.websocket = websocket;
 
-		this.websocket.onopen = () => {
-			this.isConnected = true;
-			this.onConnect?.();
-
-			// Keep the initial PTY size from the session-create POST. Re-focusing here
-			// opens the soft keyboard before the first shell output arrives, and that
-			// viewport change can still corrupt the initial prompt layout on restored tabs.
-			// Focus is deferred until bootstrap output is actually visible.
-		};
-
-		this.websocket.onmessage = (event) => {
-			if (typeof event.data === "string") {
+			const rejectInitialConnect = (message, error) => {
+				if (settled || hasOpened) return;
+				settled = true;
+				this.isConnected = false;
 				try {
-					const message = JSON.parse(event.data);
-					if (message.type === "exit") {
-						this.onProcessExit?.(message.data);
+					websocket.close();
+				} catch {}
+				reject(error || new Error(message));
+			};
+
+			const connectionTimeout = setTimeout(() => {
+				rejectInitialConnect(
+					`Timed out while connecting to terminal session ${pid}`,
+				);
+			}, CONNECT_TIMEOUT);
+
+			// The backend replays scrollback immediately after the WebSocket upgrade.
+			// If AttachAddon is only installed in onopen, those first binary frames can
+			// arrive before xterm is listening and the initial MOTD/prompt is lost.
+			if (this.attachAddon) {
+				try {
+					this.attachAddon.dispose();
+				} catch (_) {}
+				this.attachAddon = null;
+			}
+			this.attachAddon = new AttachAddon(websocket);
+			this.terminal.loadAddon(this.attachAddon);
+			this.terminal.unicode.activeVersion = "11";
+
+			websocket.onopen = () => {
+				clearTimeout(connectionTimeout);
+				hasOpened = true;
+				this.isConnected = true;
+				this.onConnect?.();
+
+				// Keep the initial PTY size from the session-create POST. Re-focusing here
+				// opens the soft keyboard before the first shell output arrives, and that
+				// viewport change can still corrupt the initial prompt layout on restored tabs.
+				// Focus is deferred until bootstrap output is actually visible.
+
+				if (!settled) {
+					settled = true;
+					resolve();
+				}
+			};
+
+			websocket.onmessage = (event) => {
+				if (typeof event.data === "string") {
+					try {
+						const message = JSON.parse(event.data);
+						if (message.type === "exit") {
+							this.onProcessExit?.(message.data);
+							return;
+						}
+					} catch (error) {
+						// Not a JSON message, let attachAddon handle it
+					}
+				}
+			};
+
+			// Also sniff the data to detect critical Alpine container corruption (e.g. bash/readline broken)
+			websocket.addEventListener("message", async (event) => {
+				this.markBootstrapOutputReady();
+
+				const MAX_SNIFF_BYTES = 4096;
+				const containsBootstrapMarker = /motd|welcome|root@localhost|\[rc:|\[motd:/i;
+
+				try {
+					let text = "";
+					if (typeof event.data === "string") {
+						text = event.data.slice(0, MAX_SNIFF_BYTES);
+					} else if (event.data instanceof ArrayBuffer) {
+						const byteLength = Math.min(event.data.byteLength, MAX_SNIFF_BYTES);
+						const view = new Uint8Array(event.data, 0, byteLength);
+						text = new TextDecoder("utf-8", { fatal: false }).decode(view);
+					} else if (event.data instanceof Blob) {
+						const slice =
+							event.data.size > MAX_SNIFF_BYTES
+								? event.data.slice(0, MAX_SNIFF_BYTES)
+								: event.data;
+						text = await new Response(slice).text();
+					}
+
+					if (!text) {
 						return;
 					}
-				} catch (error) {
-					// Not a JSON message, let attachAddon handle it
-				}
-			}
-		};
 
-		// Also sniff the data to detect critical Alpine container corruption (e.g. bash/readline broken)
-		this.websocket.addEventListener("message", async (event) => {
-			this.markBootstrapOutputReady();
-
-			const MAX_SNIFF_BYTES = 4096;
-			const containsBootstrapMarker = /motd|welcome|root@localhost|\[rc:|\[motd:/i;
-
-			try {
-				let text = "";
-				if (typeof event.data === "string") {
-					text = event.data.slice(0, MAX_SNIFF_BYTES);
-				} else if (event.data instanceof ArrayBuffer) {
-					const byteLength = Math.min(event.data.byteLength, MAX_SNIFF_BYTES);
-					const view = new Uint8Array(event.data, 0, byteLength);
-					text = new TextDecoder("utf-8", { fatal: false }).decode(view);
-				} else if (event.data instanceof Blob) {
-					const slice =
-						event.data.size > MAX_SNIFF_BYTES
-							? event.data.slice(0, MAX_SNIFF_BYTES)
-							: event.data;
-					text = await new Response(slice).text();
-				}
-
-				if (!text) {
-					return;
-				}
-
-				// If the shell finishes bootstrap while the tab is hidden (e.g. automatic
-				// tab switch), xterm keeps the hidden-tab viewport state and the first visible
-				// paint can show stale scrollback instead of the live prompt/MOTD region.
-				// Remember that hidden bootstrap arrived so the next visible-layout sync can
-				// explicitly re-anchor the viewport once the tab becomes visible again.
-				if (!this.container?.offsetParent && containsBootstrapMarker.test(text)) {
-					this._hiddenBootstrapOutputNeedsVisibleAnchor = true;
-				}
-
-				if (this._relocationSniffDisabled) {
-					return;
-				}
-
-				if (
-					text.includes("Error relocating") &&
-					text.includes("symbol not found")
-				) {
-					console.error(
-						"Detected critical Alpine libc corruption! Terminating and triggering reinstall.",
-					);
-					if (this.onCrashData) {
-						this.onCrashData("relocation_error");
+					if (!this.container?.offsetParent && containsBootstrapMarker.test(text)) {
+						this._hiddenBootstrapOutputNeedsVisibleAnchor = true;
 					}
-					this._relocationSniffDisabled = true;
-					clearTimeout(this._relocationSniffTimer);
+
+					if (this._relocationSniffDisabled) {
+						return;
+					}
+
+					if (
+						text.includes("Error relocating") &&
+						text.includes("symbol not found")
+					) {
+						console.error(
+							"Detected critical Alpine libc corruption! Terminating and triggering reinstall.",
+						);
+						if (this.onCrashData) {
+							this.onCrashData("relocation_error");
+						}
+						this._relocationSniffDisabled = true;
+						clearTimeout(this._relocationSniffTimer);
+					}
+				} catch (err) {}
+			});
+
+			websocket.onclose = (event) => {
+				clearTimeout(connectionTimeout);
+				this.isConnected = false;
+
+				if (!hasOpened) {
+					const code = event?.code ? ` (code ${event.code})` : "";
+					const reason = event?.reason ? `: ${event.reason}` : "";
+					rejectInitialConnect(
+						`Terminal session ${pid} is unavailable${code}${reason}`,
+					);
+					return;
 				}
-			} catch (err) {}
+
+				this.onDisconnect?.();
+			};
+
+			websocket.onerror = (error) => {
+				if (!hasOpened) {
+					clearTimeout(connectionTimeout);
+					rejectInitialConnect(
+						`Failed to connect to terminal session ${pid}`,
+						new Error(`Failed to connect to terminal session ${pid}`),
+					);
+					return;
+				}
+
+				this.onError?.(error);
+			};
 		});
-
-		this.websocket.onclose = (event) => {
-			this.isConnected = false;
-			this.onDisconnect?.();
-		};
-
-		this.websocket.onerror = (error) => {
-			this.onError?.(error);
-		};
 	}
 
 	async syncExistingSessionLayoutBeforeReconnect() {
