@@ -219,6 +219,31 @@ class Executor {
       exec(resolve, reject, this.ExecutorType, "loadLibrary", [path]);
     });
   }
+
+  download(url, dst, onProgress) {
+    return new Promise((resolve, reject) => {
+      exec(
+        (msg) => {
+          if (typeof msg === "string") {
+            try {
+              const data = JSON.parse(msg);
+              if (data.type === "progress") {
+                if (typeof onProgress === "function") {
+                  onProgress(data);
+                }
+                return;
+              }
+            } catch (_) {}
+          }
+          resolve(msg);
+        },
+        reject,
+        this.ExecutorType,
+        "download",
+        [url, dst]
+      );
+    });
+  }
 }
 
 //backward compatibility

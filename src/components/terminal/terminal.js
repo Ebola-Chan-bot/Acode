@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Terminal Component using xtermjs
  * Provides a pluggable and customizable terminal interface
  */
@@ -24,6 +24,29 @@ import { getTerminalSettings } from "./terminalDefaults";
 import TerminalThemeManager from "./terminalThemeManager";
 import TerminalTouchSelection from "./terminalTouchSelection";
 
+let terminalEnvironmentGeneration = 0;
+const AXS_READY_MARKER = "__ACODE_AXS_READY__";
+
+// Bump the generation counter to invalidate all in-flight createSessionInternal() calls.
+// Used by terminalManager.closeAllTerminals() to cancel startup code for terminals not yet
+// registered in the terminals map (so dispose() alone cannot reach them).
+export function invalidateTerminalEnvironment() {
+	terminalEnvironmentGeneration++;
+}
+
+// Expose the current generation so callers can snapshot it before an await
+// boundary and later detect invalidations that occurred during the wait.
+export function getTerminalEnvironmentGeneration() {
+	return terminalEnvironmentGeneration;
+}
+
+class TerminalSessionStaleError extends Error {
+	constructor(message = "Terminal session attempt became stale") {
+		super(message);
+		this.name = "TerminalSessionStaleError";
+	}
+}
+
 export default class TerminalComponent {
 	constructor(options = {}) {
 		// Get terminal settings from shared defaults
@@ -37,7 +60,7 @@ export default class TerminalComponent {
 			port: options.port || 8767,
 			renderer: options.renderer || "auto", // 'auto' | 'canvas' | 'webgl'
 			fontSize: terminalSettings.fontSize,
-			fontFamily: terminalSettings.fontFamily,
+			fontFamily: `"${terminalSettings.fontFamily}", monospace`,
 			fontWeight: terminalSettings.fontWeight,
 			theme: TerminalThemeManager.getTheme(terminalSettings.theme),
 			cursorBlink: terminalSettings.cursorBlink,
@@ -66,6 +89,16 @@ export default class TerminalComponent {
 		this.touchSelection = null;
 		this.parsedAppKeybindings = [];
 		this.parsedAppKeybindingsVersion = -1;
+		this._isDisposed = false;
+		this._sessionCreationPromise = null;
+		this._bootstrapOutputSeen = false;
+		this._pendingFocusAfterBootstrap = false;
+		this._visibleLayoutSyncFrame = null;
+		this._visibleLayoutSyncTimeout = null;
+		this._focusLayoutSyncTimeout = null;
+		this._visualViewportSyncHandler = null;
+		this._wasVisibleOnLastLayoutSync = false;
+		this._hiddenBootstrapOutputNeedsVisibleAnchor = false;
 
 		this.init();
 	}
@@ -185,23 +218,22 @@ export default class TerminalComponent {
 	setupResizeHandling() {
 		let resizeTimeout = null;
 		let lastKnownScrollPosition = 0;
+		let wasNearBottomBeforeResize = true;
 		let isResizing = false;
-		let resizeCount = 0;
 		const RESIZE_DEBOUNCE = 100;
-		const MAX_RAPID_RESIZES = 3;
 
 		// Store original dimensions for comparison
 		let originalRows = this.terminal.rows;
-		let originalCols = this.terminal.cols;
 
 		this.terminal.onResize((size) => {
-			// Track resize events
-			resizeCount++;
 			isResizing = true;
 
 			// Store current scroll position before resize
 			if (this.terminal.buffer && this.terminal.buffer.active) {
-				lastKnownScrollPosition = this.terminal.buffer.active.viewportY;
+				const buffer = this.terminal.buffer.active;
+				const maxScroll = Math.max(0, buffer.length - this.terminal.rows);
+				lastKnownScrollPosition = buffer.viewportY;
+				wasNearBottomBeforeResize = buffer.viewportY >= maxScroll - 1;
 			}
 
 			// Clear any existing timeout
@@ -212,19 +244,22 @@ export default class TerminalComponent {
 			// Debounced resize handling
 			resizeTimeout = setTimeout(async () => {
 				try {
-					// Only proceed with server resize if dimensions actually changed significantly
-					const rowDiff = Math.abs(size.rows - originalRows);
-					const colDiff = Math.abs(size.cols - originalCols);
-
-					// If this is a minor resize (likely intermediate state), skip server update
-					if (rowDiff < 2 && colDiff < 2 && resizeCount > 1) {
-						console.log("Skipping minor resize to prevent instability");
-						isResizing = false;
-						resizeCount = 0;
-						return;
-					}
-
-					// Handle server resize
+					// Always sync cols/rows to backend PTY on every client resize.
+					//
+					// The original code only synced when heightRatio < 0.75 (the "keyboard resize"
+					// heuristic below). That fails in several real scenarios on mobile:
+					//   1. Small keyboard height changes (e.g. switching input methods, suggestion
+					//      bar appearing/disappearing) shrink height by <25%, bypassing the threshold.
+					//   2. Width-only changes (screen rotation, split-screen toggle) leave height
+					//      unchanged so heightRatio ≈ 1.0, but cols change and PTY must know.
+					//   3. Animated keyboard open/close fires many incremental resize events; each
+					//      individual step is a tiny delta that never crosses 0.75, yet the
+					//      accumulated drift corrupts output.
+					//   4. Different ROMs / WebView versions report slightly different viewport sizes
+					//      for the same keyboard, making any fixed threshold unreliable.
+					//
+					// Unconditionally syncing is cheap (one small HTTP POST per debounced resize)
+					// and guarantees the PTY always matches the client grid.
 					if (this.serverMode) {
 						await this.resizeTerminal(size.cols, size.rows);
 					}
@@ -256,18 +291,29 @@ export default class TerminalComponent {
 							);
 							this.terminal.scrollToLine(targetScroll);
 						}
+					} else if (wasNearBottomBeforeResize) {
+						// Restoring a stale viewportY after a hidden-tab/IME height change while
+						// the prompt is at the bottom replays a scroll offset that no longer matches
+						// the new viewport height, causing xterm to shift the DOM layer above its
+						// container. If we were already at the live bottom, re-anchor there.
+						this.terminal.scrollToBottom();
 					} else {
-						// Regular resize - preserve scroll position
+						// Regular resize away from the prompt - preserve the user-visible viewport.
 						this.preserveViewportPosition(lastKnownScrollPosition);
 					}
 
 					// Update stored dimensions
 					originalRows = size.rows;
-					originalCols = size.cols;
 
 					// Mark resize as complete
 					isResizing = false;
-					resizeCount = 0;
+
+					// IME animation can shrink the viewport after the tab is visible, causing
+					// WebView to reapply a stale scroll offset that pushes the .xterm layer above
+					// the container. Running visible-layout correction after the debounced resize
+					// settles fixes that late relocation, and also makes hidden terminals that
+					// received MOTD while inactive repaint correctly when they become active.
+					this.scheduleVisibleLayoutSync();
 
 					// Notify touch selection if it exists
 					if (this.touchSelection) {
@@ -276,7 +322,6 @@ export default class TerminalComponent {
 				} catch (error) {
 					console.error("Resize handling failed:", error);
 					isResizing = false;
-					resizeCount = 0;
 				}
 			}, RESIZE_DEBOUNCE);
 		});
@@ -533,6 +578,7 @@ export default class TerminalComponent {
 		try {
 			// Open first to ensure a stable renderer is attached
 			this.terminal.open(container);
+			this.bindVisualViewportLayoutSync();
 
 			// Renderer selection: 'canvas' (default core), 'webgl', or 'auto'
 			if (
@@ -560,17 +606,18 @@ export default class TerminalComponent {
 				this.loadLigaturesAddon();
 			}
 
-			// First render pass: schedule a fit + focus once the frame is ready
+			// First render pass: schedule a fit once the frame is ready.
+			// Auto-focusing here opens the soft keyboard before MOTD/prompt arrives and
+			// can shrink the viewport while restored tabs are still computing their first
+			// PTY size, causing hard-wrapped output on first paint.
 			if (typeof requestAnimationFrame === "function") {
 				requestAnimationFrame(() => {
 					this.fitAddon.fit();
-					this.terminal.focus();
 					this.setupTouchSelection();
 				});
 			} else {
 				setTimeout(() => {
 					this.fitAddon.fit();
-					this.terminal.focus();
 					this.setupTouchSelection();
 				}, 0);
 			}
@@ -592,61 +639,431 @@ export default class TerminalComponent {
 			);
 		}
 
+		if (this._sessionCreationPromise) {
+			return this._sessionCreationPromise;
+		}
+
+		// The same terminal tab can hit createSession twice while mount/reconnect work
+		// overlaps. Without a per-instance single-flight guard, one attempt can consume
+		// the ready marker while the other times out and tears down a healthy session.
+		const sessionCreationPromise = this.createSessionInternal();
+		this._sessionCreationPromise = sessionCreationPromise;
+
 		try {
+			return await sessionCreationPromise;
+		} finally {
+			if (this._sessionCreationPromise === sessionCreationPromise) {
+				this._sessionCreationPromise = null;
+			}
+		}
+	}
+
+	async createSessionInternal() {
+		try {
+			// Use the pre-install generation snapshot if available.  Waiters capture
+		// this BEFORE the shared install operation so that an uninstall that
+		// happens between install completion and createSessionInternal entry
+		// (which bumps the generation) is detected as stale.
+		let observedEnvironmentGeneration =
+			this._preInstallEnvironmentGeneration ?? terminalEnvironmentGeneration;
+		delete this._preInstallEnvironmentGeneration;
+			const ensureAttemptIsStillValid = () => {
+				if (this._isDisposed) {
+					throw new TerminalSessionStaleError();
+				}
+
+				// Terminal startup mutates a single shared AXS/rootfs environment.
+				// If another terminal has already created a newer healthy session,
+				// this older async flow must fail fast instead of repairing and
+				// tearing down the newer instance underneath it.
+				if (terminalEnvironmentGeneration !== observedEnvironmentGeneration) {
+					throw new TerminalSessionStaleError();
+				}
+			};
+
 			// Check if terminal is installed before starting AXS
-			if (!(await Terminal.isInstalled())) {
+			const installed = await Terminal.isInstalled();
+			ensureAttemptIsStillValid();
+			if (!installed) {
 				throw new Error(
 					"Terminal not installed. Please install terminal first.",
 				);
 			}
 
 			// Start AXS if not running
-			if (!(await Terminal.isAxsRunning())) {
-				await Terminal.startAxs(false, () => {}, console.error);
+			const axsRunning = await Terminal.isAxsRunning();
+			ensureAttemptIsStillValid();
 
-				// Check if AXS started with interval polling
-				const maxRetries = 10;
-				let retries = 0;
-				while (retries < maxRetries) {
-					await new Promise((resolve) => setTimeout(resolve, 1000));
-					if (await Terminal.isAxsRunning()) {
-						break;
+			// Poll by hitting the actual HTTP endpoint, not just checking PID liveness.
+			// isAxsRunning() only does kill -0 on the PID file, which can return true
+			// while the HTTP server inside proot is still booting.
+			const fetchWithTimeout = async (url, options = {}, timeoutMs = 2000) => {
+				const hasAbortSignalTimeout =
+					typeof AbortSignal !== "undefined" &&
+					typeof AbortSignal.timeout === "function";
+
+				if (hasAbortSignalTimeout) {
+					return fetch(url, {
+						...options,
+						signal: AbortSignal.timeout(timeoutMs),
+					});
+				}
+
+				if (typeof AbortController === "undefined") {
+					return fetch(url, options);
+				}
+
+				const controller = new AbortController();
+				const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+				try {
+					return await fetch(url, {
+						...options,
+						signal: controller.signal,
+					});
+				} finally {
+					clearTimeout(timeoutId);
+				}
+			};
+
+			const pollAxs = async (maxRetries = 30, intervalMs = 1000) => {
+				for (let i = 0; i < maxRetries; i++) {
+					// Exit early when the terminal was disposed or the environment was
+					// invalidated (e.g. uninstall called closeAllTerminals while this
+					// terminal was still initializing and not yet in the terminals map).
+					ensureAttemptIsStillValid();
+					await new Promise((r) => setTimeout(r, intervalMs));
+					ensureAttemptIsStillValid();
+					try {
+						const resp = await fetchWithTimeout(
+							`http://localhost:${this.options.port}/`,
+							{ method: "GET" },
+							2000,
+						);
+						if (resp.ok || resp.status < 500) return true;
+					} catch (_) {
+						// HTTP not yet reachable
 					}
-					retries++;
+				}
+				return false;
+			};
+
+			const writeLifecycleLog = (message, isError = false) => {
+				const cleanMessage = String(message ?? "").replace(/^(stdout|stderr)\s+/, "");
+				if (cleanMessage) {
+					startupLifecycleOutputSeen = true;
+					if (startupProgressNoticeTimer) {
+						clearTimeout(startupProgressNoticeTimer);
+						startupProgressNoticeTimer = null;
+					}
+					this.terminal.write(
+						`${isError ? "\x1b[31m" : ""}${cleanMessage}\x1b[0m\r\n`,
+					);
+					if (isError) {
+						console.error(cleanMessage);
+					} else {
+						console.log(cleanMessage);
+					}
+				}
+			};
+
+			const runSharedEnvironmentOperation = async (type, run) => {
+				if (this.environmentCoordinator?.runExclusive) {
+					return this.environmentCoordinator.runExclusive({
+						type,
+						run: async () => {
+							// Shared startup/repair/refresh owners intentionally bump the terminal
+							// environment generation before waiters resume their own local checks.
+							// Reusing the stale pre-wait generation here makes the waiter abort its
+							// normal connect path, leaving the tab stuck on the transient waiting
+							// screen and forcing the UI to fall back to the internal terminal_N id.
+							observedEnvironmentGeneration = terminalEnvironmentGeneration;
+							return run();
+						},
+					});
 				}
 
-				// If AXS still not running after retries, throw error
-				if (!(await Terminal.isAxsRunning())) {
-					toast("Failed to start AXS server after multiple attempts");
-					//throw new Error("Failed to start AXS server after multiple attempts");
+				return run();
+			};
+
+			let startupProgressNoticeTimer = null;
+			let startupLifecycleOutputSeen = false;
+			const clearStartupProgressNoticeTimer = () => {
+				if (startupProgressNoticeTimer) {
+					clearTimeout(startupProgressNoticeTimer);
+					startupProgressNoticeTimer = null;
 				}
+			};
+
+			const showStartupProgressNotice = (message, delayMs = 0) => {
+				clearStartupProgressNoticeTimer();
+				const writeNotice = () => {
+					if (startupLifecycleOutputSeen) {
+						return;
+					}
+					this.terminal.write(`\x1b[36m${message}\x1b[0m\r\n`);
+				};
+
+				// Terminal startup currently waits for the shared AXS/proot bootstrap before
+				// the first lifecycle line arrives. Without an early foreground notice, users
+				// see a long black screen and misread normal startup work as a freeze.
+				if (delayMs <= 0) {
+					writeNotice();
+					return;
+				}
+
+				startupProgressNoticeTimer = setTimeout(() => {
+					startupProgressNoticeTimer = null;
+					writeNotice();
+				}, delayMs);
+			};
+
+			const syncTerminalLayout = async () => {
+				const hasRenderableLayout = () => {
+					if (!this.container) {
+						return false;
+					}
+
+					const rect = this.container.getBoundingClientRect();
+					return rect.width >= 10 && rect.height >= 10;
+				};
+
+				const runFit = () => {
+					// Shared startup waiters can resume after their tab has already moved to the
+					// background. Fitting xterm while the container is hidden collapses cols to a
+					// bogus tiny value, and the subsequent POST /terminals creates a PTY with an
+					// incorrect grid size. Only pre-fit when the terminal has a real renderable layout.
+					if (!hasRenderableLayout()) {
+						return;
+					}
+
+					this.fit();
+				};
+
+				if (typeof requestAnimationFrame === "function") {
+					await new Promise((resolve) => {
+						requestAnimationFrame(() => {
+							runFit();
+							resolve();
+						});
+					});
+					return;
+				}
+
+				runFit();
+			};
+
+			const startAxsAndWaitForReady = async (installing = false) => {
+				let readyResolve;
+				let readyReject;
+				let readySettled = false;
+				let readyTimeoutId = null;
+				startupLifecycleOutputSeen = false;
+				showStartupProgressNotice("Starting terminal environment...");
+				showStartupProgressNotice(
+					"Terminal environment is still starting. Waiting for AXS output...",
+					1500,
+				);
+
+				const readyPromise = new Promise((resolve, reject) => {
+					readyResolve = resolve;
+					readyReject = reject;
+				});
+
+				const settleReady = (resolver, value) => {
+					if (readySettled) {
+						return;
+					}
+
+					readySettled = true;
+					if (readyTimeoutId) {
+						clearTimeout(readyTimeoutId);
+						readyTimeoutId = null;
+					}
+					resolver(value);
+				};
+
+				const handleLifecycleMessage = (message, isError = false) => {
+					const cleanMessage = String(message ?? "").replace(/^(stdout|stderr)\s+/, "");
+
+					if (cleanMessage.includes(AXS_READY_MARKER)) {
+						settleReady(readyResolve, true);
+						return;
+					}
+
+					writeLifecycleLog(message, isError);
+
+					if (cleanMessage.startsWith("exit ")) {
+						settleReady(
+							readyReject,
+							new Error(`AXS exited before becoming ready: ${cleanMessage}`),
+						);
+					}
+				};
+
+				const startResult = await Terminal.startAxs(
+					installing,
+					(message) => handleLifecycleMessage(message, false),
+					(message) => handleLifecycleMessage(message, true),
+				);
+
+				if (installing) {
+					clearStartupProgressNoticeTimer();
+					return startResult;
+				}
+
+				try {
+					await readyPromise;
+				} finally {
+					clearStartupProgressNoticeTimer();
+				}
+			};
+
+			if (!axsRunning) {
+				await runSharedEnvironmentOperation("startup", async () => {
+					ensureAttemptIsStillValid();
+					const sharedAxsRunning = await Terminal.isAxsRunning();
+					ensureAttemptIsStillValid();
+					if (sharedAxsRunning) {
+						return;
+					}
+
+					await startAxsAndWaitForReady(false);
+				});
+				ensureAttemptIsStillValid();
 			}
+
+			// Always wait for the HTTP endpoint, even if the PID is already alive.
+			// kill -0 only tells us the outer process exists; the embedded server may
+			// still be starting, especially after crash recovery on slower devices.
+			// Cold starts can spend tens of seconds finishing apk work inside proot.
+			// If we repair too early, we kill the first AXS instance just as it becomes
+			// reachable and force an unnecessary reinstall loop.
+			const initialPollRetries = axsRunning ? 10 : 1;
+			if (!(await pollAxs(initialPollRetries))) {
+				// Uninstall usually trips ensureAttemptIsStillValid() inside pollAxs(), but
+				// it can still race in after the last checkpoint and before pollAxs() returns
+				// false. Re-check here so that narrow stale case is not reported as a generic
+				// "AXS HTTP endpoint is not reachable after startup" failure.
+				ensureAttemptIsStillValid();
+				throw new Error("AXS HTTP endpoint is not reachable after startup");
+			}
+
+			// Session size must be measured after the mounted terminal has had a frame to lay
+			// out. If PTY creation runs with the pre-fit grid, the first prompt is wrapped using
+			// a bogus narrow width and later resize cannot un-break the already rendered line.
+			await syncTerminalLayout();
 
 			const requestBody = {
 				cols: this.terminal.cols,
 				rows: this.terminal.rows,
 			};
 
-			const response = await fetch(
-				`http://localhost:${this.options.port}/terminals`,
-				{
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify(requestBody),
-				},
-			);
+			const parsePtyOpenError = (payload) => {
+				if (typeof payload !== "string") {
+					return null;
+				}
 
-			if (!response.ok) {
-				throw new Error(`HTTP error! status: ${response.status}`);
+				const trimmed = payload.trim();
+				if (!trimmed.startsWith("{")) {
+					return null;
+				}
+
+				try {
+					const parsed = JSON.parse(trimmed);
+					return typeof parsed?.error === "string" ? parsed.error : null;
+				} catch {
+					return null;
+				}
+			};
+
+			const openTerminalSession = async () => {
+				const response = await fetch(
+					`http://localhost:${this.options.port}/terminals`,
+					{
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify(requestBody),
+					},
+				);
+
+				if (!response.ok) {
+					throw new Error(`HTTP error! status: ${response.status}`);
+				}
+
+				const rawData = await response.text();
+				let pid = rawData.trim();
+				if (pid.startsWith("{")) {
+					try {
+						const parsed = JSON.parse(pid);
+						if (parsed.pid != null) {
+							pid = String(parsed.pid);
+						}
+					} catch {}
+				}
+				return {
+					data: pid,
+					ptyOpenError: parsePtyOpenError(rawData),
+				};
+			};
+
+			let sessionResult = await openTerminalSession();
+			ensureAttemptIsStillValid();
+
+			// Detect PTY errors from axs server (e.g. incompatible binary)
+			if (sessionResult.ptyOpenError?.includes("Failed to open PTY")) {
+				writeLifecycleLog("AXS PTY creation failed, refreshing axs binary and retrying...", true);
+
+				await runSharedEnvironmentOperation("refresh", async () => {
+					// Refresh replaces the shared axs binary/process. Older in-flight
+					// session attempts must stop before they can attach to the old state.
+
+					try {
+						ensureAttemptIsStillValid();
+						await Terminal.stopAxs();
+					} catch (_) {
+						/* ignore */
+					}
+
+					await Terminal.refreshAxs(
+						(message) => writeLifecycleLog(message, false),
+						(message) => writeLifecycleLog(message, true),
+						true,
+					);
+					ensureAttemptIsStillValid();
+
+					await startAxsAndWaitForReady(false);
+					ensureAttemptIsStillValid();
+
+					if (!(await pollAxs(1))) {
+						ensureAttemptIsStillValid();
+						throw new Error("Failed to restart AXS after refreshing binary");
+					}
+				});
+				ensureAttemptIsStillValid();
+
+				sessionResult = await openTerminalSession();
+				ensureAttemptIsStillValid();
+				if (sessionResult.ptyOpenError?.includes("Failed to open PTY")) {
+					throw new Error("Failed to open PTY");
+				}
 			}
 
-			const data = await response.text();
-			this.pid = data.trim();
+			this.pid = sessionResult.data.trim();
 			return this.pid;
 		} catch (error) {
-			console.error("Failed to create terminal session:", error);
+			if (error?.name === "TerminalSessionStaleError") {
+				throw error;
+			}
+			// User-initiated tab close during shared environment startup is not an
+			// error — it produces a sharedEnvironmentInterrupted exception that the
+			// caller already handles gracefully.
+			if (error?.sharedEnvironmentInterrupted) {
+				console.log("Terminal session cancelled by user:", error.message);
+			} else {
+				console.error("Failed to create terminal session:", error);
+			}
 			throw error;
 		}
 	}
@@ -662,13 +1079,33 @@ export default class TerminalComponent {
 			);
 		}
 
-		if (!pid) {
-			pid = await this.createSession();
+		const isReconnecting = !!pid;
+
+		try {
+			if (!pid) {
+				pid = await this.createSession();
+			}
+		} catch (error) {
+			if (error?.name === "TerminalSessionStaleError") {
+				return;
+			}
+			throw error;
 		}
 
 		this.pid = pid;
+		this._relocationSniffDisabled = false;
+		clearTimeout(this._relocationSniffTimer);
+		this._relocationSniffTimer = setTimeout(() => {
+			this._relocationSniffDisabled = true;
+		}, 15000);
+
+		if (isReconnecting) {
+			await this.syncExistingSessionLayoutBeforeReconnect();
+		}
 
 		const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
+		this._bootstrapOutputSeen = false;
+		this._pendingFocusAfterBootstrap = false;
 
 		await new Promise((resolve, reject) => {
 			const websocket = new WebSocket(wsUrl);
@@ -694,20 +1131,29 @@ export default class TerminalComponent {
 				);
 			}, CONNECT_TIMEOUT);
 
+			// The backend replays scrollback immediately after the WebSocket upgrade.
+			// If AttachAddon is only installed in onopen, those first binary frames can
+			// arrive before xterm is listening and the initial MOTD/prompt is lost.
+			if (this.attachAddon) {
+				try {
+					this.attachAddon.dispose();
+				} catch (_) {}
+				this.attachAddon = null;
+			}
+			this.attachAddon = new AttachAddon(websocket);
+			this.terminal.loadAddon(this.attachAddon);
+			this.terminal.unicode.activeVersion = "11";
+
 			websocket.onopen = () => {
 				clearTimeout(connectionTimeout);
 				hasOpened = true;
 				this.isConnected = true;
 				this.onConnect?.();
 
-				// Load attach addon after connection
-				this.attachAddon = new AttachAddon(websocket);
-				this.terminal.loadAddon(this.attachAddon);
-				this.terminal.unicode.activeVersion = "11";
-
-				// Focus terminal and ensure it's ready
-				this.terminal.focus();
-				this.fit();
+				// Keep the initial PTY size from the session-create POST. Re-focusing here
+				// opens the soft keyboard before the first shell output arrives, and that
+				// viewport change can still corrupt the initial prompt layout on restored tabs.
+				// Focus is deferred until bootstrap output is actually visible.
 
 				if (!settled) {
 					settled = true;
@@ -716,7 +1162,6 @@ export default class TerminalComponent {
 			};
 
 			websocket.onmessage = (event) => {
-				// Handle text messages (exit events)
 				if (typeof event.data === "string") {
 					try {
 						const message = JSON.parse(event.data);
@@ -728,8 +1173,58 @@ export default class TerminalComponent {
 						// Not a JSON message, let attachAddon handle it
 					}
 				}
-				// For binary data or non-exit text messages, let attachAddon handle them
 			};
+
+			// Also sniff the data to detect critical Alpine container corruption (e.g. bash/readline broken)
+			websocket.addEventListener("message", async (event) => {
+				this.markBootstrapOutputReady();
+
+				const MAX_SNIFF_BYTES = 4096;
+				const containsBootstrapMarker = /motd|welcome|root@localhost|\[rc:|\[motd:/i;
+
+				try {
+					let text = "";
+					if (typeof event.data === "string") {
+						text = event.data.slice(0, MAX_SNIFF_BYTES);
+					} else if (event.data instanceof ArrayBuffer) {
+						const byteLength = Math.min(event.data.byteLength, MAX_SNIFF_BYTES);
+						const view = new Uint8Array(event.data, 0, byteLength);
+						text = new TextDecoder("utf-8", { fatal: false }).decode(view);
+					} else if (event.data instanceof Blob) {
+						const slice =
+							event.data.size > MAX_SNIFF_BYTES
+								? event.data.slice(0, MAX_SNIFF_BYTES)
+								: event.data;
+						text = await new Response(slice).text();
+					}
+
+					if (!text) {
+						return;
+					}
+
+					if (!this.container?.offsetParent && containsBootstrapMarker.test(text)) {
+						this._hiddenBootstrapOutputNeedsVisibleAnchor = true;
+					}
+
+					if (this._relocationSniffDisabled) {
+						return;
+					}
+
+					if (
+						text.includes("Error relocating") &&
+						text.includes("symbol not found")
+					) {
+						console.error(
+							"Detected critical Alpine libc corruption! Terminating and triggering reinstall.",
+						);
+						if (this.onCrashData) {
+							this.onCrashData("relocation_error");
+						}
+						this._relocationSniffDisabled = true;
+						clearTimeout(this._relocationSniffTimer);
+					}
+				} catch (err) {}
+			});
 
 			websocket.onclose = (event) => {
 				clearTimeout(connectionTimeout);
@@ -757,10 +1252,30 @@ export default class TerminalComponent {
 					return;
 				}
 
-				console.error("WebSocket error:", error);
 				this.onError?.(error);
 			};
 		});
+	}
+
+	async syncExistingSessionLayoutBeforeReconnect() {
+		if (!this.serverMode || !this.pid || !this.container) {
+			return;
+		}
+
+		const rect = this.container.getBoundingClientRect();
+		if (rect.width < 10 || rect.height < 10) {
+			return;
+		}
+
+		// Restored sessions replay scrollback immediately after the WebSocket upgrade.
+		// Waiting only for ResizeObserver proves the tab has dimensions, but it does not
+		// guarantee the corresponding POST /resize has already reached the backend. When
+		// reconnect races ahead of that resize, the restored prompt can replay with the
+		// previous narrow grid, causing split prompt text or a blank first frame.
+		this.fit();
+		if (this.terminal.cols > 0 && this.terminal.rows > 0) {
+			await this.resizeTerminal(this.terminal.cols, this.terminal.rows);
+		}
 	}
 
 	/**
@@ -815,6 +1330,30 @@ export default class TerminalComponent {
 		}
 	}
 
+	rebuildWebglRenderer() {
+		if (!this.webglAddon) {
+			return false;
+		}
+
+		try {
+			// When a tab transitions from hidden to visible under Android WebView, the WebGL
+			// renderer can remain bound to stale hidden-tab surfaces even after a normal
+			// fit/refresh cycle. Rebuilding the renderer at that visibility boundary forces
+			// xterm to bind fresh canvases to the live viewport.
+			this.webglAddon.dispose();
+			const addon = new WebglAddon();
+			if (typeof addon.onContextLoss === "function") {
+				addon.onContextLoss(() => this._handleWebglContextLoss());
+			}
+			this.terminal.loadAddon(addon);
+			this.webglAddon = addon;
+			return true;
+		} catch (error) {
+			console.error("Failed to rebuild WebGL renderer:", error);
+			return false;
+		}
+	}
+
 	/**
 	 * Write line to terminal
 	 * @param {string} data - Data to write
@@ -830,11 +1369,192 @@ export default class TerminalComponent {
 		this.terminal.clear();
 	}
 
+	markBootstrapOutputReady() {
+		if (this._bootstrapOutputSeen) {
+			return;
+		}
+
+		this._bootstrapOutputSeen = true;
+		this.scheduleVisibleLayoutSync();
+		if (this._pendingFocusAfterBootstrap) {
+			this._pendingFocusAfterBootstrap = false;
+			this.focusWhenReady();
+		}
+	}
+
+	scheduleVisibleLayoutSync() {
+		if (this._visibleLayoutSyncFrame !== null) {
+			cancelAnimationFrame?.(this._visibleLayoutSyncFrame);
+			this._visibleLayoutSyncFrame = null;
+		}
+		if (this._visibleLayoutSyncTimeout !== null) {
+			clearTimeout(this._visibleLayoutSyncTimeout);
+			this._visibleLayoutSyncTimeout = null;
+		}
+
+		const runSync = () => {
+			this._visibleLayoutSyncFrame = null;
+			this.syncVisibleLayout();
+		};
+
+		if (typeof requestAnimationFrame === "function") {
+			this._visibleLayoutSyncFrame = requestAnimationFrame(runSync);
+		} else {
+			setTimeout(runSync, 0);
+		}
+
+		// The black block can reappear one more frame later when WebView finishes the IME
+		// viewport scroll after xterm already fit to the new height. Run one delayed sync in
+		// the settled layout as well so the relocated xterm layer snaps back into place.
+		this._visibleLayoutSyncTimeout = setTimeout(() => {
+			this._visibleLayoutSyncTimeout = null;
+			this.syncVisibleLayout();
+		}, 180);
+	}
+
+	bindVisualViewportLayoutSync() {
+		if (this._visualViewportSyncHandler) {
+			return;
+		}
+
+		// ResizeObserver covers the terminal container itself, but Android WebView can apply
+		// an extra visualViewport scroll after the IME animation settles. That late shift can
+		// leave a non-scrollable black block, so visible-layout correction must also listen
+		// to visualViewport changes directly.
+		this._visualViewportSyncHandler = () => {
+			this.scheduleVisibleLayoutSync();
+		};
+
+		window.addEventListener("resize", this._visualViewportSyncHandler, {
+			passive: true,
+		});
+		window.visualViewport?.addEventListener(
+			"resize",
+			this._visualViewportSyncHandler,
+			{ passive: true },
+		);
+		window.visualViewport?.addEventListener(
+			"scroll",
+			this._visualViewportSyncHandler,
+			{ passive: true },
+		);
+	}
+
+	unbindVisualViewportLayoutSync() {
+		if (!this._visualViewportSyncHandler) {
+			return;
+		}
+
+		window.removeEventListener("resize", this._visualViewportSyncHandler);
+		window.visualViewport?.removeEventListener(
+			"resize",
+			this._visualViewportSyncHandler,
+		);
+		window.visualViewport?.removeEventListener(
+			"scroll",
+			this._visualViewportSyncHandler,
+		);
+		this._visualViewportSyncHandler = null;
+	}
+
+	syncVisibleLayout() {
+		if (!this.container || !this.terminal) {
+			return;
+		}
+
+		const rect = this.container.getBoundingClientRect();
+		if (rect.width < 10 || rect.height < 10) {
+			return;
+		}
+
+		const xtermElement = this.container.querySelector(".xterm");
+		const viewportElement = this.container.querySelector(".xterm-viewport");
+		const isCurrentlyVisible = !!this.container.offsetParent;
+		const becameVisible =
+			isCurrentlyVisible && !this._wasVisibleOnLastLayoutSync;
+		this._wasVisibleOnLastLayoutSync = isCurrentlyVisible;
+		const isViewportRelocated =
+			xtermElement &&
+			Math.abs(xtermElement.getBoundingClientRect().top - rect.top) > 4;
+
+		this.fit();
+		if (becameVisible && this.webglAddon) {
+			this.rebuildWebglRenderer();
+		}
+
+		const shouldAnchorHiddenBootstrapViewport =
+			becameVisible && this._hiddenBootstrapOutputNeedsVisibleAnchor;
+
+		if (isViewportRelocated || shouldAnchorHiddenBootstrapViewport) {
+			// When a previously hidden terminal is reactivated with the IME already affecting
+			// layout, WebView/xterm can restore a stale internal viewport scroll offset, causing
+			// xterm.top to go negative and leaving a black gap. Re-anchor both xterm's logical
+			// viewport and the DOM scroller to the live bottom row as soon as the tab is visible.
+			// The same re-anchor is required when bootstrap output arrived while the tab was
+			// hidden: otherwise the first visible paint can show stale scrollback.
+			this.container.scrollTop = 0;
+			this.terminal.scrollToBottom();
+			if (viewportElement) {
+				viewportElement.scrollTop = viewportElement.scrollHeight;
+			}
+			this._hiddenBootstrapOutputNeedsVisibleAnchor = false;
+		}
+
+		if (this.terminal.rows > 0) {
+			this.terminal.clearTextureAtlas?.();
+			this.terminal.refresh(0, this.terminal.rows - 1);
+		}
+	}
+
+	focusTerminalTextareaWithoutScroll() {
+		// When reactivating a terminal while the IME is already open, WebView may
+		// auto-scroll the focused xterm textarea using stale hidden-tab geometry,
+		// shifting the xterm layer above the visible container. Focusing without
+		// viewport scrolling keeps input active while leaving layout ownership to
+		// the existing fit/resize path.
+		this.terminal.textarea.focus({ preventScroll: true });
+	}
+
+	/**
+	 * Focus terminal
+	 */
+	focusWhenReady() {
+		if (this.serverMode && !this._bootstrapOutputSeen) {
+			this._pendingFocusAfterBootstrap = true;
+			return;
+		}
+
+		if (typeof requestAnimationFrame === "function") {
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					this.focus();
+				});
+			});
+			return;
+		}
+
+		setTimeout(() => {
+			this.focus();
+		}, 0);
+	}
+
 	/**
 	 * Focus terminal
 	 */
 	focus() {
-		this.terminal.focus();
+		this.focusTerminalTextareaWithoutScroll();
+		this.scheduleVisibleLayoutSync();
+		if (this._focusLayoutSyncTimeout !== null) {
+			clearTimeout(this._focusLayoutSyncTimeout);
+		}
+		// Android WebView can apply one more IME-driven viewport shift after the
+		// textarea is already focused. Re-running the visible-layout sync slightly
+		// later catches that final relocation and corrects the negative top position
+		// that leaves a black block at the bottom.
+		this._focusLayoutSyncTimeout = setTimeout(() => {
+			this._focusLayoutSyncTimeout = null;
+			this.scheduleVisibleLayoutSync();
+		}, 320);
 	}
 
 	/**
@@ -985,10 +1705,25 @@ export default class TerminalComponent {
 	 * Load terminal font if it's not already loaded
 	 */
 	async loadTerminalFont() {
-		const fontFamily = this.options.fontFamily;
+		// Use original name without quotes for Acode fonts.get
+		const fontFamily = this.options.fontFamily
+			.replace(/^"|"$/g, "")
+			.replace(/",\s*monospace$/, "");
 		if (fontFamily && fonts.get(fontFamily)) {
 			try {
 				await fonts.loadFont(fontFamily);
+				// Make Xterm.js aware that the font is fully loaded
+				// Setting options.fontFamily triggers a re-eval of character dimensions
+				if (this.terminal) {
+					this.terminal.options.fontFamily = `"${fontFamily}", monospace`;
+					if (this.webglAddon) {
+						try {
+							this.webglAddon.clearTextureAtlas();
+						} catch (e) {}
+					}
+					// Ensure terminal dimensions are updated after font load changes char size
+					setTimeout(() => this.fit(), 100);
+				}
 			} catch (error) {
 				console.warn(`Failed to load terminal font ${fontFamily}:`, error);
 			}
@@ -1049,6 +1784,22 @@ export default class TerminalComponent {
 	 * Terminate terminal session
 	 */
 	async terminate() {
+		clearTimeout(this._relocationSniffTimer);
+		this._relocationSniffDisabled = true;
+		if (this._focusLayoutSyncTimeout !== null) {
+			clearTimeout(this._focusLayoutSyncTimeout);
+			this._focusLayoutSyncTimeout = null;
+		}
+		if (this._visibleLayoutSyncFrame !== null) {
+			cancelAnimationFrame?.(this._visibleLayoutSyncFrame);
+			this._visibleLayoutSyncFrame = null;
+		}
+		if (this._visibleLayoutSyncTimeout !== null) {
+			clearTimeout(this._visibleLayoutSyncTimeout);
+			this._visibleLayoutSyncTimeout = null;
+		}
+		this.unbindVisualViewportLayoutSync();
+
 		if (this.websocket) {
 			this.websocket.close();
 		}
@@ -1061,8 +1812,8 @@ export default class TerminalComponent {
 						method: "POST",
 					},
 				);
-			} catch (error) {
-				console.error("Failed to terminate terminal:", error);
+			} catch {
+				// Expected: terminal process may have already exited and acodex-server disconnected
 			}
 		}
 	}
@@ -1071,6 +1822,7 @@ export default class TerminalComponent {
 	 * Dispose terminal
 	 */
 	dispose() {
+		this._isDisposed = true;
 		this.terminate();
 
 		// Dispose touch selection

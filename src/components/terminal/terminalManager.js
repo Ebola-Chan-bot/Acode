@@ -1,10 +1,10 @@
-/**
+﻿/**
  * Terminal Manager
  * Handles terminal session creation and management
  */
 
 import EditorFile from "lib/editorFile";
-import TerminalComponent from "./terminal";
+import TerminalComponent, { invalidateTerminalEnvironment, getTerminalEnvironmentGeneration } from "./terminal";
 import TerminalTouchSelection from "./terminalTouchSelection";
 import "@xterm/xterm/css/xterm.css";
 import quickTools from "components/quickTools";
@@ -18,10 +18,396 @@ import helpers from "utils/helpers";
 
 const TERMINAL_SESSION_STORAGE_KEY = "acodeTerminalSessions";
 
+
 class TerminalManager {
 	constructor() {
 		this.terminals = new Map();
 		this.terminalCounter = 0;
+		this.sharedEnvironmentOperation = null;
+		this.reservedTerminalNumbers = new Set();
+		this.nextSharedEnvironmentOperationId = 1;
+		this.lastAlertedSharedEnvironmentInterruptionId = null;
+		this.lastAlertedSharedEnvironmentFailureId = null;
+		this.lastHandledSharedEnvironmentFailureId = null;
+	}
+
+	writeSharedEnvironmentNotice(component, message, color = "36") {
+		if (!component || typeof component.write !== "function") return;
+		component.write(`\x1b[${color}m${message}\x1b[0m\r\n`);
+	}
+
+	createSharedEnvironmentInterruptedError(
+		ownerName,
+		operationTitle,
+		operationId = null,
+		options = {},
+	) {
+		const { silent = false, reason = null } = options;
+		const error = new Error(
+			`${ownerName}'s terminal ${operationTitle} was interrupted because that terminal was closed.`,
+		);
+		error.sharedEnvironmentInterrupted = true;
+		error.sharedEnvironmentOperationId = operationId;
+		error.sharedEnvironmentSilent = silent;
+		error.sharedEnvironmentInterruptionReason = reason;
+		return error;
+	}
+
+	createSharedEnvironmentFailureError(
+		type,
+		ownerName,
+		result,
+		operationId = null,
+	) {
+		const operationTitle = this.getSharedEnvironmentOperationTitle(type);
+		const message =
+			result?.error ||
+			`${ownerName}'s terminal ${operationTitle} failed.`;
+		const error = new Error(message);
+		error.sharedEnvironmentFailure = true;
+		error.sharedEnvironmentOperationId = operationId;
+		error.sharedEnvironmentOperationType = type;
+		error.sharedEnvironmentResult = result || null;
+		return error;
+	}
+
+	showSharedEnvironmentInterruptedAlertOnce(error) {
+		if (!error?.sharedEnvironmentInterrupted) {
+			return;
+		}
+
+		if (error?.sharedEnvironmentSilent) {
+			return;
+		}
+
+		const operationId = error.sharedEnvironmentOperationId;
+		if (
+			operationId !== null &&
+			operationId !== undefined &&
+			this.lastAlertedSharedEnvironmentInterruptionId === operationId
+		) {
+			return;
+		}
+
+		this.lastAlertedSharedEnvironmentInterruptionId =
+			operationId ?? this.lastAlertedSharedEnvironmentInterruptionId;
+		alert(strings["error"], error.message);
+	}
+
+	showSharedEnvironmentFailureAlertOnce(error) {
+		if (!error?.sharedEnvironmentFailure) {
+			return;
+		}
+
+		const operationId = error.sharedEnvironmentOperationId;
+		if (
+			operationId !== null &&
+			operationId !== undefined &&
+			this.lastAlertedSharedEnvironmentFailureId === operationId
+		) {
+			return;
+		}
+
+		this.lastAlertedSharedEnvironmentFailureId =
+			operationId ?? this.lastAlertedSharedEnvironmentFailureId;
+		alert(
+			strings["error"],
+			`Terminal environment setup failed: ${error.message}`,
+		);
+	}
+
+	handleSharedEnvironmentFailure(error, terminalId, terminalName, terminalFile, terminalComponent) {
+		const operationId = error?.sharedEnvironmentOperationId;
+		const failureAlreadyHandled =
+			operationId !== null &&
+			operationId !== undefined &&
+			this.lastHandledSharedEnvironmentFailureId === operationId;
+
+		// The owner terminal can still be outside this.terminals while its first
+		// initialization is in-flight. Clean that transient tab explicitly so a
+		// shared install/download failure does not leave one broken owner tab behind
+		// while every registered terminal is closed via closeAllTerminals().
+		const isRegisteredTerminal = Array.from(this.terminals.values()).some(
+			(terminal) => terminal.file === terminalFile,
+		);
+		if (!isRegisteredTerminal) {
+			try {
+				terminalComponent?.dispose?.();
+			} catch {}
+
+			try {
+				terminalFile._skipTerminalCloseConfirm = true;
+				terminalFile.remove(true);
+			} catch (removeError) {
+				console.error("Error removing failed shared terminal tab:", removeError);
+			}
+		}
+
+		if (!failureAlreadyHandled) {
+			this.lastHandledSharedEnvironmentFailureId =
+				operationId ?? this.lastHandledSharedEnvironmentFailureId;
+
+			// A download/configure failure belongs to the shared terminal environment,
+			// not to a single tab. Closing every terminal immediately prevents the UI
+			// from silently deleting only the owner tab and then letting waiting tabs
+			// restart the same failing install path one by one.
+			this.closeAllTerminals(
+				"Terminal environment setup failed. Closing all terminal tabs...",
+			);
+		}
+
+		this.showSharedEnvironmentFailureAlertOnce(error);
+	}
+
+	getSharedEnvironmentOperationTitle(type) {
+		switch (type) {
+			case "startup":
+				return "startup";
+			case "install":
+				return "installation";
+			case "repair":
+				return "repair";
+			case "refresh":
+				return "repair";
+			case "uninstall":
+				return "uninstall";
+			case "uninstall-full":
+				return "full uninstall";
+			default:
+				return "maintenance";
+		}
+	}
+
+	async runSharedEnvironmentOperation({
+		type,
+		ownerName,
+		ownerTerminalId = null,
+		progressTerminal = null,
+		run,
+	}) {
+		const progressComponent = progressTerminal?.component || null;
+		const operationTitle = this.getSharedEnvironmentOperationTitle(type);
+
+		if (this.sharedEnvironmentOperation) {
+			const activeOperation = this.sharedEnvironmentOperation;
+			const activeTitle = this.getSharedEnvironmentOperationTitle(
+				activeOperation.type,
+			);
+			if (progressComponent) {
+				this.writeSharedEnvironmentNotice(
+					progressComponent,
+					`Waiting for ${activeOperation.ownerName}'s terminal ${activeTitle} to finish...`,
+				);
+			}
+
+			try {
+				await activeOperation.promise;
+				if (progressComponent && !progressComponent.isConnected) {
+					// Waiter terminals are still empty at this point: they only contain the shared
+					// "Waiting..." / "Rechecking..." notices. Keeping those lines makes the tab look
+					// stuck even after the local re-check creates and connects a fresh PTY, because
+					// the user lands on stale status text instead of the new MOTD/prompt. Clear the
+					// transient wait buffer before resuming the waiter's normal startup path.
+					progressComponent.clear();
+				}
+
+				// Waiters must resume via their own normal path after the owner finishes.
+				// Reusing the owner's resolved promise skips the waiter's local re-checks,
+				// which can leave that terminal stuck showing the wait message even though
+				// the shared install/startup already completed successfully.
+				return run();
+			} catch (error) {
+				const failureMessage = error?.sharedEnvironmentInterrupted
+					? `Shared terminal ${activeTitle} was interrupted. Closing this terminal...`
+					: `Shared terminal ${activeTitle} failed. Closing this terminal...`;
+				if (progressComponent) {
+					this.writeSharedEnvironmentNotice(
+						progressComponent,
+						failureMessage,
+						"31",
+					);
+				}
+				throw error;
+			}
+		}
+
+		const operation = {
+			id: this.nextSharedEnvironmentOperationId++,
+			type,
+			ownerName: ownerName || "Terminal maintenance",
+			ownerTerminalId,
+			interrupted: false,
+			settled: false,
+			interrupt: null,
+			promise: null,
+		};
+
+		let rejectInterruptedOperation;
+		const interruptedPromise = new Promise((_, reject) => {
+			rejectInterruptedOperation = reject;
+		});
+
+		const runPromise = (async () => await run())();
+		void runPromise.catch(() => {});
+		const sharedPromise = runPromise.then((result) => {
+			// Shared install/repair operations must fail as one unit. If the owner
+			// returns { success: false }, letting waiters continue into their own run()
+			// causes the exact behavior seen in runtime logs: one terminal closes while
+			// the remaining tabs each retry the same broken download/configure flow.
+			if (result?.success === false) {
+				throw this.createSharedEnvironmentFailureError(
+					type,
+					ownerName || "Terminal maintenance",
+					result,
+					operation.id,
+				);
+			}
+
+			return result;
+		});
+		void sharedPromise.catch(() => {});
+
+		operation.interrupt = (error) => {
+			if (operation.interrupted || operation.settled) {
+				return;
+			}
+
+			operation.interrupted = true;
+			rejectInterruptedOperation(error);
+		};
+
+		operation.promise = Promise.race([
+			sharedPromise,
+			interruptedPromise,
+		]).finally(() => {
+			operation.settled = true;
+			try {
+			} finally {
+				if (this.sharedEnvironmentOperation === operation) {
+					this.sharedEnvironmentOperation = null;
+				}
+			}
+		});
+
+		this.sharedEnvironmentOperation = operation;
+		return operation.promise;
+	}
+
+	interruptSharedEnvironmentOperationForTerminal(terminalId, terminalName) {
+		const operation = this.sharedEnvironmentOperation;
+		if (!operation || !terminalId) {
+			return;
+		}
+
+		if (operation.ownerTerminalId !== terminalId) {
+			return;
+		}
+
+		const operationTitle = this.getSharedEnvironmentOperationTitle(operation.type);
+		operation.interrupt?.(
+			this.createSharedEnvironmentInterruptedError(
+				terminalName || operation.ownerName || "Shared terminal",
+				operationTitle,
+				operation.id,
+			),
+		);
+	}
+
+	async preemptSharedEnvironmentOperationForUninstall(noticeMessage) {
+		const operation = this.sharedEnvironmentOperation;
+		if (!operation) {
+			return;
+		}
+
+		if (operation.type === "uninstall" || operation.type === "uninstall-full") {
+			await operation.promise.catch(() => {});
+			return;
+		}
+
+		const operationTitle = this.getSharedEnvironmentOperationTitle(operation.type);
+
+		// Uninstall owns the whole shared terminal environment. If the user requests
+		// uninstall while install/startup/repair is still running, treating the in-flight
+		// operation as a normal failure produces a burst of per-tab error dialogs even
+		// though the correct UX is to close every terminal and let uninstall proceed.
+		// Interrupt the shared operation first, mark the interruption as silent, and wait
+		// for the old owner/waiters to tear themselves down before running uninstall.
+		operation.interrupt?.(
+			this.createSharedEnvironmentInterruptedError(
+				operation.ownerName || "Terminal maintenance",
+				operationTitle,
+				operation.id,
+				{ silent: true, reason: "uninstall" },
+			),
+		);
+
+		this.closeAllTerminals(noticeMessage);
+		await operation.promise.catch(() => {});
+	}
+
+	closeAllTerminals(noticeMessage = null) {
+		// Bump the environment generation so that in-flight createSessionInternal()
+		// calls throw TerminalSessionStaleError at their next ensureAttemptIsStillValid()
+		// checkpoint.  This covers terminals still initializing (not yet in this.terminals)
+		// which dispose() alone cannot reach.
+		invalidateTerminalEnvironment();
+
+		const terminals = Array.from(this.terminals.entries());
+
+		for (const [terminalId, terminal] of terminals) {
+			if (noticeMessage) {
+				this.writeSharedEnvironmentNotice(
+					terminal.component,
+					noticeMessage,
+					"33",
+				);
+			}
+
+			this.closeTerminal(terminalId, true);
+		}
+
+		// Terminals stuck in waitForTerminalLayoutReady (waiting for
+		// _activationReadyPromise) are not yet registered in this.terminals,
+		// so closeTerminal above cannot reach them.  Find them via
+		// editorManager.files and force-close them so uninstall does not
+		// leave orphaned terminal tabs behind.
+		const allFiles = window.editorManager?.files;
+		if (Array.isArray(allFiles)) {
+			const terminalFiles = allFiles.filter(
+				(f) => f.type === "terminal",
+			);
+			for (const f of terminalFiles) {
+				try {
+					f._skipTerminalCloseConfirm = true;
+					f.remove(true);
+				} catch {}
+			}
+		}
+	}
+
+	async uninstallTerminalEnvironment(deleteCache = false) {
+		const type = deleteCache ? "uninstall-full" : "uninstall";
+		const noticeMessage =
+			"Terminal environment is being uninstalled. Closing all terminal tabs...";
+
+		await this.preemptSharedEnvironmentOperationForUninstall(noticeMessage);
+
+		await this.runSharedEnvironmentOperation({
+			type,
+			ownerName: "Settings",
+			ownerTerminalId: null,
+			run: async () => {
+				this.closeAllTerminals(noticeMessage);
+
+				if (deleteCache) {
+					await Terminal.uninstallFull();
+				} else {
+					await Terminal.uninstall();
+				}
+
+				return { success: true };
+			},
+		});
 	}
 
 	extractTerminalNumber(name) {
@@ -40,6 +426,10 @@ class TerminalManager {
 			if (Number.isInteger(number) && number > 0) {
 				usedNumbers.add(number);
 			}
+		}
+
+		for (const number of this.reservedTerminalNumbers.values()) {
+			usedNumbers.add(number);
 		}
 
 		let nextNumber = 1;
@@ -217,6 +607,7 @@ class TerminalManager {
 
 	async restorePersistedSessions() {
 		const sessions = await this.getPersistedSessions();
+
 		if (!sessions.length) return;
 
 		const manager = window.editorManager;
@@ -235,6 +626,7 @@ class TerminalManager {
 					pinned: session.pinned === true,
 					reconnecting: true,
 					render: false,
+					deferInitialRestoreActivation: true,
 				});
 				if (instance) restoredTerminals.push(instance);
 			} catch (error) {
@@ -256,10 +648,20 @@ class TerminalManager {
 			toast(message);
 		}
 
-		if (activeFileId && manager?.getFile) {
-			const fileToRestore = manager.getFile(activeFileId, "id");
-			fileToRestore?.makeActive();
-		} else if (!manager?.activeFile && restoredTerminals.length) {
+		// Restored terminal tabs transiently steal editor focus while openFile creates
+		// them. If we trust manager.activeFile here, the last created terminal becomes
+		// the implicit "active" tab and its hidden onfocus reconnect runs immediately
+		// against a 0x0 container, corrupting the restored layout.
+		for (const restoredTerminal of restoredTerminals) {
+			restoredTerminal.armDeferredInitialization?.();
+		}
+
+		const fileToRestore = activeFileId && manager?.getFile
+			? manager.getFile(activeFileId, "id")
+			: null;
+		if (fileToRestore) {
+			fileToRestore.makeActive();
+		} else if (restoredTerminals.length) {
 			restoredTerminals[0]?.file?.makeActive();
 		}
 	}
@@ -276,6 +678,11 @@ class TerminalManager {
 			const shouldRender = render !== false;
 			const isServerMode = serverMode !== false;
 			const isReconnecting = reconnecting === true;
+			const shouldDeferHiddenReconnect =
+				!shouldRender && isServerMode && isReconnecting && !!terminalOptions.pid;
+			const shouldArmDeferredRestoreInitialization =
+				shouldDeferHiddenReconnect &&
+				terminalOptions.deferInitialRestoreActivation === true;
 
 			const terminalId = `terminal_${++this.terminalCounter}`;
 			const providedName =
@@ -283,24 +690,35 @@ class TerminalManager {
 			const terminalNumber = providedName
 				? this.extractTerminalNumber(providedName)
 				: this.getNextAvailableTerminalNumber();
+			if (Number.isInteger(terminalNumber) && terminalNumber > 0) {
+				this.reservedTerminalNumbers.add(terminalNumber);
+			}
 			const terminalName = providedName || `Terminal ${terminalNumber}`;
 			const titlePrefix = terminalNumber
 				? `Terminal ${terminalNumber}`
 				: terminalName;
-
-			// Check if terminal is installed before proceeding
-			if (isServerMode) {
-				const installationResult = await this.checkAndInstallTerminal();
-				if (!installationResult.success) {
-					throw new Error(installationResult.error);
-				}
-			}
 
 			// Create terminal component
 			const terminalComponent = new TerminalComponent({
 				serverMode: isServerMode,
 				...terminalOptions,
 			});
+			if (shouldDeferHiddenReconnect) {
+				terminalComponent.pid = String(terminalOptions.pid).trim();
+			}
+			terminalComponent._restoreInitializationArmed =
+				!shouldArmDeferredRestoreInitialization;
+			terminalComponent.terminalDisplayName = terminalName;
+			terminalComponent.environmentCoordinator = {
+				runExclusive: ({ type, run }) =>
+					this.runSharedEnvironmentOperation({
+						type,
+						ownerName: terminalName,
+						ownerTerminalId: terminalId,
+						progressTerminal: { component: terminalComponent },
+						run,
+					}),
+			};
 
 			// Create container
 			const terminalContainer = tag("div", {
@@ -326,17 +744,115 @@ class TerminalManager {
 				pinned,
 				render: shouldRender,
 			});
+			terminalFile.onfocus = () => {
+				terminalFile._resolveActivationReady?.();
+				terminalFile._resolveActivationReady = null;
+				terminalFile._activationReadyPromise = null;
+
+				requestAnimationFrame(() => {
+					terminalComponent.syncVisibleLayout?.();
+					terminalComponent.focusWhenReady();
+				});
+			};
+			terminalFile.onclose = () => {
+				this.interruptSharedEnvironmentOperationForTerminal(
+					terminalId,
+					terminalName,
+				);
+
+				try {
+					terminalComponent.dispose();
+				} catch {}
+			};
 
 			// Wait for tab creation and setup
 			return await new Promise((resolve, reject) => {
 				setTimeout(async () => {
 					try {
+						const initializeTerminalSession = async () => {
+							const activeFile = window.editorManager?.activeFile;
+							const isActiveTerminalTab = activeFile?.id === terminalFile.id;
+
+							// Hidden restored terminals must never mount or reconnect until their tab is
+							// actually active. Startup could otherwise initialize background tabs here,
+							// opening fresh PTYs on invisible grids and causing mismatched restored state.
+							// NOTE: hasVisibleLayout (offsetParent) is intentionally NOT checked here.
+							// onfocus fires synchronously inside makeActive() before the DOM applies
+							// the new active-tab CSS, so offsetParent is always null at this point
+							// even for legitimate user tab-clicks, making the check a false negative.
+							if (
+								shouldDeferHiddenReconnect &&
+								!terminalComponent._deferredInitializationPromise &&
+								!isActiveTerminalTab
+							) {
+								return null;
+							}
+
+							// Restored terminals created with render:false are not attached to the
+							// DOM yet. Mounting xterm and opening the PTY while the tab is hidden
+							// makes the first POST /terminals use a transient narrow grid, so the
+							// initial "root@localhost" prompt is hard-wrapped before the tab is
+							// ever shown. Hidden restored sessions must wait until first focus.
+							if (terminalComponent._deferredInitializationPromise) {
+								return terminalComponent._deferredInitializationPromise;
+							}
+
+							terminalComponent._deferredInitializationPromise = (async () => {
 						// Mount terminal component
 						terminalComponent.mount(terminalContainer);
+						this.setupTerminalResizeObserver(
+							terminalFile,
+							terminalComponent,
+							terminalId,
+						);
+
+						if (terminalComponent.serverMode) {
+							// Snapshot the environment generation BEFORE entering the shared
+							// install operation.  Waiters may block here for the full duration
+							// of an install; if an uninstall fires right after install settles,
+							// the generation bump happens before createSessionInternal() starts
+							// and would be invisible to its own fresh snapshot.  Passing the
+							// pre-install value lets createSessionInternal detect the stale
+							// environment and throw TerminalSessionStaleError instead of the
+							// non-silent "Terminal not installed" error.
+							terminalComponent._preInstallEnvironmentGeneration =
+								getTerminalEnvironmentGeneration();
+
+							// Run install check after mount so install logs can stream into this
+							// exact terminal tab (via progressTerminal.component), instead of
+							// opening a separate "Terminal Installation" tab. Keeping it inside
+							// this init try/catch also reuses the same cleanup path on failure
+							// (dispose component + remove broken tab).
+							const installationResult = await this.checkAndInstallTerminal(
+								false,
+								{
+									component: terminalComponent,
+									terminalId,
+								},
+								{ ownerTerminalId: terminalId, ownerName: terminalName },
+							);
+							if (!installationResult.success) {
+								throw new Error(installationResult.error);
+							}
+						}
 
 						// Connect to session if in server mode
 						if (terminalComponent.serverMode) {
+						await this.waitForTerminalLayoutReady(
+							terminalFile,
+							terminalComponent,
+							terminalId,
+						);
 							await terminalComponent.connectToSession(terminalOptions.pid);
+							// Track whether this is a restored (reconnected) session so onProcessExit
+							// can distinguish unexpected exits from a stale previous session vs.
+							// the user intentionally running `exit` in a fresh shell.
+							terminalComponent._isReconnectedSession = isReconnecting;
+							if (isReconnecting) {
+								terminalComponent.write(
+									"\x1b[36m[Restored existing terminal session. MOTD is only shown when a new shell starts.]\x1b[0m\r\n",
+								);
+							}
 						} else {
 							// For local mode, just write a welcome message
 							terminalComponent.write(
@@ -354,6 +870,79 @@ class TerminalManager {
 							uniqueId,
 							titlePrefix,
 						);
+
+								return uniqueId;
+							})();
+
+							return terminalComponent._deferredInitializationPromise;
+						};
+
+						if (shouldDeferHiddenReconnect) {
+							const uniqueId = terminalComponent.pid;
+							const instance = {
+								id: uniqueId,
+								name: terminalName,
+								terminalNumber,
+								component: terminalComponent,
+								file: terminalFile,
+								container: terminalContainer,
+								armDeferredInitialization: () => {
+									terminalComponent._restoreInitializationArmed = true;
+								},
+							};
+
+							terminalFile.onfocus = async () => {
+								try {
+									if (!terminalComponent._restoreInitializationArmed) {
+										return;
+									}
+									const initializedId = await initializeTerminalSession();
+									if (!initializedId) {
+										return;
+									}
+									terminalComponent.focusWhenReady();
+								} catch (error) {
+									if (
+										error?.name === "TerminalSessionStaleError" ||
+										error?.sharedEnvironmentInterrupted
+									) {
+										this.closeTerminal(uniqueId, true);
+										this.showSharedEnvironmentInterruptedAlertOnce(error);
+										return;
+									}
+
+									if (error?.sharedEnvironmentFailure) {
+										this.handleSharedEnvironmentFailure(
+											error,
+											terminalId,
+											terminalName,
+											terminalFile,
+											terminalComponent,
+										);
+										return;
+									}
+
+									console.error(
+										`Failed to initialize restored terminal ${uniqueId}:`,
+										error,
+									);
+									this.closeTerminal(uniqueId, true);
+									alert(
+										strings["error"],
+										`Failed to restore terminal: ${terminalName}`,
+									);
+								}
+							};
+
+							this.terminals.set(uniqueId, instance);
+							if (Number.isInteger(terminalNumber) && terminalNumber > 0) {
+								this.reservedTerminalNumbers.delete(terminalNumber);
+							}
+							resolve(instance);
+							return;
+						}
+
+						const uniqueId = await initializeTerminalSession();
 
 						const instance = {
 							id: uniqueId,
@@ -373,8 +962,55 @@ class TerminalManager {
 								terminalFile.pinned,
 							);
 						}
+						if (Number.isInteger(terminalNumber) && terminalNumber > 0) {
+							this.reservedTerminalNumbers.delete(terminalNumber);
+						}
 						resolve(instance);
 					} catch (error) {
+						if (Number.isInteger(terminalNumber) && terminalNumber > 0) {
+							this.reservedTerminalNumbers.delete(terminalNumber);
+						}
+						if (error?.name === "TerminalSessionStaleError") {
+							try {
+								terminalComponent.dispose();
+							} catch {}
+
+							try {
+								terminalFile._skipTerminalCloseConfirm = true;
+								terminalFile.remove(true);
+							} catch {}
+
+							resolve(null);
+							return;
+						}
+
+						if (error?.sharedEnvironmentInterrupted) {
+							try {
+								terminalComponent.dispose();
+							} catch {}
+
+							try {
+								terminalFile._skipTerminalCloseConfirm = true;
+								terminalFile.remove(true);
+							} catch {}
+
+							this.showSharedEnvironmentInterruptedAlertOnce(error);
+							resolve(null);
+							return;
+						}
+
+						if (error?.sharedEnvironmentFailure) {
+							this.handleSharedEnvironmentFailure(
+								error,
+								terminalId,
+								terminalName,
+								terminalFile,
+								terminalComponent,
+							);
+							resolve(null);
+							return;
+						}
+
 						console.error("Failed to initialize terminal:", error);
 
 						// Cleanup on failure - dispose component and remove broken tab
@@ -409,6 +1045,9 @@ class TerminalManager {
 				}, 100);
 			});
 		} catch (error) {
+			if (Number.isInteger(terminalNumber) && terminalNumber > 0) {
+				this.reservedTerminalNumbers.delete(terminalNumber);
+			}
 			console.error("Failed to create terminal:", error);
 			throw error;
 		}
@@ -416,61 +1055,101 @@ class TerminalManager {
 
 	/**
 	 * Check if terminal is installed and install if needed
+	 * @param {boolean} [forceReinstall=false] - Whether to force reinstall even if already installed.
+	 * Usually false for normal terminal creation. Set to true only for recovery flows
+	 * (currently relocation_error auto-repair) to bypass the "already installed"
+	 * early return and run a full reinstall.
 	 * @returns {Promise<{success: boolean, error?: string}>}
 	 */
-	async checkAndInstallTerminal() {
-		try {
-			// Check if terminal is already installed
-			const isInstalled = await Terminal.isInstalled();
-			if (isInstalled) {
-				return { success: true };
-			}
+	async checkAndInstallTerminal(
+		forceReinstall = false,
+		progressTerminal = null,
+		options = {},
+	) {
+		const { skipSharedLock = false, ownerName = null } = options;
+		const runInstall = async () => {
+			try {
+				// Check if terminal is already installed
+				const isInstalled = await Terminal.isInstalled();
+				if (isInstalled && !forceReinstall) {
+					return { success: true };
+				}
 
-			// Check if terminal is supported on this device
-			const isSupported = await Terminal.isSupported();
-			if (!isSupported) {
-				return {
-					success: false,
-					error: "Terminal is not supported on this device architecture",
-				};
-			}
+				// Check if terminal is supported on this device
+				const isSupported = await Terminal.isSupported();
+				if (!isSupported) {
+					return {
+						success: false,
+						error: "Terminal is not supported on this device architecture",
+					};
+				}
 
-			// Create installation progress terminal
-			const installTerminal = await this.createInstallationTerminal();
-
-			// Install terminal with progress logging
-			const installResult = await Terminal.install(
-				(message) => {
-					// Remove stdout/stderr prefix for
-					const cleanMessage = message.replace(/^(stdout|stderr)\s+/, "");
-					installTerminal.component.write(`${cleanMessage}\r\n`);
-				},
-				(error) => {
-					// Remove stdout/stderr prefix
-					const cleanError = error.replace(/^(stdout|stderr)\s+/, "");
+				// Create installation progress terminal (or reuse current one)
+				const installTerminal =
+					progressTerminal || (await this.createInstallationTerminal());
+				if (progressTerminal?.component) {
 					installTerminal.component.write(
-						`\x1b[31mError: ${cleanError}\x1b[0m\r\n`,
+						"\x1b[33mInstalling terminal environment...\x1b[0m\r\n",
 					);
-				},
-			);
+				}
 
-			// Only return success if Terminal.install() indicates success (exit code 0)
-			if (installResult === true) {
-				return { success: true };
-			} else {
+				// Install terminal with progress logging
+				const installResult = await Terminal.install(
+					(message) => {
+						// Remove stdout/stderr prefix for
+						const cleanMessage = message.replace(/^(stdout|stderr)\s+/, "");
+						installTerminal.component.write(`${cleanMessage}\r\n`);
+						console.log("[install]", cleanMessage); // 仅调试用
+					},
+					(error) => {
+						// Remove stdout/stderr prefix
+						const cleanError = error.replace(/^(stdout|stderr)\s+/, "");
+						installTerminal.component.write(
+							`\x1b[31mError: ${cleanError}\x1b[0m\r\n`,
+						);
+						console.error("[install]", cleanError); // 仅调试用
+					},
+				);
+
+				// Only return success if Terminal.install() indicates success (exit code 0)
+				if (installResult === true || installResult?.success === true) {
+					return { success: true };
+				} else {
+					const installError =
+						typeof installResult === "object" && installResult
+							? installResult.error
+							: null;
+					return {
+						success: false,
+						error:
+							installError ||
+							"Terminal installation failed - process did not exit with code 0",
+					};
+				}
+			} catch (error) {
+				console.error("Terminal installation failed:", error);
 				return {
 					success: false,
-					error:
-						"Terminal installation failed - process did not exit with code 0",
+					error: `Terminal installation failed: ${error.message}`,
 				};
 			}
-		} catch (error) {
-			console.error("Terminal installation failed:", error);
-			return {
-				success: false,
-				error: `Terminal installation failed: ${error.message}`,
-			};
+		};
+
+		if (skipSharedLock) {
+			return runInstall();
 		}
+
+		return this.runSharedEnvironmentOperation({
+			type: forceReinstall ? "repair" : "install",
+			ownerName:
+				ownerName ||
+				progressTerminal?.component?.terminalDisplayName ||
+				"Terminal maintenance",
+			ownerTerminalId:
+				options.ownerTerminalId || progressTerminal?.terminalId || null,
+			progressTerminal,
+			run: runInstall,
+		});
 	}
 
 	/**
@@ -554,6 +1233,187 @@ class TerminalManager {
 	}
 
 	/**
+	 * Bind the ResizeObserver before session creation so the first PTY size is
+	 * derived from the real tab dimensions instead of the transient narrow width
+	 * that appears while the tab is still entering the layout.
+	 * @param {EditorFile} terminalFile - Terminal file instance
+	 * @param {TerminalComponent} terminalComponent - Terminal component
+	 * @param {string} terminalId - Terminal ID
+	 */
+	setupTerminalResizeObserver(terminalFile, terminalComponent, terminalId) {
+		if (terminalFile._resizeObserver) {
+			return;
+		}
+
+		terminalFile._initialLayoutReady = false;
+		terminalFile._activationReadyPromise = null;
+		terminalFile._resolveActivationReady = null;
+		terminalFile._initialLayoutReadyPromise = new Promise((resolve) => {
+			terminalFile._resolveInitialLayoutReady = resolve;
+		});
+
+		let resizeTimeout = null;
+		const RESIZE_DEBOUNCE = 200;
+		let lastWidth = 0;
+		let lastHeight = 0;
+
+		const resizeObserver = new ResizeObserver((entries) => {
+			const entry = entries && entries[0];
+			const cr = entry?.contentRect;
+			const width = cr?.width ?? terminalFile.content?.clientWidth ?? 0;
+			const height = cr?.height ?? terminalFile.content?.clientHeight ?? 0;
+
+			if (resizeTimeout) {
+				clearTimeout(resizeTimeout);
+			}
+
+			resizeTimeout = setTimeout(() => {
+				try {
+					if (!terminalComponent.terminal || !terminalComponent.container) {
+						return;
+					}
+
+					if (width < 10 || height < 10) {
+						return;
+					}
+
+					if (
+						Math.abs(width - lastWidth) > 0.5 ||
+						Math.abs(height - lastHeight) > 0.5 ||
+						!terminalFile._initialLayoutReady
+					) {
+						terminalComponent.fit();
+						lastWidth = width;
+						lastHeight = height;
+					}
+
+					if (!terminalFile._initialLayoutReady) {
+						terminalFile._initialLayoutReady = true;
+						terminalFile._resolveInitialLayoutReady?.();
+						terminalFile._resolveInitialLayoutReady = null;
+					}
+				} catch (error) {
+					console.error(`Resize error for terminal ${terminalId}:`, error);
+				}
+			}, RESIZE_DEBOUNCE);
+		});
+
+		const containerElement = terminalFile.content;
+		if (containerElement && containerElement instanceof Element) {
+			resizeObserver.observe(containerElement);
+			terminalFile._resizeObserver = resizeObserver;
+		} else {
+			console.warn("Terminal container not available for ResizeObserver");
+		}
+	}
+
+	/**
+	 * Wait for terminal layout to stabilize before connecting to session.
+	 * The first PTY inherits xterm's current cols/rows, so reconnecting before the
+	 * tab finishes entering layout can permanently hard-wrap the first prompt.
+	 */
+	async waitForTerminalLayoutReady(terminalFile, terminalComponent, terminalId) {
+		const containerElement = terminalFile.content;
+		if (!(containerElement instanceof Element)) {
+			throw new Error(
+				`Terminal ${terminalId} container is not available for initial layout`,
+			);
+		}
+
+		const hasRenderableTerminalLayout = () => {
+			const outerRect = containerElement.getBoundingClientRect();
+			const innerRect = terminalComponent.container?.getBoundingClientRect();
+
+			return (
+				outerRect.width >= 10 &&
+				outerRect.height >= 10 &&
+				innerRect?.width >= 10 &&
+				innerRect?.height >= 10
+			);
+		};
+
+		const waitForRenderableTerminalLayout = async () => {
+			if (hasRenderableTerminalLayout()) {
+				return;
+			}
+
+			await new Promise((resolve, reject) => {
+				const startTime = Date.now();
+				const pollLayout = () => {
+					if (hasRenderableTerminalLayout()) {
+						resolve();
+						return;
+					}
+
+					// Active tab selection fires before WebView finishes applying the new
+					// tab CSS and xterm's own container catches up. Waiting for the actual
+					// mounted xterm box prevents connectToSession from seeing 0x0 and
+					// opening a PTY on an invisible grid that later paints as black.
+					if (Date.now() - startTime >= 4000) {
+						reject(
+							new Error(
+								`Terminal ${terminalId} xterm container did not become renderable before session connect`,
+							),
+						);
+						return;
+					}
+
+					if (typeof requestAnimationFrame === "function") {
+						requestAnimationFrame(pollLayout);
+						return;
+					}
+
+					setTimeout(pollLayout, 16);
+				};
+
+				pollLayout();
+			});
+		};
+
+		if (terminalFile._initialLayoutReady && hasRenderableTerminalLayout()) {
+			return;
+		}
+
+		const isActiveTerminalTab =
+			window.editorManager?.activeFile?.id === terminalFile.id;
+		if (!isActiveTerminalTab) {
+			if (!terminalFile._activationReadyPromise) {
+				terminalFile._activationReadyPromise = new Promise((resolve) => {
+					terminalFile._resolveActivationReady = resolve;
+				});
+			}
+
+			await terminalFile._activationReadyPromise;
+
+			if (terminalFile._initialLayoutReady) {
+				return;
+			}
+		}
+
+		const waitForObserver = terminalFile._initialLayoutReadyPromise;
+		if (!waitForObserver) {
+			throw new Error(
+				`Terminal ${terminalId} layout observer is not ready before session connect`,
+			);
+		}
+
+		await Promise.race([
+			waitForObserver,
+			new Promise((_, reject) => {
+				setTimeout(() => {
+					reject(
+						new Error(
+							`Terminal ${terminalId} did not receive an initial layout event before session connect`,
+						),
+					);
+				}, 4000);
+			}),
+		]);
+
+		await waitForRenderableTerminalLayout();
+	}
+
+	/**
 	 * Setup terminal event handlers
 	 * @param {EditorFile} terminalFile - Terminal file instance
 	 * @param {TerminalComponent} terminalComponent - Terminal component
@@ -565,6 +1425,16 @@ class TerminalManager {
 		terminalId,
 		titlePrefix = terminalId,
 	) {
+		// Reuse a stable display name inside debug-only close logs. The previous
+		// instrumentation referenced an out-of-scope terminalName and crashed the
+		// remove path after uninstall had already started closing tabs.
+		const terminalDisplayName =
+			terminalComponent.terminalDisplayName || terminalFile.filename || titlePrefix;
+		this.setupTerminalResizeObserver(
+			terminalFile,
+			terminalComponent,
+			terminalId,
+		);
 		const textarea = terminalComponent.terminal?.textarea;
 		if (textarea) {
 			const onFocus = () => {
@@ -596,25 +1466,14 @@ class TerminalManager {
 
 		// Handle tab focus/blur
 		terminalFile.onfocus = () => {
-			// Guarded fit on focus: only fit if cols/rows would change, then focus
-			const run = () => {
-				try {
-					const pd = terminalComponent.fitAddon?.proposeDimensions?.();
-					if (
-						pd &&
-						(pd.cols !== terminalComponent.terminal.cols ||
-							pd.rows !== terminalComponent.terminal.rows)
-					) {
-						terminalComponent.fitAddon.fit();
-					}
-				} catch {}
-				terminalComponent.focus();
-			};
-			if (typeof requestAnimationFrame === "function") {
-				requestAnimationFrame(run);
-			} else {
-				setTimeout(run, 0);
-			}
+			terminalFile._resolveActivationReady?.();
+			terminalFile._resolveActivationReady = null;
+			terminalFile._activationReadyPromise = null;
+
+			requestAnimationFrame(() => {
+				terminalComponent.syncVisibleLayout?.();
+				terminalComponent.focusWhenReady();
+			});
 		};
 
 		// Handle tab close
@@ -649,63 +1508,6 @@ class TerminalManager {
 			terminalFile._skipTerminalCloseConfirm = false;
 			return originalRemove(force, options);
 		};
-
-		// Enhanced resize handling with debouncing
-		let resizeTimeout = null;
-		const RESIZE_DEBOUNCE = 200;
-		let lastResizeTime = 0;
-
-		let lastWidth = 0;
-		let lastHeight = 0;
-		const resizeObserver = new ResizeObserver((entries) => {
-			const now = Date.now();
-			const entry = entries && entries[0];
-			const cr = entry?.contentRect;
-			const width = cr?.width ?? terminalFile.content?.clientWidth ?? 0;
-			const height = cr?.height ?? terminalFile.content?.clientHeight ?? 0;
-
-			// Clear any pending resize
-			if (resizeTimeout) {
-				clearTimeout(resizeTimeout);
-			}
-
-			// Debounce rapid resize events (common during keyboard open/close)
-			resizeTimeout = setTimeout(() => {
-				try {
-					// Check if terminal is still available and mounted
-					if (!terminalComponent.terminal || !terminalComponent.container) {
-						return;
-					}
-
-					// Only fit if actual size changed to reduce reflows
-					if (
-						Math.abs(width - lastWidth) > 0.5 ||
-						Math.abs(height - lastHeight) > 0.5
-					) {
-						terminalComponent.fit();
-						lastWidth = width;
-						lastHeight = height;
-					}
-
-					// Update last resize time
-					lastResizeTime = now;
-				} catch (error) {
-					console.error(`Resize error for terminal ${terminalId}:`, error);
-				}
-			}, RESIZE_DEBOUNCE);
-		});
-
-		// Wait for the terminal container to be available, then observe it
-		setTimeout(() => {
-			const containerElement = terminalFile.content;
-			if (containerElement && containerElement instanceof Element) {
-				resizeObserver.observe(containerElement);
-				// store observer so we can disconnect on close
-				terminalFile._resizeObserver = resizeObserver;
-			} else {
-				console.warn("Terminal container not available for ResizeObserver");
-			}
-		}, 200);
 
 		// Terminal event handlers
 		terminalComponent.onConnect = () => {
@@ -752,7 +1554,7 @@ class TerminalManager {
 			}
 		};
 
-		terminalComponent.onProcessExit = (exitData) => {
+		terminalComponent.onProcessExit = async (exitData) => {
 			// Format exit message based on exit code and signal
 			let message;
 			if (exitData.signal) {
@@ -763,10 +1565,97 @@ class TerminalManager {
 				message = `Process exited with code ${exitData.exit_code}`;
 			}
 
+			// For reconnected (restored) sessions, a non-zero exit often means the
+			// previous session's shell was left mid-command and finished naturally
+			// after reconnect. Auto-closing the tab in that case is disorienting:
+			// the user's tab disappears without warning. Show the exit message in
+			// the terminal output instead and let the user decide to close manually.
+			// Zero exit (user typed `exit`) still auto-closes for both session types.
+			if (terminalComponent._isReconnectedSession && exitData.exit_code !== 0) {
+				terminalComponent.write(
+					`\r\n\x1b[31m[${message}]\x1b[0m\r\n`,
+				);
+				toast(message);
+				return;
+			}
+
 			this.closeTerminal(terminalId);
 			terminalFile._skipTerminalCloseConfirm = true;
 			terminalFile.remove(true, { ignorePinned: true });
 			toast(message);
+		};
+
+		// Auto-recovery for corrupted rootfs (in-place, no new tab or toast)
+		terminalComponent.onCrashData = async (reason) => {
+			if (reason === "relocation_error") {
+				try {
+					// Disconnect websocket to stop feeding garbage
+					if (terminalComponent.websocket) {
+						terminalComponent.websocket.close();
+					}
+					terminalComponent.isConnected = false;
+
+					// Write recovery status directly into the current terminal
+					terminalComponent.clear();
+					terminalComponent.write(
+						"\x1b[33m⚠ Detected terminal environment corruption (libc/readline).\x1b[0m\r\n",
+					);
+					terminalComponent.write(
+						"\x1b[33m  Starting automatic repair...\x1b[0m\r\n\r\n",
+					);
+
+					// Uninstall corrupted rootfs
+					terminalComponent.write("Removing corrupted rootfs...\r\n");
+					if (
+						!window.Terminal ||
+						typeof window.Terminal.uninstall !== "function"
+					) {
+						throw new Error(
+							"Terminal uninstall API is unavailable; cannot repair corrupted rootfs.",
+						);
+					}
+					await this.runSharedEnvironmentOperation({
+						type: "repair",
+						ownerName: terminalComponent.terminalDisplayName || "Terminal",
+						ownerTerminalId: terminalId,
+						progressTerminal: { component: terminalComponent },
+						run: async () => {
+							terminalComponent.write("Rootfs removed. Reinstalling...\r\n\r\n");
+							await window.Terminal.uninstall();
+							const result = await this.checkAndInstallTerminal(
+								true,
+								{
+									component: terminalComponent,
+								},
+								{
+									skipSharedLock: true,
+									ownerName:
+										terminalComponent.terminalDisplayName || "Terminal",
+								},
+							);
+
+							if (!result.success) {
+								throw new Error(result.error);
+							}
+
+							return result;
+						},
+					});
+
+					terminalComponent.write(
+						"\r\n\x1b[32m✔ Recovery complete. Reconnecting session...\x1b[0m\r\n",
+					);
+					// Clear the terminal buffer so the new shell prompt starts clean
+					terminalComponent.clear();
+					// Reconnect a fresh session in the same terminal
+					await terminalComponent.connectToSession();
+				} catch (e) {
+					console.error("In-place terminal recovery failed:", e);
+					terminalComponent.write(
+						`\r\n\x1b[31m✘ Recovery error: ${e.message}\x1b[0m\r\n`,
+					);
+				}
+			}
 		};
 
 		// Handle acode CLI open commands (OSC 7777)
@@ -796,7 +1685,6 @@ class TerminalManager {
 		// Store references for cleanup
 		terminalFile._terminalId = terminalId;
 		terminalFile.terminalComponent = terminalComponent;
-		terminalFile._resizeObserver = resizeObserver;
 
 		// Set up custom title function for terminal
 		const getTerminalTitle = () => {
@@ -822,6 +1710,11 @@ class TerminalManager {
 			if (terminal.component.serverMode && terminal.component.pid) {
 				this.removePersistedSession(terminal.component.pid);
 			}
+
+			this.interruptSharedEnvironmentOperationForTerminal(
+				terminalId,
+				terminal.name,
+			);
 
 			// Cleanup resize observer
 			if (terminal.file._resizeObserver) {

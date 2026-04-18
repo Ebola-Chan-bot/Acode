@@ -339,6 +339,15 @@ export default class TerminalTouchSelection {
 		this.scrollElement =
 			this.terminal.element.querySelector(".xterm-viewport") ||
 			this.terminal.element;
+		if (this.scrollElement) {
+			// Android WebView becomes much less willing to pan nested scroll containers
+			// once the IME is visible. Force the xterm viewport to advertise vertical
+			// touch scrolling explicitly so terminal history remains draggable while
+			// the keyboard is up and the shell is waiting for input.
+			this.scrollElement.style.touchAction = "pan-y pinch-zoom";
+			this.scrollElement.style.webkitOverflowScrolling = "touch";
+			this.scrollElement.style.overscrollBehaviorY = "contain";
+		}
 		this.scrollElement.addEventListener(
 			"scroll",
 			this.boundHandlers.terminalScroll,
@@ -493,19 +502,34 @@ export default class TerminalTouchSelection {
 			return;
 		}
 
+		const touch = event.changedTouches?.[0];
+		const tapDuration = Date.now() - this.touchStartTime;
+		const tapDeltaX = touch
+			? Math.abs(touch.clientX - this.touchStartPos.x)
+			: Number.POSITIVE_INFINITY;
+		const tapDeltaY = touch
+			? Math.abs(touch.clientY - this.touchStartPos.y)
+			: Number.POSITIVE_INFINITY;
+		const isPlainTap =
+			tapDuration < this.options.tapHoldDuration &&
+			tapDeltaX <= this.options.moveThreshold &&
+			tapDeltaY <= this.options.moveThreshold &&
+			!this.isTerminalScrolling;
+
 		// If we were selecting and not dragging handles, finalize selection
 		if (this.isSelecting && !this.isHandleDragging) {
 			if (this.isTerminalScrolling) return;
 			this.finalizeSelection();
 		} else if (!this.isSelecting) {
-			// Only focus terminal on touch end if not selecting and terminal was already focused
-			// This prevents keyboard popup when just starting selection
-			const currentlyFocused = this.isTerminalFocused();
-			if (currentlyFocused) {
-				// Terminal is already focused, maintain focus
+			// Hidden-tab terminals can miss the programmatic focus attempt that runs after the
+			// tab becomes active, leaving the PTY connected but the textarea unfocused. In that
+			// state the user sees a prompt yet cannot type, and the previous logic refused to
+			// recover focus on a normal tap. A plain tap on the active terminal must reclaim
+			// input focus; long-press selection is still preserved by the tap/hold and move
+			// thresholds above.
+			if (isPlainTap || this.isTerminalFocused()) {
 				this.terminal.focus();
 			}
-			// If terminal wasn't focused, don't focus it (prevents keyboard popup)
 		}
 	}
 
@@ -1303,14 +1327,20 @@ export default class TerminalTouchSelection {
 	}
 
 	updateCellDimensions() {
-		if (this.terminal._core && this.terminal._core._renderService) {
-			const dimensions = this.terminal._core._renderService.dimensions;
-			if (dimensions && dimensions.css && dimensions.css.cell) {
-				this.cellDimensions = {
-					width: dimensions.css.cell.width,
-					height: dimensions.css.cell.height,
-				};
+		try {
+			if (this.terminal._core && this.terminal._core._renderService) {
+				const dimensions = this.terminal._core._renderService.dimensions;
+				if (dimensions && dimensions.css && dimensions.css.cell) {
+					this.cellDimensions = {
+						width: dimensions.css.cell.width,
+						height: dimensions.css.cell.height,
+					};
+				}
 			}
+		} catch {
+			// xterm can tear down its render service before delayed mobile-selection
+			// callbacks run; ignore that race instead of crashing terminal cleanup.
+			return;
 		}
 	}
 

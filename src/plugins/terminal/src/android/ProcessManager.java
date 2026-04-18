@@ -19,7 +19,7 @@ public class ProcessManager {
      * Creates a ProcessBuilder with common environment setup
      */
     public ProcessBuilder createProcessBuilder(String cmd, boolean useAlpine) {
-        String xcmd = useAlpine ? "source $PREFIX/init-sandbox.sh " + cmd : cmd;
+        String xcmd = useAlpine ? ". $PREFIX/init-sandbox.sh " + cmd : cmd;
         ProcessBuilder builder = new ProcessBuilder("sh", "-c", xcmd);
         setupEnvironment(builder.environment());
         return builder;

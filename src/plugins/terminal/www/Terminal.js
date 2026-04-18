@@ -1,67 +1,306 @@
 const Executor = require("./Executor");
 
+const ALPINE_RELEASES_BASE_URL = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases";
+const latestAlpineUrlCache = new Map();
+let sharedInstallState = null;
+
+const formatFailureMessage = (value) => {
+    if (!value) return "Unknown error";
+    if (typeof value === "string") return value;
+    if (value instanceof Error) return value.message || value.stack || String(value);
+    try {
+        return JSON.stringify(value);
+    } catch (_) {
+        return String(value);
+    }
+};
+
+const formatLogMessage = (parts) => parts.map((part) => formatFailureMessage(part)).join(" ");
+
+const addSharedInstallListener = (logger, err_logger) => {
+    if (!sharedInstallState) {
+        return () => {};
+    }
+
+    const listener = { logger, err_logger };
+    sharedInstallState.listeners.add(listener);
+    return () => {
+        sharedInstallState?.listeners.delete(listener);
+    };
+};
+
+const emitSharedInstallMessage = (channel, message) => {
+    if (!sharedInstallState) {
+        return;
+    }
+
+    for (const listener of sharedInstallState.listeners) {
+        if (channel === "error") {
+            listener.err_logger?.(message);
+        } else {
+            listener.logger?.(message);
+        }
+    }
+};
+
+const withSharedInstall = async (logger, err_logger, run) => {
+    if (sharedInstallState) {
+        const detachListener = addSharedInstallListener(logger, err_logger);
+        try {
+            return await sharedInstallState.promise;
+        } finally {
+            detachListener();
+        }
+    }
+
+    const installState = {
+        listeners: new Set(),
+        promise: null,
+    };
+    sharedInstallState = installState;
+
+    const detachListener = addSharedInstallListener(logger, err_logger);
+    const sharedLogger = (...parts) => {
+        emitSharedInstallMessage("log", formatLogMessage(parts));
+    };
+    const sharedErrLogger = (...parts) => {
+        emitSharedInstallMessage("error", formatLogMessage(parts));
+    };
+
+    installState.promise = Promise.resolve(run(sharedLogger, sharedErrLogger)).finally(() => {
+        detachListener();
+        if (sharedInstallState === installState) {
+            sharedInstallState = null;
+        }
+    });
+
+    return installState.promise;
+};
+
+const resolveLatestAlpineUrl = async (releaseArch) => {
+    const cachedUrl = latestAlpineUrlCache.get(releaseArch);
+    if (cachedUrl) {
+        return cachedUrl;
+    }
+
+    const filesDir = await new Promise((resolve, reject) => {
+        system.getFilesDir(resolve, reject);
+    });
+    const metadataUrl = `${ALPINE_RELEASES_BASE_URL}/${releaseArch}/latest-releases.yaml`;
+    const metadataPath = `${filesDir}/.alpine-latest-releases-${releaseArch}.yaml`;
+
+    await Executor.download(metadataUrl, metadataPath);
+
+    const metadata = await Executor.execute(`cat "${metadataPath}"`);
+    const matches = [...metadata.matchAll(/^\s*file:\s*(alpine-minirootfs-[^\s]+\.tar\.gz)\s*$/gm)];
+    const latestMatch = matches.at(-1);
+    if (!latestMatch) {
+        throw new Error(`Failed to resolve latest Alpine minirootfs for ${releaseArch}`);
+    }
+
+    const alpineUrl = `${ALPINE_RELEASES_BASE_URL}/${releaseArch}/${latestMatch[1]}`;
+    latestAlpineUrlCache.set(releaseArch, alpineUrl);
+    return alpineUrl;
+};
+
+const resolveAlpineBranch = (alpineUrl) => {
+    const match = /\/alpine-minirootfs-(\d+\.\d+)\.\d+-/.exec(alpineUrl);
+    if (!match) {
+        throw new Error(`Failed to resolve Alpine branch from URL: ${alpineUrl}`);
+    }
+    return `v${match[1]}`;
+};
+
+const resolveInstallTargets = (arch) => {
+    if (arch === "arm64-v8a") {
+        return {
+            arch,
+            alpineReleaseArch: "aarch64",
+            libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot.so",
+            libproot32: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot32.so",
+            libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libtalloc.so",
+            prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot-xed.so",
+            axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-arm64",
+        };
+    }
+
+    if (arch === "armeabi-v7a") {
+        return {
+            arch,
+            alpineReleaseArch: "armhf",
+            libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot.so",
+            libproot32: null,
+            libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libtalloc.so",
+            prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot-xed.so",
+            axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-armv7",
+        };
+    }
+
+    if (arch === "x86_64") {
+        return {
+            arch,
+            alpineReleaseArch: "x86_64",
+            libproot: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot.so",
+            libproot32: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot32.so",
+            libTalloc: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libtalloc.so",
+            prootUrl: "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot-xed.so",
+            axsUrl: "https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-x86_64",
+        };
+    }
+
+    throw new Error(`Unsupported architecture: ${arch}`);
+};
+
+const getInstallTargets = async (arch) => {
+    const targets = resolveInstallTargets(arch);
+    const alpineUrl = await resolveLatestAlpineUrl(targets.alpineReleaseArch);
+    return {
+        ...targets,
+        alpineUrl,
+        alpineBranch: resolveAlpineBranch(alpineUrl),
+    };
+};
+
+const renderInitAlpineContent = (content, alpineBranch) => {
+    return content.replaceAll("__ALPINE_BRANCH__", alpineBranch);
+};
+
+
 const Terminal = {
+    async getDownloadTargets() {
+        const arch = await new Promise((resolve, reject) => {
+            system.getArch(resolve, reject);
+        });
+
+        const { alpineUrl, axsUrl } = await getInstallTargets(arch);
+        return { arch, alpineUrl, axsUrl };
+    },
+
+    async refreshAxs(logger = console.log, err_logger = console.error, force = false) {
+        const filesDir = await new Promise((resolve, reject) => {
+            system.getFilesDir(resolve, reject);
+        });
+
+        const { alpineUrl, axsUrl } = await this.getDownloadTargets();
+        const manifestPath = `${filesDir}/.download-manifest`;
+        const currentManifest = [alpineUrl, axsUrl].join("\n");
+        const savedManifest = await Executor.execute(`cat "${manifestPath}" 2>/dev/null || echo ""`).catch(() => "");
+        const hasAxs = await new Promise((resolve) => {
+            system.fileExists(`${filesDir}/axs`, false, (result) => resolve(result == 1), () => resolve(false));
+        });
+
+        if (!force && hasAxs && savedManifest === currentManifest) {
+            return false;
+        }
+
+        logger(force ? "♻️  Refreshing axs binary..." : "🔄  AXS source changed, refreshing binary...");
+        logger(`🌐  axs source: ${axsUrl}`);
+
+        await Executor.execute(`rm -rf "${filesDir}/axs"`).catch(() => {});
+
+        try {
+            await Executor.download(axsUrl, `${filesDir}/axs`, (progress) => {
+                const total = progress.total > 0 ? progress.total : 0;
+                logger(`⬇️  axs ${progress.downloaded}/${total}`);
+            });
+            await writeTextFile(manifestPath, currentManifest);
+            logger("✅  AXS binary ready");
+            return true;
+        } catch (error) {
+            err_logger("Failed to refresh axs:", error);
+            throw error;
+        }
+    },
+
     /**
      * Starts the AXS environment by writing init scripts and executing the sandbox.
      * @param {boolean} [installing=false] - Whether AXS is being started during installation.
      * @param {Function} [logger=console.log] - Function to log standard output.
      * @param {Function} [err_logger=console.error] - Function to log errors.
-     * @returns {Promise<boolean>} - Returns true if installation completes with exit code 0, void if not installing
+    * @returns {Promise<boolean|{success: boolean, error?: string, exitCode?: string}>} - Returns installation result details when installing, void if not installing
      */
     async startAxs(installing = false, logger = console.log, err_logger = console.error) {
+        // Keep app alive in background
+        await Executor.moveToForeground().catch(() => {});
+
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
         });
 
+        await this.refreshAxs(logger, err_logger);
+
+        const { alpineBranch } = await this.getDownloadTargets().then(async ({ arch }) => getInstallTargets(arch));
+        const initAlpineContent = renderInitAlpineContent(await readAsset("init-alpine.sh"), alpineBranch);
+        const initSandboxContent = await readAsset("init-sandbox.sh");
+        const rmWrapperContent = await readAsset("rm-wrapper.sh");
+
         if (installing) {
-            return new Promise((resolve, reject) => {
-                readAsset("init-alpine.sh", async (content) => {
-                    system.writeText(`${filesDir}/init-alpine.sh`, content, logger, err_logger);
-                });
-
-                readAsset("rm-wrapper.sh", async (content) => {
-                    system.deleteFile(`${filesDir}/alpine/bin/rm`, logger, err_logger);
-                    system.writeText(`${filesDir}/alpine/bin/rm`, content, logger, err_logger);
-                    system.setExec(`${filesDir}/alpine/bin/rm`, true, logger, err_logger);
-                });
-
-                readAsset("init-sandbox.sh", (content) => {
-                    system.writeText(`${filesDir}/init-sandbox.sh`, content, logger, err_logger);
+            return new Promise((resolve) => {
+                (async () => {
+                    // Ensure alpine/bin/ exists: a previous interrupted uninstall may have
+                    // partially removed the rootfs while leaving the .extracted marker,
+                    // causing the install flow to skip extraction but land on a missing
+                    // directory when trying to write the rm wrapper.
+                    await Executor.execute(`mkdir -p "${filesDir}/alpine/bin"`);
+                    await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
+                    await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
+                    await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
+                    await setExecutable(`${filesDir}/alpine/bin/rm`, true);
+                    await writeTextFile(`${filesDir}/init-sandbox.sh`, initSandboxContent);
 
                     Executor.start("sh", (type, data) => {
                         logger(`${type} ${data}`);
 
-                        // Check for exit code during installation
                         if (type === "exit") {
-                            resolve(data === "0");
+                            const success = data === "0";
+                            if (success) {
+                                const writeMarker = () => {
+                                    system.writeText(`${filesDir}/.configured`, "1", () => {
+                                        resolve(true);
+                                    }, () => {
+                                        resolve(true);
+                                    });
+                                };
+                                Executor.execute(`rm -rf "${filesDir}/.configured"`).then(writeMarker).catch(writeMarker);
+                            } else {
+                                resolve({
+                                    success: false,
+                                    error: `Terminal installation failed with exit code ${data}`,
+                                    exitCode: data,
+                                });
+                            }
                         }
                     }).then(async (uuid) => {
-                        await Executor.write(uuid, `source ${filesDir}/init-sandbox.sh ${installing ? "--installing" : ""}; exit`);
+                        await Executor.write(uuid, `. "${filesDir}/init-sandbox.sh" --installing; exit`);
                     }).catch((error) => {
                         err_logger("Failed to start AXS:", error);
-                        resolve(false);
+                        resolve({
+                            success: false,
+                            error: formatFailureMessage(error),
+                        });
+                    });
+                })().catch((error) => {
+                    err_logger("Failed to prepare AXS installation:", error);
+                    resolve({
+                        success: false,
+                        error: formatFailureMessage(error),
                     });
                 });
             });
         } else {
-            readAsset("rm-wrapper.sh", async (content) => {
-                system.deleteFile(`${filesDir}/alpine/bin/rm`, logger, err_logger);
-                system.writeText(`${filesDir}/alpine/bin/rm`, content, logger, err_logger);
-                system.setExec(`${filesDir}/alpine/bin/rm`, true, logger, err_logger);
-            });
+            await Executor.execute(`mkdir -p "${filesDir}/alpine/bin"`); // same guard as the installing path
+            await writeTextFile(`${filesDir}/init-alpine.sh`, initAlpineContent);
+            await deleteFileIfExists(`${filesDir}/alpine/bin/rm`);
+            await writeTextFile(`${filesDir}/alpine/bin/rm`, rmWrapperContent);
+            await setExecutable(`${filesDir}/alpine/bin/rm`, true);
+            await writeTextFile(`${filesDir}/init-sandbox.sh`, initSandboxContent);
 
-            readAsset("init-alpine.sh", async (content) => {
-                system.writeText(`${filesDir}/init-alpine.sh`, content, logger, err_logger);
-            });
-
-            readAsset("init-sandbox.sh", (content) => {
-                system.writeText(`${filesDir}/init-sandbox.sh`, content, logger, err_logger);
-
-                Executor.start("sh", (type, data) => {
-                    logger(`${type} ${data}`);
-                }).then(async (uuid) => {
-                    await Executor.write(uuid, `source ${filesDir}/init-sandbox.sh ${installing ? "--installing" : ""}; exit`);
-                });
+            Executor.start("sh", (type, data) => {
+                logger(`${type} ${data}`);
+            }).then(async (uuid) => {
+                await Executor.write(uuid, `. "${filesDir}/init-sandbox.sh"; exit`);
+            }).catch((error) => {
+                err_logger("Failed to start AXS:", error);
             });
         }
     },
@@ -71,7 +310,7 @@ const Terminal = {
      * @returns {Promise<void>}
      */
     async stopAxs() {
-        await Executor.execute(`kill -KILL $(cat $PREFIX/pid)`);
+        await Executor.execute(`kill -KILL $(cat $PREFIX/pid) 2>/dev/null`);
     },
 
     /**
@@ -98,161 +337,243 @@ const Terminal = {
     /**
      * Installs Alpine by downloading binaries and extracting the root filesystem.
      * Also sets up additional dependencies for F-Droid variant.
+     * Supports incremental install: skips already-completed steps based on
+     * marker files (.downloaded, .extracted, .configured) and existing binaries.
      * @param {Function} [logger=console.log] - Function to log standard output.
      * @param {Function} [err_logger=console.error] - Function to log errors.
-     * @returns {Promise<boolean>} - Returns true if installation completes with exit code 0
+     * @returns {Promise<boolean|{success: boolean, error?: string, exitCode?: string}>} - Returns true on success or failure details when installation fails
      */
     async install(logger = console.log, err_logger = console.error) {
-        if (!(await this.isSupported())) return false;
+        return withSharedInstall(logger, err_logger, async (logger, err_logger) => {
+            return this.installInternal(logger, err_logger);
+        });
+    },
 
-        try {
-            //cleanup before insatll
-            await this.uninstall();
-        } catch (e) {
-            //supress error
+    async installInternal(logger, err_logger) {
+        if (!(await this.isSupported())) {
+            return {
+                success: false,
+                error: "Terminal is not supported on this device architecture",
+            };
         }
+
+        // Start foreground service to prevent Android from killing the app
+        // during lengthy downloads/extraction when user switches away
+        await Executor.moveToForeground().catch(() => {});
 
         const filesDir = await new Promise((resolve, reject) => {
             system.getFilesDir(resolve, reject);
         });
-
         const arch = await new Promise((resolve, reject) => {
             system.getArch(resolve, reject);
         });
 
+        // Helper: check if a file exists
+        const fileExists = (path) => new Promise((resolve) => {
+            system.fileExists(path, false, (result) => resolve(result == 1), () => resolve(false));
+        });
+        const writeText = (path, content) => new Promise((resolve, reject) => {
+            system.writeText(path, content, resolve, reject);
+        });
+
+        const formatBytes = (bytes) => {
+            if (bytes < 1024) return bytes + " B";
+            if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+            return (bytes / 1048576).toFixed(1) + " MB";
+        };
+        const formatEta = (seconds) => {
+            if (seconds < 60) return seconds + "s";
+            const m = Math.floor(seconds / 60);
+            const s = seconds % 60;
+            return m + "m" + (s > 0 ? s + "s" : "");
+        };
+        const formatInstallError = (error) => {
+            if (!error) return "unknown error";
+            if (typeof error === "string") return error;
+            if (error instanceof Error) return error.stack || error.message || String(error);
+            try {
+                return JSON.stringify(error);
+            } catch (_) {
+                return String(error);
+            }
+        };
+        const downloadWithLogging = async (label, url, dst, progressHandler) => {
+            logger(`🌐  ${label} source: ${url}`);
+            // 下载到临时文件，完成后原子重命名，防止中断留下截断文件
+            // 根因：WebView重载中断下载后，残留的部分文件会被后续安装误认为已完成下载
+            const tmpDst = dst + ".tmp";
+            try {
+                await Executor.download(url, tmpDst, progressHandler);
+                await Executor.execute(`mv -f "${tmpDst}" "${dst}"`);
+                logger(`✅  ${label} download finished`);
+            } catch (error) {
+                await Executor.execute(`rm -f "${tmpDst}"`).catch(() => {});
+                logger(`❌  ${label} download failed: ${formatInstallError(error)}`);
+                throw error;
+            }
+        };
+
+        // Check which stages are already done
+        let alreadyDownloaded = await fileExists(`${filesDir}/.downloaded`);
+        let alreadyExtracted = await fileExists(`${filesDir}/.extracted`);
+        let alreadyConfigured = await fileExists(`${filesDir}/.configured`);
+
+        // An interrupted uninstall can leave the .extracted marker while the
+        // rootfs is partially deleted (e.g. alpine/bin/sh missing).  Detect
+        // this inconsistency and force a re-extraction so proot finds a valid
+        // rootfs.
+        if (alreadyExtracted && !(await fileExists(`${filesDir}/alpine/bin/sh`))) {
+            await Executor.execute(`rm -rf "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine"`).catch(() => {});
+            alreadyExtracted = false;
+            alreadyConfigured = false;
+        }
+
+        const hasPidFile = await fileExists(`${filesDir}/pid`);
         try {
-            let alpineUrl;
-            let axsUrl;
-            let prootUrl;
-            let libTalloc;
-            let libproot = null;
-            let libproot32 = null;
+            const {
+                alpineUrl,
+                axsUrl,
+                prootUrl,
+                libTalloc,
+                libproot,
+                libproot32,
+            } = await getInstallTargets(arch);
 
-            if (arch === "arm64-v8a") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot.so";
-                libproot32 = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot32.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-arm64`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz";
-            } else if (arch === "armeabi-v7a") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-armv7`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/armhf/alpine-minirootfs-3.21.0-armhf.tar.gz";
-            } else if (arch === "x86_64") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot.so";
-                libproot32 = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot32.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-x86_64`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz";
+            // Invalidate download cache if URLs changed (e.g. version bump)
+            if (alreadyDownloaded) {
+                const currentManifest = [alpineUrl, axsUrl].join("\n");
+                const savedManifest = await Executor.execute(`cat "${filesDir}/.download-manifest" 2>/dev/null || echo ""`);
+                if (savedManifest !== currentManifest) {
+                    logger("🔄  Update detected, clearing download cache...");
+                    await Executor.execute(`rm -rf "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/axs" "${filesDir}/.download-manifest"`).catch(() => {});
+                    alreadyDownloaded = false;
+                    alreadyExtracted = false;
+                    alreadyConfigured = false;
+                }
+            }
+
+            // ── Phase 1: Download (skip if .downloaded marker exists) ──
+            if (!alreadyDownloaded) {
+                // Check individual files and only download what's missing
+                const hasAlpineTar = await fileExists(`${filesDir}/alpine.tar.gz`);
+                const hasAxs = await fileExists(`${filesDir}/axs`);
+
+                if (!hasAlpineTar) {
+                    logger("⬇️  Downloading sandbox filesystem...");
+                    await downloadWithLogging("sandbox filesystem", alpineUrl, `${filesDir}/alpine.tar.gz`, (p) => {
+                        const dl = formatBytes(p.downloaded);
+                        const total = p.total > 0 ? formatBytes(p.total) : "?";
+                        const speed = formatBytes(p.speed) + "/s";
+                        const eta = p.eta > 0 ? formatEta(p.eta) : "--";
+                        logger(`⬇️  ${dl} / ${total}  ${speed}  ETA ${eta}`);
+                    });
+                } else {
+                    logger("✅  Sandbox filesystem already downloaded");
+                }
+
+                if (!hasAxs) {
+                    logger("⬇️  Downloading axs...");
+					await downloadWithLogging("axs", axsUrl, `${filesDir}/axs`, (p) => {
+                        const dl = formatBytes(p.downloaded);
+                        const total = p.total > 0 ? formatBytes(p.total) : "?";
+                        const speed = formatBytes(p.speed) + "/s";
+                        const eta = p.eta > 0 ? formatEta(p.eta) : "--";
+                        logger(`⬇️  ${dl} / ${total}  ${speed}  ETA ${eta}`);
+                    });
+                } else {
+                    logger("✅  AXS binary already downloaded");
+                }
+
+                const isFdroid = await Executor.execute("echo $FDROID");
+                if (isFdroid === "true") {
+                    logger("🐧  F-Droid flavor detected, checking additional files...");
+
+                    const hasProot = await fileExists(`${filesDir}/libproot-xed.so`);
+                    if (!hasProot) {
+                        logger("⬇️  Downloading compatibility layer...");
+                        await downloadWithLogging("compatibility layer", prootUrl, `${filesDir}/libproot-xed.so`);
+                    }
+
+                    const hasTalloc = await fileExists(`${filesDir}/libtalloc.so.2`);
+                    if (!hasTalloc) {
+                        logger("⬇️  Downloading supporting library...");
+                        await downloadWithLogging("supporting library", libTalloc, `${filesDir}/libtalloc.so.2`);
+                    }
+
+                    if (libproot != null && !(await fileExists(`${filesDir}/libproot.so`))) {
+                        await downloadWithLogging("libproot", libproot, `${filesDir}/libproot.so`);
+                    }
+
+                    if (libproot32 != null && !(await fileExists(`${filesDir}/libproot32.so`))) {
+                        await downloadWithLogging("libproot32", libproot32, `${filesDir}/libproot32.so`);
+                    }
+                }
+
+                logger("✅  All downloads completed");
+
+                // Save URL manifest for cache invalidation on version change
+                await writeText(`${filesDir}/.download-manifest`, [alpineUrl, axsUrl].join("\n"));
+
+                logger("📁  Setting up directories...");
+                await new Promise((resolve, reject) => {
+                    system.mkdirs(`${filesDir}/.downloaded`, resolve, reject);
+                });
             } else {
-                throw new Error(`Unsupported architecture: ${arch}`);
+                logger("✅  Downloads cached, skipping download phase");
             }
 
+            // ── Phase 2: Extract (skip if .extracted marker exists) ──
+            if (!alreadyExtracted) {
+                const alpineDir = `${filesDir}/alpine`;
 
-            logger("⬇️  Downloading sandbox filesystem...");
-            await new Promise((resolve, reject) => {
-                cordova.plugin.http.downloadFile(
-                    alpineUrl, {}, {},
-                    cordova.file.dataDirectory + "alpine.tar.gz",
-                    resolve, reject
-                );
-            });
-
-            logger("⬇️  Downloading axs...");
-            await new Promise((resolve, reject) => {
-                cordova.plugin.http.downloadFile(
-                    axsUrl, {}, {},
-                    cordova.file.dataDirectory + "axs",
-                    resolve, reject
-                );
-            });
-
-            const isFdroid = await Executor.execute("echo $FDROID");
-            if (isFdroid === "true") {
-                logger("🐧  F-Droid flavor detected, downloading additional files...");
-                logger("⬇️  Downloading compatibility layer...");
+                // Clean up partial extraction from previous failed attempt
+                await Executor.execute(`rm -rf "${alpineDir}"`).catch(() => {});
                 await new Promise((resolve, reject) => {
-                    cordova.plugin.http.downloadFile(
-                        prootUrl, {}, {},
-                        cordova.file.dataDirectory + "libproot-xed.so",
-                        resolve, reject
-                    );
+                    system.mkdirs(alpineDir, resolve, reject);
                 });
 
-                logger("⬇️  Downloading supporting library...");
+                logger("📦  Extracting sandbox filesystem...");
+                await Executor.execute(`tar --no-same-owner -xf "${filesDir}/alpine.tar.gz" -C "${alpineDir}"`);
+
+                logger("⚙️  Applying basic configuration...");
+                await writeText(`${alpineDir}/etc/resolv.conf`, `nameserver 8.8.4.4\nnameserver 8.8.8.8`);
+
+                const rmWrapperContent = await readAsset("rm-wrapper.sh");
+                await deleteFileIfExists(`${alpineDir}/bin/rm`);
+                await writeText(`${alpineDir}/bin/rm`, rmWrapperContent);
+                await setExecutable(`${alpineDir}/bin/rm`, true);
+
+                logger("✅  Extraction complete");
                 await new Promise((resolve, reject) => {
-                    cordova.plugin.http.downloadFile(
-                        libTalloc, {}, {},
-                        cordova.file.dataDirectory + "libtalloc.so.2",
-                        resolve, reject
-                    );
+                    system.mkdirs(`${filesDir}/.extracted`, resolve, reject);
                 });
-
-                if (libproot != null) {
-                    await new Promise((resolve, reject) => {
-                        cordova.plugin.http.downloadFile(
-                            libproot, {}, {},
-                            cordova.file.dataDirectory + "libproot.so",
-                            resolve, reject
-                        );
-                    });
-                }
-
-                if (libproot32 != null) {
-                    await new Promise((resolve, reject) => {
-                        cordova.plugin.http.downloadFile(
-                            libproot32, {}, {},
-                            cordova.file.dataDirectory + "libproot32.so",
-                            resolve, reject
-                        );
-                    });
-                }
-
+            } else {
+                logger("✅  Extraction cached, skipping extraction phase");
             }
 
-            logger("✅  All downloads completed");
-
-            logger("📁  Setting up directories...");
-
-            await new Promise((resolve, reject) => {
-                system.mkdirs(`${filesDir}/.downloaded`, resolve, reject);
-            });
-
-            const alpineDir = `${filesDir}/alpine`;
-
-            await new Promise((resolve, reject) => {
-                system.mkdirs(alpineDir, resolve, reject);
-            });
-
-            logger("📦  Extracting sandbox filesystem...");
-            await Executor.execute(`tar --no-same-owner -xf ${filesDir}/alpine.tar.gz -C ${alpineDir}`);
-
-            logger("⚙️  Applying basic configuration...");
-            system.writeText(`${alpineDir}/etc/resolv.conf`, `nameserver 8.8.4.4 \nnameserver 8.8.8.8`);
-
-            readAsset("rm-wrapper.sh", async (content) => {
-                system.deleteFile(`${alpineDir}/bin/rm`, logger, err_logger);
-                system.writeText(`${alpineDir}/bin/rm`, content, logger, err_logger);
-                system.setExec(`${alpineDir}/bin/rm`, true, logger, err_logger);
-            });
-
-            logger("✅  Extraction complete");
-            await new Promise((resolve, reject) => {
-                system.mkdirs(`${filesDir}/.extracted`, resolve, reject);
-            });
-
+            // ── Phase 3: Configure (always run — installs packages, creates configs) ──
             logger("⚙️  Updating sandbox enviroment...");
-            const installResult = await this.startAxs(true, logger, err_logger);
-            return installResult;
+            const configureResult = await this.startAxs(true, logger, err_logger);
+
+            if (configureResult === true || configureResult?.success === true) {
+                return configureResult;
+            }
+
+            return configureResult || {
+                success: false,
+                error: "Terminal configuration failed",
+            };
 
         } catch (e) {
             err_logger("Installation failed:", e);
-            console.error("Installation failed:", e);
-            return false;
+            // Clean up everything so the next manual attempt starts from a fully fresh state
+            // instead of inheriting partially downloaded or partially extracted artifacts from
+            // the failed run that just produced the diagnostic logs above.
+            await Executor.execute(`rm -rf "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/.download-manifest"`).catch(() => {});
+            return {
+                success: false,
+                error: formatInstallError(e),
+            };
         }
     },
 
@@ -290,6 +611,8 @@ const Terminal = {
                 }, reject);
             });
 
+            // and ls output to detect whether install catch-cleanup from a dying WebView
+            // context deleted the rootfs (see install() catch block's rm -rf).
             resolve(alpineExists && downloaded && extracted && configured);
         });
     },
@@ -327,6 +650,7 @@ const Terminal = {
                 reject("Alpine is not installed.");
                 return;
             }
+
             const cmd = `
             set -e
             INCLUDE_FILES="alpine .downloaded .extracted .configured axs"
@@ -337,6 +661,7 @@ const Terminal = {
             tar -cf "$PREFIX/aterm_backup.tar" -C "$PREFIX" $EXCLUDE $INCLUDE_FILES
             echo "ok"
             `;
+
             const result = await Executor.execute(cmd);
             if (result === "ok") {
                 resolve(cordova.file.dataDirectory + "aterm_backup.tar");
@@ -395,64 +720,129 @@ const Terminal = {
         });
     },
     /**
+     * Removes the .configured marker so the next terminal open triggers re-install.
+     * Does NOT delete the rootfs or downloaded files — only the config flag.
+     * @returns {Promise<boolean>} - `true` if marker is removed, `false` otherwise.
+     */
+    async resetConfigured() {
+        const filesDir = await new Promise((resolve, reject) => {
+            system.getFilesDir(resolve, reject);
+        });
+
+        try {
+            await Executor.execute(`rm -rf "$PREFIX/.configured" "${filesDir}/.configured"`);
+        } catch (error) {
+            // continue to existence check below
+        }
+
+        const stillExists = await new Promise((resolve, reject) => {
+            system.fileExists(`${filesDir}/.configured`, false, (result) => {
+                resolve(result == 1);
+            }, reject);
+        });
+
+        return !stillExists;
+    },
+
+    /**
      * Uninstalls the Alpine Linux installation
      * @async
      * @function uninstall
-     * @description Completely removes the Alpine Linux installation from the device by deleting all
-     * Alpine-related files and directories. This function stops any running Alpine processes before
-     * removal. NOTE: This does not perform cleanup of $PREFIX
+     * @description Removes the Alpine Linux rootfs and config markers, but preserves
+     * downloaded binaries (alpine.tar.gz, axs) as cache for faster re-install.
      * @returns {Promise<string>} Promise that resolves to "ok" when uninstallation completes successfully
      * @throws {string} Rejects with command output if uninstallation fails
-     * @example
-     * try {
-     *   await uninstall();
-     *   console.log("Alpine installation removed successfully");
-     * } catch (error) {
-     *   console.error(`Uninstall failed: ${error}`);
-     * }
      */
-    uninstall() {
-        return new Promise(async (resolve, reject) => {
-            if (await this.isAxsRunning()) {
-                await this.stopAxs();
-            }
+    // Fixed: was `new Promise(async (resolve, reject) => ...)` which is an antipattern —
+    // if `await Executor.execute()` rejects, the rejection becomes unhandled and the
+    // outer Promise stays pending forever, causing the shared environment operation to
+    // never settle and all subsequent terminals to hang on "Waiting for ...".
+    async uninstall() {
+        if (await this.isAxsRunning()) {
+            await this.stopAxs();
+        }
 
-            const cmd = `
-            set -e
+        // Remove rootfs and markers, but keep downloaded files as cache
+        // (alpine.tar.gz, axs binary, libproot*.so, libtalloc.so.2)
+        // No `set -e`: rm -rf can fail when proot child processes from a
+        // preempted install are still writing files (race: rmdir sees a
+        // newly created file → "Directory not empty").  Best-effort removal
+        // is acceptable — the next install overwrites everything.
+        const cmd = `
+        INCLUDE_FILES="$PREFIX/alpine $PREFIX/.downloaded $PREFIX/.extracted $PREFIX/.configured"
 
-            INCLUDE_FILES="$PREFIX/alpine $PREFIX/.downloaded $PREFIX/.extracted $PREFIX/.configured $PREFIX/axs"
+        for item in $INCLUDE_FILES; do
+            rm -rf -- "$item" 2>/dev/null
+        done
 
-            if [ "$FDROID" = "true" ]; then
-                INCLUDE_FILES="$INCLUDE_FILES $PREFIX/libtalloc.so.2 $PREFIX/libproot-xed.so"
-            fi
+        echo "ok"
+        `;
+        const result = await Executor.execute(cmd);
+        if (result === "ok") {
+            return result;
+        }
+        throw new Error(result);
+    },
 
-            for item in $INCLUDE_FILES; do
-                rm -rf -- "$item"
-            done
+    /**
+     * Fully uninstalls Alpine including download cache.
+     * @returns {Promise<string>} Resolves to "ok" when complete.
+     */
+    // Same antipattern fix as uninstall() above.
+    async uninstallFull() {
+        if (await this.isAxsRunning()) {
+            await this.stopAxs();
+        }
 
-            echo "ok"
-            `;
-            const result = await Executor.execute(cmd);
-            if (result === "ok") {
-                resolve(result);
-            } else {
-                reject(result);
-            }
+        const filesDir = await new Promise((resolve, reject) => {
+            system.getFilesDir(resolve, reject);
         });
+
+        // No `set -e`: same race condition as uninstall() — see comment there.
+        const cmd = `
+        rm -rf "${filesDir}/alpine" "${filesDir}/.downloaded" "${filesDir}/.extracted" "${filesDir}/.configured" "${filesDir}/alpine.tar.gz" "${filesDir}/alpine.tar" "${filesDir}/axs" "${filesDir}/libproot-xed.so" "${filesDir}/libtalloc.so.2" "${filesDir}/libproot.so" "${filesDir}/libproot32.so" "${filesDir}/.download-manifest" 2>/dev/null
+        echo "ok"
+        `;
+        const result = await Executor.execute(cmd);
+        if (result === "ok") {
+            return result;
+        }
+        throw new Error(result);
     }
 };
 
 
-function readAsset(assetPath, callback) {
+function writeTextFile(path, content) {
+    return new Promise((resolve, reject) => {
+        system.writeText(path, content, resolve, reject);
+    });
+}
+
+function deleteFileIfExists(path) {
+    return new Promise((resolve) => {
+        system.deleteFile(path, resolve, () => resolve());
+    });
+}
+
+function setExecutable(path, executable) {
+    return new Promise((resolve, reject) => {
+        system.setExec(path, executable, resolve, reject);
+    });
+}
+
+function readAsset(assetPath) {
     const assetUrl = "file:///android_asset/" + assetPath;
 
-    window.resolveLocalFileSystemURL(assetUrl, fileEntry => {
-        fileEntry.file(file => {
-            const reader = new FileReader();
-            reader.onloadend = () => callback(reader.result);
-            reader.readAsText(file);
-        }, console.error);
-    }, console.error);
+    return new Promise((resolve, reject) => {
+        window.resolveLocalFileSystemURL(assetUrl, fileEntry => {
+            fileEntry.file(file => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = () => reject(reader.error || new Error(`Failed to read asset: ${assetPath}`));
+                reader.readAsText(file);
+            }, reject);
+        }, reject);
+    });
 }
 
 module.exports = Terminal;
