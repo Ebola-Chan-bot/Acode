@@ -1099,7 +1099,6 @@ class TerminalManager {
 						// Remove stdout/stderr prefix for
 						const cleanMessage = message.replace(/^(stdout|stderr)\s+/, "");
 						installTerminal.component.write(`${cleanMessage}\r\n`);
-						console.log("[install]", cleanMessage); // 仅调试用
 					},
 					(error) => {
 						// Remove stdout/stderr prefix
@@ -1107,7 +1106,6 @@ class TerminalManager {
 						installTerminal.component.write(
 							`\x1b[31mError: ${cleanError}\x1b[0m\r\n`,
 						);
-						console.error("[install]", cleanError); // 仅调试用
 					},
 				);
 

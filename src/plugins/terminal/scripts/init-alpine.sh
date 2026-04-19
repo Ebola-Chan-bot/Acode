@@ -81,13 +81,6 @@ if [ -n "$missing_packages" ]; then
 
         if [ "$apk_add_rc" -ne 0 ]; then
             echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
-            # ── 仅调试用：本轮焦点 = proot 内置 EPERM 定位诊断（proot-diag: ... 行由 proot 源码注入）──
-            echo "DIAG ENV: PROOT_NO_SECCOMP='${PROOT_NO_SECCOMP:-unset}' PROOT_VERBOSE='${PROOT_VERBOSE:-unset}'" # 仅调试用
-            echo "DIAG rc=$apk_add_rc repo_mode=$repo_mode" # 仅调试用
-            # ── 仅调试用：再跑一次 apk add 以触发 proot-diag 打印 EPERM 来源 ──
-            echo "DIAG apk -v add retry (watch for proot-diag lines above/below):" # 仅调试用
-            apk -v add --no-cache $missing_packages 2>&1 | tail -n 40 # 仅调试用
-            echo "DIAG end" # 仅调试用
             continue
         fi
 
